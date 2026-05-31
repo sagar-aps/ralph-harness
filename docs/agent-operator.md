@@ -132,13 +132,21 @@ keeps the branch by default — pass `--delete-branch` to remove it.
 5. **Integrate only after explicit approval**, with `ralph integrate`. Then offer
    to clean up.
 
-## Claude Code section
+## Installing operator commands into your coding agent
 
-Install the operator slash-commands once:
+Install the operator commands once. The same four commands are adapted per agent:
 
 ```bash
-ralph install-agent-commands     # installs into ~/.claude/commands/
+ralph install-agent-commands              # interactive menu (Claude Code / Codex / Copilot)
+ralph install-agent-commands --agent codex
+ralph install-agent-commands --agent copilot
 ```
+
+| Agent (`--agent`) | Installs to | Invoke as |
+| --- | --- | --- |
+| `claude` (default) | `~/.claude/commands/` | `/ralph-review` … in Claude Code |
+| `codex` | `~/.codex/prompts/` | `/ralph-review` … in Codex (CLI/IDE) |
+| `copilot` | VS Code user prompts folder (`*.prompt.md`) | `/ralph-review` … in Copilot Chat |
 
 This gives you:
 
@@ -147,8 +155,8 @@ This gives you:
 - `/ralph-integrate --repo <path> [--run latest|<id>]`
 - `/ralph-cleanup --repo <path> [--run latest|<id>] [--delete-branch]`
 
-These commands teach Claude Code to *operate* the harness, not to reimplement it.
-When acting as the operator, Claude Code should:
+These commands teach the agent to *operate* the harness, not to reimplement it.
+When acting as the operator, the agent should:
 
 - Run `/ralph-review` instead of editing the target repo directly.
 - After the run, read `<target>/.ralph/last-run.env` + the run's `final_status.md`

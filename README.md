@@ -380,14 +380,28 @@ preview, and keeps the branch unless `--delete-branch`.
 ### Operate from a coding agent (`ralph install-agent-commands`)
 
 ```bash
-ralph install-agent-commands     # v1: Claude Code -> ~/.claude/commands/
+ralph install-agent-commands              # interactive: pick the agent
+ralph install-agent-commands --agent codex   # non-interactive
 ```
 
 Installs `/ralph-review`, `/ralph-status`, `/ralph-integrate`, `/ralph-cleanup`
-slash-commands that teach the agent to *drive* the harness (run it, summarize,
-ask before integrating) rather than reimplement it. Existing files are kept unless
-`--force`. See **[docs/agent-operator.md](docs/agent-operator.md)** for the full
-operator playbook (harness vs target, roles vs backends, expected agent behavior).
+commands that teach the agent to *drive* the harness (run it, summarize, ask before
+integrating) rather than reimplement it. The commands are authored once (canonical
+markdown in `agent-commands/ralph/`) and adapted per agent at install time:
+
+| `--agent` | Installs to | Format |
+| --- | --- | --- |
+| `claude` (default) | `~/.claude/commands/<name>.md` | Claude slash commands (`$ARGUMENTS`) |
+| `codex` | `~/.codex/prompts/<name>.md` | Codex slash commands (frontmatter stripped) |
+| `copilot` | VS Code user prompts¹ `<name>.prompt.md` | Copilot prompt files (`${input:args}`) |
+
+¹ `~/.config/Code/User/prompts/` (Linux), `~/Library/Application Support/Code/User/prompts/`
+(macOS), `%APPDATA%\Code\User\prompts\` (Windows).
+
+Existing files are kept unless `--force`. Add another agent by adding one entry to
+`AGENT_TARGETS` in `bin/ralph`. See **[docs/agent-operator.md](docs/agent-operator.md)**
+for the full operator playbook (harness vs target, roles vs backends, expected
+agent behavior).
 
 ### Intended website workflow
 

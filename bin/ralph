@@ -53,6 +53,33 @@ function exists(p) {
   }
 }
 
+// Load the interactive-prompt dependency, auto-installing it the first time if it
+// is missing (it ships as a declared dependency, but a freshly linked clone may
+// not have run `npm install` yet). Falls back to a clear instruction if that fails.
+async function loadPrompts() {
+  try {
+    return await import("@clack/prompts");
+  } catch (err) {
+    if (!err || err.code !== "ERR_MODULE_NOT_FOUND") throw err;
+    console.error("Ralph needs its '@clack/prompts' dependency, which isn't installed yet.");
+    console.error(`Installing it now (npm install in ${repoRoot})...`);
+    const result = spawnSync("npm", ["install", "--no-audit", "--no-fund"], {
+      cwd: repoRoot,
+      stdio: "inherit",
+    });
+    if (result.status === 0) {
+      try {
+        return await import("@clack/prompts");
+      } catch {
+        /* fall through to manual instructions */
+      }
+    }
+    console.error("\nCould not load '@clack/prompts'. Install dependencies, then retry:");
+    console.error(`  ( cd ${repoRoot} && npm install )`);
+    process.exit(1);
+  }
+}
+
 // --- Operator-command helpers (status / integrate / cleanup) ----------------
 function git(repo, gitArgs, opts = {}) {
   return spawnSync("git", ["-C", repo, ...gitArgs], { encoding: "utf-8", ...opts });
@@ -247,7 +274,7 @@ Commands:
   integrate --repo <path> [--run]     Merge an approved run, re-check, then auto-cleanup
   cleanup --repo <path> [--run]       Remove a run's worktree / stop its preview
   init-target --repo <path> [--type]  Scaffold a target repo (generic|nextjs-postgres)
-  install-agent-commands              Install operator slash-commands (Claude Code)
+  install-agent-commands [--agent X]  Install operator commands (claude|codex|copilot)
   overview                            Render a human overview from PRD JSON
   help                                Show this message
 
@@ -313,7 +340,7 @@ async function resolvePrdPath({ cwd, explicitPath, label }) {
   if (candidates.length === 1) {
     return candidates[0];
   }
-  const { intro, select, outro, isCancel } = await import("@clack/prompts");
+  const { intro, select, outro, isCancel } = await loadPrompts();
   intro(label || "Select PRD");
   const selection = await select({
     message: "Pick a PRD JSON file",
@@ -449,7 +476,7 @@ if (cmd === "help" || cmd === "-h" || cmd === "--help") {
 }
 
 async function runInstallSkills() {
-  const { intro, outro, select, isCancel } = await import("@clack/prompts");
+  const { intro, outro, select, isCancel } = await loadPrompts();
   intro("Ralph skills install");
 
   const agent = await select({
@@ -530,7 +557,7 @@ async function runInstallSkills() {
 async function main() {
   const updateInfo = checkForUpdate();
   if (updateInfo) {
-    const { intro, confirm, outro, isCancel } = await import("@clack/prompts");
+    const { intro, confirm, outro, isCancel } = await loadPrompts();
     intro("Ralph update available");
     const shouldUpdate = await confirm({
       message: `Update ${updateInfo.name} from ${updateInfo.current} to ${updateInfo.latest}?`,
@@ -597,53 +624,111 @@ async function main() {
 
   // --- Install operator commands into a coding agent (v1: Claude Code) --------
   if (cmd === "install-agent-commands") {
-    let targetChoice = "claude";
-    if (process.stdout.isTTY && process.stdin.isTTY) {
-      const { intro, outro, select, isCancel } = await import("@clack/prompts");
-      intro("Ralph: install agent commands");
-      const sel = await select({
-        message: "Install operator commands for which agent?",
-        options: [{ value: "claude", label: "Claude Code" }],
-        initialValue: "claude",
-      });
-      if (isCancel(sel)) {
-        outro("Cancelled.");
-        process.exit(0);
+    // Operator commands are authored once (canonical, Claude-flavored markdown in
+    // agent-commands/ralph/) and adapted per agent at install time. To add a new
+    // agent, add an entry to AGENT_TARGETS below — the menu and installer pick it
+    // up automatically. Locations verified against each tool's docs (May 2026):
+    //   Claude Code     ~/.claude/commands/<name>.md            (slash commands)
+    //   Codex CLI       ~/.codex/prompts/<name>.md              (slash commands)
+    //   GitHub Copilot  <VS Code user>/prompts/<name>.prompt.md (VS Code chat)
+    const home = os.homedir();
+    const copilotUserPromptsDir = () => {
+      if (process.platform === "darwin")
+        return path.join(home, "Library", "Application Support", "Code", "User", "prompts");
+      if (process.platform === "win32")
+        return path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "Code", "User", "prompts");
+      return path.join(home, ".config", "Code", "User", "prompts");
+    };
+    const stripFrontmatter = (s) => s.replace(/^---\n[\s\S]*?\n---\n+/, "");
+    const frontmatterField = (s, key) => {
+      const m = s.match(new RegExp(`^---\\n[\\s\\S]*?^${key}:\\s*(.+)$[\\s\\S]*?\\n---`, "m"));
+      return m ? m[1].trim() : "";
+    };
+    const toCopilotPrompt = (s) => {
+      const desc = frontmatterField(s, "description") || "Operate the Ralph harness";
+      const body = stripFrontmatter(s).replace(/\$ARGUMENTS/g, "${input:args}");
+      return `---\ndescription: ${desc}\nmode: agent\n---\n\n${body}`;
+    };
+
+    const AGENT_TARGETS = {
+      claude: {
+        label: "Claude Code",
+        dir: () => path.join(home, ".claude", "commands"),
+        ext: ".md",
+        transform: (s) => s, // canonical format
+        invoke: "in Claude Code, type /ralph-review, /ralph-status, …",
+      },
+      codex: {
+        label: "Codex CLI",
+        dir: () => path.join(home, ".codex", "prompts"),
+        ext: ".md",
+        transform: stripFrontmatter, // Codex prompts are plain markdown; $ARGUMENTS works
+        invoke: "in Codex, type /ralph-review, /ralph-status, …",
+      },
+      copilot: {
+        label: "GitHub Copilot (VS Code, user prompts)",
+        dir: copilotUserPromptsDir,
+        ext: ".prompt.md",
+        transform: toCopilotPrompt, // .prompt.md + ${input:args}
+        invoke: "in Copilot Chat (VS Code), type /ralph-review, /ralph-status, …",
+      },
+    };
+
+    const order = ["claude", "codex", "copilot"];
+    const valid = order;
+    let targetChoice = agentOverride || null;
+    if (!targetChoice) {
+      if (process.stdout.isTTY && process.stdin.isTTY) {
+        const { intro, outro, select, isCancel } = await loadPrompts();
+        intro("Ralph: install agent commands");
+        const sel = await select({
+          message: "Install operator commands for which agent?",
+          options: order.map((k) => ({ value: k, label: AGENT_TARGETS[k].label })),
+          initialValue: order[0],
+        });
+        if (isCancel(sel)) {
+          outro("Cancelled.");
+          process.exit(0);
+        }
+        targetChoice = sel;
+        outro("Installing...");
+      } else {
+        targetChoice = order[0]; // non-interactive default
       }
-      targetChoice = sel;
-      outro("Installing...");
     }
-    const srcDir = path.join(repoRoot, "agent-commands", targetChoice);
-    if (!exists(srcDir)) {
-      console.error(`No command templates for "${targetChoice}" at ${srcDir}`);
+    if (!valid.includes(targetChoice)) {
+      console.error(`install-agent-commands supports: ${valid.join(", ")} (got "${targetChoice}").`);
       process.exit(1);
     }
-    const home = os.homedir();
-    // Claude Code reads user slash commands from ~/.claude/commands/.
-    const destDir = path.join(home, ".claude", "commands");
+
+    const target = AGENT_TARGETS[targetChoice];
+    const srcDir = path.join(repoRoot, "agent-commands", "ralph");
+    if (!exists(srcDir)) {
+      console.error(`Command templates not found at ${srcDir}`);
+      process.exit(1);
+    }
+    const destDir = target.dir();
     fs.mkdirSync(destDir, { recursive: true });
     const files = fs.readdirSync(srcDir).filter((f) => f.endsWith(".md"));
     const installed = [];
     const skipped = [];
     for (const f of files) {
-      const dst = path.join(destDir, f);
+      const base = `ralph-${f.replace(/\.md$/, "")}`; // review.md -> ralph-review
+      const dst = path.join(destDir, base + target.ext);
       if (exists(dst) && !installForce) {
-        skipped.push(f);
+        skipped.push(base);
         continue;
       }
-      fs.copyFileSync(path.join(srcDir, f), dst);
-      installed.push(f);
+      const content = target.transform(fs.readFileSync(path.join(srcDir, f), "utf-8"));
+      fs.writeFileSync(dst, content);
+      installed.push(base);
     }
-    console.log("Target agent: Claude Code");
+    console.log(`Target agent: ${target.label}`);
     console.log(`Source:       ${srcDir}`);
     console.log(`Installed to: ${destDir}`);
-    if (installed.length)
-      console.log(`Installed:    ${installed.map((f) => "/" + f.replace(/\.md$/, "")).join(", ")}`);
-    if (skipped.length)
-      console.log(`Skipped (already exist; use --force): ${skipped.join(", ")}`);
-    console.log(
-      "\nUse them in Claude Code as: /ralph-review, /ralph-status, /ralph-integrate, /ralph-cleanup",
-    );
+    if (installed.length) console.log(`Installed:    ${installed.map((b) => "/" + b).join(", ")}`);
+    if (skipped.length) console.log(`Skipped (already exist; use --force): ${skipped.join(", ")}`);
+    console.log(`\nUse them: ${target.invoke}`);
     process.exit(0);
   }
 
@@ -921,7 +1006,7 @@ async function main() {
     if (installSkills) {
       await runInstallSkills();
     } else {
-      const { confirm, isCancel } = await import("@clack/prompts");
+      const { confirm, isCancel } = await loadPrompts();
       const wantsSkills = await confirm({
         message: "Install skills (commit + dev-browser + prd)?",
         initialValue: true,
@@ -1095,7 +1180,7 @@ async function main() {
   if (cmd === "prd") {
     let request = args.slice(1).join(" ").trim();
     if (!request) {
-      const { intro, outro, text, isCancel } = await import("@clack/prompts");
+      const { intro, outro, text, isCancel } = await loadPrompts();
       intro("Ralph PRD");
       const response = await text({
         message: "Describe the feature you want a PRD for",
