@@ -207,15 +207,18 @@ Useful flags: `--max-iterations <n>` (default 5), `--check '<cmd>'`
 
 ```
 for iteration in 1..MAX:
-  render builder prompt (incl. previous reviewer feedback + check logs)
-  run builder backend         (cwd = target worktree)
-  run check command           (cwd = target worktree)
+  render builder prompt (incl. previous reviewer feedback + check/preview/e2e logs)
+  run builder backend                 (cwd = target worktree)
+  run check command                   (cwd = target worktree)
   capture git diff vs base
-  render reviewer prompt (diff + check output + builder handoff)
-  run reviewer backend        (read-only)
+  if preview enabled:
+    preview-up -> preview-url -> e2e   (cwd = target worktree)
+  render reviewer prompt (diff + check/preview/e2e output + builder handoff)
+  run reviewer backend                (read-only)
   parse VERDICT: PASS|FAIL
-  if checks passed AND verdict PASS -> READY_FOR_HUMAN_REVIEW
-  else feed reviewer output + check log back into the next builder iteration
+  if check==0 AND (preview disabled OR preview-up+e2e ok) AND verdict PASS:
+    -> READY_FOR_HUMAN_REVIEW
+  else feed reviewer output + check/preview/e2e logs back into the next builder
 ```
 
 The builder must write `.agent-handoff.md` every attempt (summary, files touched,
@@ -261,8 +264,120 @@ git -C /path/to/target worktree remove <worktree path>
   story unless `--task`/`<index>` is given.
 - Worktrees are created at `<target-parent>/.ralph-worktrees/` (override with
   `RALPH_WORKTREE_DIR`) and are **not** auto-removed.
-- A `PASS` requires both a passing check command **and** a `VERDICT: PASS`; a
-  missing/garbled verdict line is treated as `FAIL`.
+- A `PASS` requires a passing check command, passing preview/e2e (if enabled),
+  **and** a `VERDICT: PASS`; a missing/garbled verdict line is treated as `FAIL`.
+
+### Scaffold a target repo (`ralph init-target`)
+
+```bash
+ralph init-target --repo /path/to/target                  # generic
+ralph init-target --repo /path/to/target --type nextjs-postgres
+```
+
+Creates `.agents/tasks/`, a `ralph.target.json` config, `scripts/check.sh`, adds
+`.ralph/` + `.agent-handoff.md` to `.gitignore`, and (for `nextjs-postgres`) adds
+executable `scripts/preview-up.sh`, `preview-down.sh`, `preview-url.sh`, `e2e.sh`
+templates. Existing files are not overwritten unless you pass `--force`.
+
+### Target config (`ralph.target.json`)
+
+Committed to the **target** repo. CLI flags override it; it overrides the
+built-in defaults.
+
+```json
+{
+  "check": "./scripts/check.sh",
+  "preview": {
+    "enabled": true,
+    "up": "./scripts/preview-up.sh",
+    "down": "./scripts/preview-down.sh",
+    "url": "./scripts/preview-url.sh",
+    "e2e": "./scripts/e2e.sh",
+    "host": "localhost",
+    "keepOnPass": true,
+    "keepOnFail": false
+  }
+}
+```
+
+### Website preview + e2e lifecycle
+
+When preview is enabled (config `preview.enabled` or `--preview`), each iteration
+adds `preview-up → preview-url → e2e` between the check and the reviewer. If
+`preview-up` or `e2e` fails, the iteration fails and its logs are fed back to the
+builder (a regression caught by e2e is treated as a failure of the current task,
+not a new one). After the run, the preview is torn down unless `keepOnPass`/
+`keepOnFail` (or `--keep-preview-on-fail`) says to leave it running.
+
+The target's preview scripts receive a **dynamic run environment** (they read env,
+they do not parse CLI args):
+
+| Env var | Meaning |
+| --- | --- |
+| `RALPH_RUN_ID` | unique id for this run |
+| `RALPH_TARGET_REPO` | the target repo path |
+| `RALPH_WORKTREE` | the worktree the scripts run in (cwd) |
+| `RALPH_BRANCH` | the run branch |
+| `RALPH_BASE_COMMIT` | commit the branch started from |
+| `RALPH_APP_PORT` / `RALPH_DB_PORT` | ports (auto-allocated if not passed) |
+| `RALPH_PREVIEW_URL` | `http://<host>:<app-port>` (or whatever `preview-url.sh` prints) |
+| `RALPH_COMPOSE_PROJECT` | isolated docker-compose project name |
+
+Ports come from `--app-port`/`--db-port` or are auto-allocated. Hostname defaults
+to `localhost` (`--preview-host` or config `preview.host`); for the apps VM use
+`--preview-host apps` so the URL is `http://apps:<app-port>`. Per-iteration preview
+artifacts are saved: `preview_up_N.log`, `preview_url_N.txt`, `e2e_N.log`, and
+`preview_down_N.log` if teardown runs.
+
+### Operator commands: status / integrate / cleanup
+
+```bash
+ralph status    --repo /path/to/target                 # summarize latest run
+ralph integrate --repo /path/to/target --run latest    # merge an APPROVED run
+ralph cleanup   --repo /path/to/target --run latest     # remove worktree / stop preview
+```
+
+Each run writes `<target>/.ralph/last-run.env` (RUN_ID, STATUS, BRANCH, WORKTREE,
+BASE_COMMIT, PREVIEW_URL, ARTIFACTS_DIR) so these commands can find it; `--run`
+accepts `latest` or a specific run id.
+
+`ralph integrate` is conservative: it refuses unless the run is
+`READY_FOR_HUMAN_REVIEW` (override with `--force`), refuses if the target is dirty,
+shows a diff summary, merges the run branch into the current branch with
+`git merge --no-ff`, re-runs the check, and **never pushes**. It does not remove the
+worktree unless you pass `--cleanup`. `ralph cleanup` removes the worktree (refuses
+a dirty one without `--force`), optionally stops the preview, and keeps the branch
+unless `--delete-branch`.
+
+### Operate from a coding agent (`ralph install-agent-commands`)
+
+```bash
+ralph install-agent-commands     # v1: Claude Code -> ~/.claude/commands/
+```
+
+Installs `/ralph-review`, `/ralph-status`, `/ralph-integrate`, `/ralph-cleanup`
+slash-commands that teach the agent to *drive* the harness (run it, summarize,
+ask before integrating) rather than reimplement it. Existing files are kept unless
+`--force`. See **[docs/agent-operator.md](docs/agent-operator.md)** for the full
+operator playbook (harness vs target, roles vs backends, expected agent behavior).
+
+### Intended website workflow
+
+```bash
+# 1. one-time: scaffold + author a PRD + fill in preview/e2e scripts
+ralph init-target --repo /path/to/target --type nextjs-postgres
+
+# 2. run the adversarial loop with preview validation
+ralph review 1 --repo /path/to/target --builder opencode-z --reviewer claude --preview
+#    harness: worktree -> builder -> check -> preview-up -> e2e -> reviewer (loop)
+
+# 3. if READY_FOR_HUMAN_REVIEW, open the printed preview URL and review the diff
+ralph status --repo /path/to/target
+
+# 4. after you approve, integrate and clean up (never auto-merged/pushed)
+ralph integrate --repo /path/to/target --run latest
+ralph cleanup   --repo /path/to/target --run latest
+```
 
 ## State files (.ralph/)
 

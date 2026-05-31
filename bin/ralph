@@ -17,7 +17,7 @@ let installForce = false;
 let prdPath = null;
 let progressPath = null;
 let prdOutPath = null;
-// Review-loop (builder/reviewer) options.
+// Review-loop (builder/reviewer) + operator options.
 const review = {
   repo: null,
   builder: null,
@@ -30,6 +30,17 @@ const review = {
   verdictRegex: null,
   allowDirty: false,
   noWorktree: false,
+  // preview / website validation
+  appPort: null,
+  dbPort: null,
+  previewHost: null,
+  preview: null, // null = use target config; true/false = forced
+  keepPreviewOnFail: false,
+  // init-target / operator commands
+  type: null,
+  run: null,
+  cleanup: false,
+  deleteBranch: false,
 };
 
 function exists(p) {
@@ -39,6 +50,145 @@ function exists(p) {
   } catch {
     return false;
   }
+}
+
+// --- Operator-command helpers (status / integrate / cleanup) ----------------
+function git(repo, gitArgs, opts = {}) {
+  return spawnSync("git", ["-C", repo, ...gitArgs], { encoding: "utf-8", ...opts });
+}
+
+function parseEnvFile(file) {
+  const out = {};
+  if (!exists(file)) return out;
+  for (const line of fs.readFileSync(file, "utf-8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const idx = trimmed.indexOf("=");
+    if (idx === -1) continue;
+    out[trimmed.slice(0, idx)] = trimmed.slice(idx + 1);
+  }
+  return out;
+}
+
+function readTargetConfig(repo) {
+  const file = path.join(repo, "ralph.target.json");
+  if (!exists(file)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+// Resolve a run directory from --run latest|<run-id>, falling back to last-run.env.
+function resolveRun(repo, runArg) {
+  const runsDir = path.join(repo, ".ralph", "runs");
+  const lastRun = parseEnvFile(path.join(repo, ".ralph", "last-run.env"));
+  if (!runArg || runArg === "latest") {
+    if (lastRun.RUN_ID && exists(path.join(runsDir, lastRun.RUN_ID))) {
+      return { runId: lastRun.RUN_ID, runDir: path.join(runsDir, lastRun.RUN_ID), lastRun };
+    }
+    // Fallback: newest directory by name.
+    if (exists(runsDir)) {
+      const dirs = fs
+        .readdirSync(runsDir)
+        .filter((d) => fs.statSync(path.join(runsDir, d)).isDirectory())
+        .sort();
+      if (dirs.length) {
+        const runId = dirs[dirs.length - 1];
+        return { runId, runDir: path.join(runsDir, runId), lastRun };
+      }
+    }
+    return { runId: null, runDir: null, lastRun };
+  }
+  return {
+    runId: runArg,
+    runDir: path.join(runsDir, runArg),
+    lastRun: lastRun.RUN_ID === runArg ? lastRun : {},
+  };
+}
+
+// Merge last-run.env with the chosen run's final_status.md / config.resolved.env.
+function loadRunMeta(repo, runArg) {
+  const { runId, runDir, lastRun } = resolveRun(repo, runArg);
+  let meta = { ...lastRun };
+  if (runDir && exists(path.join(runDir, "config.resolved.env"))) {
+    const cfg = parseEnvFile(path.join(runDir, "config.resolved.env"));
+    // last-run.env wins for STATUS/PREVIEW_URL; config fills the rest.
+    meta = { ...cfg, ...meta };
+  }
+  if (runId && !meta.RUN_ID) meta.RUN_ID = runId;
+  if (runDir && !meta.ARTIFACTS_DIR) meta.ARTIFACTS_DIR = runDir;
+  return { runId, runDir, meta };
+}
+
+// Shared by `cleanup` and `integrate --cleanup`. Conservative by design.
+function doCleanup(repo, runId, meta, deleteBranch, force) {
+  const actions = [];
+  const left = [];
+  const cfg = readTargetConfig(repo);
+  const worktree = meta.WORKTREE;
+
+  // Stop the preview if a down script/config exists.
+  if (cfg.preview && cfg.preview.enabled && cfg.preview.down) {
+    const runIn = worktree && exists(worktree) ? worktree : repo;
+    const composeProject =
+      meta.RALPH_COMPOSE_PROJECT ||
+      `ralph-${String(runId).toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
+    const env = {
+      ...process.env,
+      RALPH_RUN_ID: runId,
+      RALPH_COMPOSE_PROJECT: composeProject,
+      RALPH_TARGET_REPO: repo,
+      RALPH_WORKTREE: runIn,
+      RALPH_APP_PORT: meta.RALPH_APP_PORT || "",
+      RALPH_DB_PORT: meta.RALPH_DB_PORT || "",
+    };
+    const r = spawnSync("bash", ["-lc", cfg.preview.down], { cwd: runIn, env, stdio: "inherit" });
+    actions.push(`ran preview-down (${cfg.preview.down}) -> exit ${r.status ?? "?"}`);
+  }
+
+  // Remove the worktree (refuse if dirty unless --force).
+  if (worktree && worktree !== repo && exists(worktree)) {
+    const wtDirty = git(worktree, ["status", "--porcelain"])
+      .stdout.split("\n")
+      .filter((l) => l && !/\.ralph\//.test(l) && !/\.agent-handoff\.md/.test(l));
+    if (wtDirty.length && !force) {
+      left.push(
+        `worktree ${worktree} has uncommitted changes — not removed (use --force):\n    ${wtDirty
+          .join("\n    ")}`,
+      );
+    } else {
+      const args = ["worktree", "remove", worktree];
+      if (force) args.push("--force");
+      const r = git(repo, args);
+      if (r.status === 0) actions.push(`removed worktree ${worktree}`);
+      else left.push(`failed to remove worktree ${worktree}: ${(r.stderr || "").trim()}`);
+    }
+    git(repo, ["worktree", "prune"]);
+  } else if (worktree && worktree === repo) {
+    left.push("run used an in-place branch (no separate worktree to remove)");
+  } else {
+    actions.push(`no worktree to remove (${worktree || "none recorded"})`);
+  }
+
+  // Branch: keep by default.
+  const branch = meta.BRANCH;
+  if (branch) {
+    if (deleteBranch) {
+      const r = git(repo, ["branch", "-D", branch]);
+      if (r.status === 0) actions.push(`deleted branch ${branch}`);
+      else left.push(`could not delete branch ${branch}: ${(r.stderr || "").trim()}`);
+    } else {
+      left.push(`branch ${branch} kept (use --delete-branch to remove it)`);
+    }
+  }
+
+  console.log(`Cleanup for run ${runId} (${repo}):`);
+  for (const a of actions) console.log(`  ✔ ${a}`);
+  for (const l of left) console.log(`  • ${l}`);
+  if (!actions.length && !left.length) console.log("  (nothing to do)");
+  return 0;
 }
 
 function readPackageMeta() {
@@ -91,6 +241,11 @@ Commands:
   log "<message>"                     Append to .ralph/activity.log
   build [n] [--no-commit]             Run single-agent build loop (default)
   review [task] --repo <path>         Run builder/reviewer loop on a TARGET repo
+  status --repo <path>                Show the latest run's status
+  integrate --repo <path> [--run]     Merge an approved run branch (after approval)
+  cleanup --repo <path> [--run]       Remove a run's worktree / stop its preview
+  init-target --repo <path> [--type]  Scaffold a target repo (generic|nextjs-postgres)
+  install-agent-commands              Install operator slash-commands (Claude Code)
   overview                            Render a human overview from PRD JSON
   help                                Show this message
 
@@ -111,6 +266,15 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
   --allow-dirty                       Allow a dirty target working tree
   --no-worktree                       Branch in place instead of a git worktree
   --verdict-regex <re>                Reviewer verdict regex (default: '^VERDICT: (PASS|FAIL)')
+  --preview | --no-preview            Force website preview+e2e on/off (else target config)
+  --app-port <n> / --db-port <n>      Fixed preview ports (else auto-allocated)
+  --preview-host <host>               Hostname for the preview URL (default: localhost)
+  --keep-preview-on-fail              Leave the preview running after a failed run
+  --run latest|<run-id>               Select a run for status/integrate/cleanup
+  --force                             integrate non-ready / overwrite on install / force cleanup
+  --delete-branch                     cleanup: also delete the run branch
+  --cleanup                           integrate: also clean up the worktree afterwards
+  --type generic|nextjs-postgres      init-target scaffold type
 
 Notes:
 - Uses local .agents/ralph if present; otherwise uses bundled defaults.
@@ -220,6 +384,11 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     "--task": "task",
     "--branch": "branch",
     "--verdict-regex": "verdictRegex",
+    "--app-port": "appPort",
+    "--db-port": "dbPort",
+    "--preview-host": "previewHost",
+    "--type": "type",
+    "--run": "run",
   };
   let matchedReviewFlag = false;
   for (const [flag, key] of Object.entries(reviewFlags)) {
@@ -242,6 +411,26 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--no-worktree") {
     review.noWorktree = true;
+    continue;
+  }
+  if (arg === "--preview") {
+    review.preview = true;
+    continue;
+  }
+  if (arg === "--no-preview") {
+    review.preview = false;
+    continue;
+  }
+  if (arg === "--keep-preview-on-fail") {
+    review.keepPreviewOnFail = true;
+    continue;
+  }
+  if (arg === "--cleanup") {
+    review.cleanup = true;
+    continue;
+  }
+  if (arg === "--delete-branch") {
+    review.deleteBranch = true;
     continue;
   }
   args.push(arg);
@@ -389,8 +578,296 @@ async function main() {
     if (prdPath) env.PRD_PATH = path.resolve(cwd, prdPath);
     if (review.allowDirty) env.ALLOW_DIRTY = "true";
     if (review.noWorktree) env.USE_WORKTREE = "false";
+    // Preview / website validation
+    if (review.preview === true) env.PREVIEW_ENABLED = "true";
+    if (review.preview === false) env.PREVIEW_ENABLED = "false";
+    if (review.appPort) env.RALPH_APP_PORT = review.appPort;
+    if (review.dbPort) env.RALPH_DB_PORT = review.dbPort;
+    if (review.previewHost) env.PREVIEW_HOST = review.previewHost;
+    if (review.keepPreviewOnFail) env.KEEP_ON_FAIL = "true";
     const result = spawnSync(reviewLoop, [], { stdio: "inherit", env });
     process.exit(result.status ?? 1);
+  }
+
+  // --- Install operator commands into a coding agent (v1: Claude Code) --------
+  if (cmd === "install-agent-commands") {
+    let targetChoice = "claude";
+    if (process.stdout.isTTY && process.stdin.isTTY) {
+      const { intro, outro, select, isCancel } = await import("@clack/prompts");
+      intro("Ralph: install agent commands");
+      const sel = await select({
+        message: "Install operator commands for which agent?",
+        options: [{ value: "claude", label: "Claude Code" }],
+        initialValue: "claude",
+      });
+      if (isCancel(sel)) {
+        outro("Cancelled.");
+        process.exit(0);
+      }
+      targetChoice = sel;
+      outro("Installing...");
+    }
+    const srcDir = path.join(repoRoot, "agent-commands", targetChoice);
+    if (!exists(srcDir)) {
+      console.error(`No command templates for "${targetChoice}" at ${srcDir}`);
+      process.exit(1);
+    }
+    const home = os.homedir();
+    // Claude Code reads user slash commands from ~/.claude/commands/.
+    const destDir = path.join(home, ".claude", "commands");
+    fs.mkdirSync(destDir, { recursive: true });
+    const files = fs.readdirSync(srcDir).filter((f) => f.endsWith(".md"));
+    const installed = [];
+    const skipped = [];
+    for (const f of files) {
+      const dst = path.join(destDir, f);
+      if (exists(dst) && !installForce) {
+        skipped.push(f);
+        continue;
+      }
+      fs.copyFileSync(path.join(srcDir, f), dst);
+      installed.push(f);
+    }
+    console.log("Target agent: Claude Code");
+    console.log(`Source:       ${srcDir}`);
+    console.log(`Installed to: ${destDir}`);
+    if (installed.length)
+      console.log(`Installed:    ${installed.map((f) => "/" + f.replace(/\.md$/, "")).join(", ")}`);
+    if (skipped.length)
+      console.log(`Skipped (already exist; use --force): ${skipped.join(", ")}`);
+    console.log(
+      "\nUse them in Claude Code as: /ralph-review, /ralph-status, /ralph-integrate, /ralph-cleanup",
+    );
+    process.exit(0);
+  }
+
+  // --- Scaffold a target repo for the harness ---------------------------------
+  if (cmd === "init-target") {
+    const targetRepo = review.repo || process.env.TARGET_REPO;
+    if (!targetRepo) {
+      console.error("ralph init-target requires --repo <path>");
+      process.exit(1);
+    }
+    const repo = path.resolve(cwd, targetRepo);
+    if (!exists(repo)) {
+      console.error(`Target repo not found: ${repo}`);
+      process.exit(1);
+    }
+    const type = review.type || "generic";
+    if (!["generic", "nextjs-postgres"].includes(type)) {
+      console.error(`Unknown --type "${type}" (use generic|nextjs-postgres)`);
+      process.exit(1);
+    }
+    const templateDir = exists(localDir) ? localDir : globalDir;
+    const tplDir = path.join(templateDir, "target-templates");
+    const created = [];
+    const updated = [];
+    const skipped = [];
+
+    const tasksDir = path.join(repo, ".agents", "tasks");
+    if (!exists(tasksDir)) {
+      fs.mkdirSync(tasksDir, { recursive: true });
+      created.push(".agents/tasks/");
+    }
+
+    const giPath = path.join(repo, ".gitignore");
+    let gi = exists(giPath) ? fs.readFileSync(giPath, "utf-8") : "";
+    let giChanged = false;
+    for (const entry of [".ralph/", ".agent-handoff.md"]) {
+      const present = gi.split("\n").some((l) => l.trim() === entry);
+      if (!present) {
+        gi += (gi && !gi.endsWith("\n") ? "\n" : "") + entry + "\n";
+        giChanged = true;
+      }
+    }
+    if (giChanged) {
+      fs.writeFileSync(giPath, gi);
+      updated.push(".gitignore");
+    }
+
+    const scriptsDir = path.join(repo, "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    const copyScript = (name) => {
+      const dst = path.join(scriptsDir, name);
+      if (exists(dst) && !installForce) {
+        skipped.push(`scripts/${name}`);
+        return;
+      }
+      const src = path.join(tplDir, name);
+      if (!exists(src)) {
+        skipped.push(`scripts/${name} (no template)`);
+        return;
+      }
+      fs.copyFileSync(src, dst);
+      fs.chmodSync(dst, 0o755);
+      created.push(`scripts/${name}`);
+    };
+    copyScript("check.sh");
+
+    let cfgObj;
+    if (type === "nextjs-postgres") {
+      for (const s of ["preview-up.sh", "preview-down.sh", "preview-url.sh", "e2e.sh"])
+        copyScript(s);
+      cfgObj = {
+        check: "./scripts/check.sh",
+        preview: {
+          enabled: true,
+          up: "./scripts/preview-up.sh",
+          down: "./scripts/preview-down.sh",
+          url: "./scripts/preview-url.sh",
+          e2e: "./scripts/e2e.sh",
+          host: "localhost",
+          keepOnPass: true,
+          keepOnFail: false,
+        },
+      };
+    } else {
+      cfgObj = { check: "./scripts/check.sh", preview: { enabled: false } };
+    }
+    const cfgPath = path.join(repo, "ralph.target.json");
+    if (exists(cfgPath) && !installForce) {
+      skipped.push("ralph.target.json");
+    } else {
+      fs.writeFileSync(cfgPath, JSON.stringify(cfgObj, null, 2) + "\n");
+      created.push("ralph.target.json");
+    }
+
+    console.log(`Initialized target (${type}): ${repo}`);
+    if (created.length) console.log(`Created: ${created.join(", ")}`);
+    if (updated.length) console.log(`Updated: ${updated.join(", ")}`);
+    if (skipped.length) console.log(`Skipped (exist; use --force): ${skipped.join(", ")}`);
+    console.log(
+      `\nNext: add a PRD JSON under .agents/tasks/, edit scripts/, then run:\n  ralph review 1 --repo ${repo}`,
+    );
+    process.exit(0);
+  }
+
+  // --- Status of the latest (or chosen) run -----------------------------------
+  if (cmd === "status") {
+    const targetRepo = review.repo || process.env.TARGET_REPO;
+    if (!targetRepo) {
+      console.error("ralph status requires --repo <path>");
+      process.exit(1);
+    }
+    const repo = path.resolve(cwd, targetRepo);
+    const { runId, runDir, meta } = loadRunMeta(repo, review.run);
+    if (!runId) {
+      console.log(`No Ralph runs found in ${path.join(repo, ".ralph", "runs")}.`);
+      process.exit(0);
+    }
+    console.log(`Ralph status for ${repo}`);
+    console.log(`- Run:       ${meta.RUN_ID || runId}`);
+    console.log(`- Status:    ${meta.STATUS || "unknown"}`);
+    console.log(`- Branch:    ${meta.BRANCH || "?"}`);
+    console.log(`- Worktree:  ${meta.WORKTREE || "?"}`);
+    console.log(`- Base:      ${meta.BASE_COMMIT || meta.BASE_REF || "?"}`);
+    if (meta.PREVIEW_URL) console.log(`- Preview:   ${meta.PREVIEW_URL}`);
+    console.log(`- Artifacts: ${meta.ARTIFACTS_DIR || runDir}`);
+    const base = meta.BASE_COMMIT || meta.BASE_REF;
+    if (meta.BRANCH && base) {
+      const wt = meta.WORKTREE && exists(meta.WORKTREE) ? meta.WORKTREE : repo;
+      const stat = git(wt, ["diff", "--stat", base]);
+      if (stat.status === 0 && stat.stdout.trim()) {
+        console.log(`\nDiff summary (vs base):\n${stat.stdout.trim()}`);
+      }
+    }
+    if ((meta.STATUS || "") === "READY_FOR_HUMAN_REVIEW") {
+      console.log(`\nREADY_FOR_HUMAN_REVIEW — after you approve:`);
+      console.log(`  ralph integrate --repo ${repo} --run ${meta.RUN_ID || runId}`);
+    }
+    process.exit(0);
+  }
+
+  // --- Integrate an approved run ----------------------------------------------
+  if (cmd === "integrate") {
+    const targetRepo = review.repo || process.env.TARGET_REPO;
+    if (!targetRepo) {
+      console.error("ralph integrate requires --repo <path>");
+      process.exit(1);
+    }
+    const repo = path.resolve(cwd, targetRepo);
+    const { runId, meta } = loadRunMeta(repo, review.run);
+    if (!runId) {
+      console.error("No run found to integrate.");
+      process.exit(1);
+    }
+    const status = meta.STATUS || "";
+    if (status !== "READY_FOR_HUMAN_REVIEW" && !installForce) {
+      console.error(
+        `Run ${runId} status is "${status || "unknown"}", not READY_FOR_HUMAN_REVIEW. Use --force to override.`,
+      );
+      process.exit(1);
+    }
+    const branch = meta.BRANCH;
+    if (!branch) {
+      console.error("No branch recorded for this run.");
+      process.exit(1);
+    }
+    const dirty = git(repo, ["status", "--porcelain"])
+      .stdout.split("\n")
+      .filter((l) => l && !/\.ralph\//.test(l));
+    if (dirty.length) {
+      console.error(`Target repo has uncommitted changes; commit/stash first:\n${dirty.join("\n")}`);
+      process.exit(1);
+    }
+    const curBranch = git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim();
+    console.log(`Integrating run ${runId}`);
+    console.log(`- Merge branch:   ${branch}`);
+    console.log(`- Into:           ${curBranch}`);
+    const base = meta.BASE_COMMIT || meta.BASE_REF;
+    const stat = git(repo, ["diff", "--stat", base ? `${base}..${branch}` : `${curBranch}..${branch}`]);
+    if (stat.stdout.trim()) console.log(`\nDiff summary:\n${stat.stdout.trim()}\n`);
+    const merge = git(
+      repo,
+      ["merge", "--no-ff", branch, "-m", `ralph integrate ${runId} (${branch})`],
+      { stdio: "inherit", encoding: undefined },
+    );
+    if (merge.status !== 0) {
+      console.error("Merge failed (resolve conflicts manually). Nothing was pushed.");
+      process.exit(merge.status ?? 1);
+    }
+    console.log("Merge complete (not pushed).");
+    const cfg = readTargetConfig(repo);
+    const checkCmd = review.check || cfg.check || "./scripts/check.sh";
+    console.log(`\nRe-running check after merge: ${checkCmd}`);
+    const chk = spawnSync("bash", ["-lc", checkCmd], { cwd: repo, stdio: "inherit" });
+    if (chk.status !== 0) {
+      console.error(
+        `\n⚠️  Post-merge check FAILED (exit ${chk.status}). The merge is in your working tree but NOT pushed.`,
+      );
+    } else {
+      console.log("\n✅ Post-merge check passed.");
+    }
+    if (cfg.preview && cfg.preview.enabled) {
+      console.log(
+        `\nNote: preview/e2e were validated on branch ${branch} during the run. They are NOT re-run on integrate by default; re-run \`ralph review\` or your preview scripts to validate the merged result.`,
+      );
+    }
+    console.log(`\nNothing pushed. Push when ready: git -C ${repo} push`);
+    if (review.cleanup) {
+      console.log("\n--cleanup requested:");
+      doCleanup(repo, runId, meta, review.deleteBranch, installForce);
+    } else {
+      console.log(`Cleanup worktree when done: ralph cleanup --repo ${repo} --run ${runId}`);
+    }
+    process.exit(chk.status === 0 ? 0 : 2);
+  }
+
+  // --- Cleanup a run (worktree + preview) -------------------------------------
+  if (cmd === "cleanup") {
+    const targetRepo = review.repo || process.env.TARGET_REPO;
+    if (!targetRepo) {
+      console.error("ralph cleanup requires --repo <path>");
+      process.exit(1);
+    }
+    const repo = path.resolve(cwd, targetRepo);
+    const { runId, meta } = loadRunMeta(repo, review.run);
+    if (!runId) {
+      console.error("No run found to clean up.");
+      process.exit(1);
+    }
+    const code = doCleanup(repo, runId, meta, review.deleteBranch, installForce);
+    process.exit(code);
   }
 
   if (cmd === "install") {

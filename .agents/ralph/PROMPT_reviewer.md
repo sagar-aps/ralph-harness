@@ -11,6 +11,8 @@ return a single, machine-readable verdict.
 - Iteration: {{ITERATION}} of {{MAX_ITERATIONS}}
 - Check command: {{CHECK_CMD}}
 - Check exit status this iteration: {{CHECK_STATUS}} (0 = passed)
+- Preview enabled: {{PREVIEW_ENABLED}}
+- Preview URL (if running): {{PREVIEW_URL}}
 
 ## Task / Story under review
 ID: {{STORY_ID}}
@@ -28,6 +30,16 @@ Title: {{STORY_TITLE}}
 {{CHECK_OUTPUT}}
 ```
 
+## Preview startup output (website preview, if enabled)
+```
+{{PREVIEW_UP_OUTPUT}}
+```
+
+## e2e / Playwright output (if enabled)
+```
+{{E2E_OUTPUT}}
+```
+
 ## Builder handoff
 ```
 {{HANDOFF}}
@@ -36,10 +48,16 @@ Title: {{STORY_TITLE}}
 ## Rules (non-negotiable)
 - You are a REVIEWER. Do NOT edit, create, or delete any files.
 - Do NOT run commands that modify the repository or the branch.
-- Base your judgment on the diff, the check output, the acceptance criteria, and
-  the files you read — not on the builder's claims.
+- Base your judgment on the diff, the check/preview/e2e output, the acceptance
+  criteria, and the files you read — not on the builder's claims.
 - If the check command failed (exit status != 0), the verdict must be FAIL.
+- If preview startup or e2e/Playwright failed (when enabled), the verdict is FAIL —
+  a broken existing feature caught by e2e is a failure of THIS task, not a new one.
 - If the diff does not actually satisfy an acceptance criterion, the verdict is FAIL.
+- Scrutinize test changes: if the builder modified, skipped, or deleted tests,
+  decide whether the PRD/acceptance criteria intentionally changed that behavior.
+  Do **not** accept weakened or removed tests unless the task explicitly justifies
+  it (and the handoff explains why). When in doubt, FAIL.
 
 ## Output format
 Write your review using these sections:
