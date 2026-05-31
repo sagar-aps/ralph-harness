@@ -17,6 +17,20 @@ let installForce = false;
 let prdPath = null;
 let progressPath = null;
 let prdOutPath = null;
+// Review-loop (builder/reviewer) options.
+const review = {
+  repo: null,
+  builder: null,
+  reviewer: null,
+  maxIterations: null,
+  check: null,
+  task: null,
+  taskIndex: null,
+  branch: null,
+  verdictRegex: null,
+  allowDirty: false,
+  noWorktree: false,
+};
 
 function exists(p) {
   try {
@@ -75,7 +89,8 @@ Commands:
   prd ["<request>"] [--out path]      Generate a PRD (JSON) via agent
   ping                                Minimal agent health check
   log "<message>"                     Append to .ralph/activity.log
-  build [n] [--no-commit]             Run build loop (default)
+  build [n] [--no-commit]             Run single-agent build loop (default)
+  review [task] --repo <path>         Run builder/reviewer loop on a TARGET repo
   overview                            Render a human overview from PRD JSON
   help                                Show this message
 
@@ -85,9 +100,24 @@ Options:
   --progress <path>                   Override progress log path
   --agent <codex|claude|droid|opencode>  Override agent runner
 
+Review-loop options (also enabled by passing --repo/--reviewer to build):
+  --repo <path>                       Target repo to operate on (required)
+  --builder <backend>                 Backend for the builder role (default: opencode)
+  --reviewer <backend>                Backend for the reviewer role (default: claude)
+  --max-iterations <n>                Max builder/reviewer cycles (default: 5)
+  --check <cmd>                       Check command in target (default: ./scripts/check.sh)
+  --task <id> | review <index>        Select a PRD story by id or 1-based index
+  --branch <name>                     Override the working branch name
+  --allow-dirty                       Allow a dirty target working tree
+  --no-worktree                       Branch in place instead of a git worktree
+  --verdict-regex <re>                Reviewer verdict regex (default: '^VERDICT: (PASS|FAIL)')
+
 Notes:
 - Uses local .agents/ralph if present; otherwise uses bundled defaults.
 - State and logs are written to .ralph/ in the project.
+- The review loop never merges to main; it stops at READY_FOR_HUMAN_REVIEW.
+- Backends: claude, codex, droid, opencode, opencode-z, codex-write, codex-readonly,
+  or any custom AGENT_<NAME>_CMD defined in agents.sh/review-config.sh.
 `);
 }
 
@@ -178,6 +208,40 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   if (arg === "--progress") {
     progressPath = rawArgs[i + 1];
     i += 1;
+    continue;
+  }
+  // --- Review loop flags (--flag value and --flag=value forms) ---
+  const reviewFlags = {
+    "--repo": "repo",
+    "--builder": "builder",
+    "--reviewer": "reviewer",
+    "--max-iterations": "maxIterations",
+    "--check": "check",
+    "--task": "task",
+    "--branch": "branch",
+    "--verdict-regex": "verdictRegex",
+  };
+  let matchedReviewFlag = false;
+  for (const [flag, key] of Object.entries(reviewFlags)) {
+    if (arg === flag) {
+      review[key] = rawArgs[i + 1];
+      i += 1;
+      matchedReviewFlag = true;
+      break;
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      review[key] = arg.slice(flag.length + 1);
+      matchedReviewFlag = true;
+      break;
+    }
+  }
+  if (matchedReviewFlag) continue;
+  if (arg === "--allow-dirty") {
+    review.allowDirty = true;
+    continue;
+  }
+  if (arg === "--no-worktree") {
+    review.noWorktree = true;
     continue;
   }
   args.push(arg);
@@ -288,6 +352,45 @@ async function main() {
     } else {
       outro("Skipped update.");
     }
+  }
+
+  // --- Review loop (builder/reviewer) routing ---------------------------------
+  const reviewTriggered =
+    cmd === "review" ||
+    ((cmd === "build" || !cmd) &&
+      (review.repo || review.reviewer || review.builder || process.env.TARGET_REPO));
+  if (reviewTriggered) {
+    const templateDir = exists(localDir) ? localDir : globalDir;
+    const reviewLoop = path.join(templateDir, "review-loop.sh");
+    if (!exists(reviewLoop)) {
+      console.error(`review-loop.sh not found at ${reviewLoop}`);
+      process.exit(1);
+    }
+    // First bare integer positional (after the command word) = task index.
+    const positionals = args.slice(1).filter((a) => /^[0-9]+$/.test(a));
+    if (positionals.length && !review.task) {
+      review.taskIndex = positionals[0];
+    }
+    const targetRepo = review.repo || process.env.TARGET_REPO;
+    if (!targetRepo) {
+      console.error("A target repo is required. Pass --repo <path> or set TARGET_REPO.");
+      process.exit(1);
+    }
+    const env = { ...process.env };
+    env.TARGET_REPO = path.resolve(cwd, targetRepo);
+    if (review.builder || process.env.BUILDER) env.BUILDER = review.builder || process.env.BUILDER;
+    if (review.reviewer || process.env.REVIEWER) env.REVIEWER = review.reviewer || process.env.REVIEWER;
+    if (review.maxIterations) env.MAX_ITERATIONS = review.maxIterations;
+    if (review.check) env.CHECK_CMD = review.check;
+    if (review.task) env.TASK_ID = review.task;
+    if (review.taskIndex) env.TASK_INDEX = review.taskIndex;
+    if (review.branch) env.BRANCH = review.branch;
+    if (review.verdictRegex) env.VERDICT_REGEX = review.verdictRegex;
+    if (prdPath) env.PRD_PATH = path.resolve(cwd, prdPath);
+    if (review.allowDirty) env.ALLOW_DIRTY = "true";
+    if (review.noWorktree) env.USE_WORKTREE = "false";
+    const result = spawnSync(reviewLoop, [], { stdio: "inherit", env });
+    process.exit(result.status ?? 1);
   }
 
   if (cmd === "install") {
