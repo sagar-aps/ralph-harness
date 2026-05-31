@@ -140,11 +140,25 @@ $DIRTY"
   fi
 fi
 
-# ---- Select the story -------------------------------------------------------
+# ---- Run dir ----------------------------------------------------------------
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_DIR="$TARGET_REPO/.ralph/runs/$RUN_ID"
 mkdir -p "$RUN_DIR"
 
+# ---- Preflight (repo contract) — block before any worktree/agent ------------
+if ! bash "$SCRIPT_DIR/preflight.sh" "$TARGET_REPO" "$RUN_DIR/preflight.md"; then
+  mkdir -p "$TARGET_REPO/.ralph"
+  {
+    echo "RUN_ID=$RUN_ID"; echo "STATUS=PREFLIGHT_FAILED"; echo "BRANCH="
+    echo "WORKTREE="; echo "BASE_COMMIT=$(git -C "$TARGET_REPO" rev-parse HEAD 2>/dev/null)"
+    echo "PREVIEW_URL="; echo "ARTIFACTS_DIR=$RUN_DIR"; echo "TARGET_REPO=$TARGET_REPO"
+  } > "$TARGET_REPO/.ralph/last-run.env"
+  echo "Preflight failed — repo baseline is not healthy. No worktree created, no agents run."
+  echo "See $RUN_DIR/preflight.md and fix the repo contract first."
+  exit 3
+fi
+
+# ---- Select the story -------------------------------------------------------
 STORY_META="$RUN_DIR/story.meta.json"
 STORY_BLOCK="$RUN_DIR/task.md"
 python3 - "$PRD_PATH" "$STORY_META" "$STORY_BLOCK" "${TASK_ID:-}" "${TASK_INDEX:-}" <<'PY'

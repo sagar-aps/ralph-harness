@@ -47,6 +47,8 @@ const review = {
   maxTasks: null,
   autoApproveBuilder: false,
   stopOnFail: false,
+  // preflight (repo contract)
+  skipPreflight: false,
 };
 
 function exists(p) {
@@ -283,6 +285,7 @@ Commands:
   build [n] [--no-commit]             Run single-agent build loop (default)
   review [task] --repo <path>         Run builder/reviewer loop on a TARGET repo
   batch --repo <path> --plan <p>      Run many tasks sequentially in ONE worktree
+  preflight --repo <path>             Run the repo-contract preflight only
   status --repo <path>                Show the latest run's status
   integrate --repo <path> [--run]     Merge an approved run, re-check, then auto-cleanup
   cleanup --repo <path> [--run]       Remove a run's worktree / stop its preview
@@ -323,6 +326,10 @@ Batch options (ralph batch):
   --max-tasks <n>                     Cap how many tasks run (default: all)
   --auto-approve-builder              Builder runs unattended (permission-skipping); reviewer stays read-only
   --stop-on-fail                      Stop at the first failing task
+
+Preflight options (build / review / batch / preflight):
+  --no-preflight | --skip-preflight   Skip the repo-contract preflight phase
+  (configure steps under "preflight" in the target's ralph.target.json)
 
 Notes:
 - Uses local .agents/ralph if present; otherwise uses bundled defaults.
@@ -495,6 +502,10 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     review.stopOnFail = true;
     continue;
   }
+  if (arg === "--no-preflight" || arg === "--skip-preflight") {
+    review.skipPreflight = true;
+    continue;
+  }
   args.push(arg);
 }
 
@@ -639,6 +650,7 @@ async function main() {
     if (review.verdictRegex) env.VERDICT_REGEX = review.verdictRegex;
     if (prdPath) env.PRD_PATH = path.resolve(cwd, prdPath);
     if (review.allowDirty) env.ALLOW_DIRTY = "true";
+    if (review.skipPreflight) env.PREFLIGHT_SKIP = "true";
     if (review.noWorktree) env.USE_WORKTREE = "false";
     // Preview / website validation
     if (review.preview === true) env.PREVIEW_ENABLED = "true";
@@ -679,6 +691,7 @@ async function main() {
     if (review.branch) env.BRANCH = review.branch;
     if (review.verdictRegex) env.VERDICT_REGEX = review.verdictRegex;
     if (review.allowDirty) env.ALLOW_DIRTY = "true";
+    if (review.skipPreflight) env.PREFLIGHT_SKIP = "true";
     if (review.autoApproveBuilder) env.AUTO_APPROVE_BUILDER = "true";
     if (review.stopOnFail) env.STOP_ON_FAIL = "true";
     // End-of-batch website preview (same knobs as `ralph review`).
@@ -688,6 +701,27 @@ async function main() {
     if (review.dbPort) env.RALPH_DB_PORT = review.dbPort;
     if (review.previewHost) env.PREVIEW_HOST = review.previewHost;
     const result = spawnSync(batchLoop, [], { stdio: "inherit", env });
+    process.exit(result.status ?? 1);
+  }
+
+  // --- Preflight (repo contract) as a standalone phase ------------------------
+  if (cmd === "preflight") {
+    const targetRepo = review.repo || process.env.TARGET_REPO || cwd;
+    const repo = path.resolve(cwd, targetRepo);
+    if (!exists(repo)) {
+      console.error(`Repo not found: ${repo}`);
+      process.exit(1);
+    }
+    const templateDir = exists(localDir) ? localDir : globalDir;
+    const pf = path.join(templateDir, "preflight.sh");
+    if (!exists(pf)) {
+      console.error(`preflight.sh not found at ${pf}`);
+      process.exit(1);
+    }
+    const env = { ...process.env };
+    if (review.skipPreflight) env.PREFLIGHT_SKIP = "true";
+    const report = path.join(repo, ".ralph", `preflight-${Date.now()}.md`);
+    const result = spawnSync("bash", [pf, repo, report], { stdio: "inherit", env });
     process.exit(result.status ?? 1);
   }
 
@@ -877,6 +911,14 @@ async function main() {
         copyScript(s);
       cfgObj = {
         check: "./scripts/check.sh",
+        // Repo-contract preflight: run before any worktree/agent; blocks on failure.
+        preflight: {
+          enabled: true,
+          install: "npm ci",
+          check: "./scripts/check.sh",
+          test: "npm test",
+          e2e: "",
+        },
         preview: {
           enabled: true,
           up: "./scripts/preview-up.sh",
@@ -889,7 +931,11 @@ async function main() {
         },
       };
     } else {
-      cfgObj = { check: "./scripts/check.sh", preview: { enabled: false } };
+      cfgObj = {
+        check: "./scripts/check.sh",
+        preflight: { enabled: true, check: "./scripts/check.sh" },
+        preview: { enabled: false },
+      };
     }
     const cfgPath = path.join(repo, "ralph.target.json");
     if (exists(cfgPath) && !installForce) {
@@ -1360,6 +1406,23 @@ async function main() {
       process.exit(1);
     }
     env.PRD_PATH = resolvedPrdPath;
+  }
+
+  // Preflight (repo contract) before the single-agent build loop. No-op unless a
+  // `preflight` block is configured in ./ralph.target.json. Blocks on failure.
+  if (needsPrd && env.RALPH_DRY_RUN !== "1") {
+    const pf = path.join(templateDir, "preflight.sh");
+    if (exists(pf)) {
+      const pfEnv = { ...env };
+      if (review.skipPreflight) pfEnv.PREFLIGHT_SKIP = "true";
+      const report = path.join(cwd, ".ralph", "preflight.md");
+      const pfRes = spawnSync("bash", [pf, cwd, report], { stdio: "inherit", env: pfEnv });
+      if (pfRes.status === 3) {
+        console.error("Preflight failed — repo baseline is not healthy. Not starting the build.");
+        console.error(`See ${report} and fix the repo contract first (or pass --no-preflight).`);
+        process.exit(3);
+      }
+    }
   }
 
   const result = spawnSync(loopPath, loopArgs, {

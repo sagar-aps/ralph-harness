@@ -17,6 +17,10 @@ Keep this file short. It is always loaded into context.
 - Docs/examples: `README.md`, `examples/`, `docs/agent-operator.md`
 
 ## Review loop + operator (target-repo orchestration)
+- Preflight (repo contract): `.agents/ralph/preflight.sh` — runs configured
+  install/check/test/e2e from `ralph.target.json` before any worktree/agent;
+  blocks build/review/batch on failure (exit 3, STATUS=PREFLIGHT_FAILED). Also a
+  standalone `ralph preflight`; bypass with `--no-preflight`.
 - Single-agent build loop: `.agents/ralph/loop.sh` (unchanged, runs in-place).
 - Adversarial loop: `.agents/ralph/review-loop.sh` — builder/reviewer on a SEPARATE
   target repo via worktree, optional preview/e2e lifecycle, never merges.
@@ -29,8 +33,8 @@ Keep this file short. It is always loaded into context.
 - Target scaffolding templates: `.agents/ralph/target-templates/` (used by
   `ralph init-target`). Operator commands: canonical set in `agent-commands/ralph/`,
   adapted per agent (claude/codex/copilot) by `ralph install-agent-commands`.
-- Operator commands live in `bin/ralph`: `review`, `batch`, `status`, `integrate`,
-  `cleanup`, `init-target`, `install-agent-commands`. Run metadata:
+- Operator commands live in `bin/ralph`: `review`, `batch`, `preflight`, `status`,
+  `integrate`, `cleanup`, `init-target`, `install-agent-commands`. Run metadata:
   `<target>/.ralph/last-run.env`; artifacts: `<target>/.ralph/runs/<run-id>/` (review)
   or `<target>/.agent-run/batch-<ts>/` (batch).
 

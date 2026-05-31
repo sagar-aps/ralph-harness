@@ -18,8 +18,15 @@ Steps:
    ralph review $ARGUMENTS
    ```
    If `--repo` is missing, ask the user for the target repo path first.
-2. Stream/observe the output. The loop runs builder → check → (preview → e2e) →
+2. Stream/observe the output. Ralph first runs a **preflight** (repo-contract
+   install/check/test/e2e) and only then runs builder → check → (preview → e2e) →
    reviewer, repeating on failure up to max iterations.
+   - **If preflight fails** (the run exits with `PREFLIGHT_FAILED` and no worktree
+     is created): the baseline repo is broken, NOT the task. Do **not** try to
+     implement the PRD or bypass preflight. Read `<run-dir>/preflight.md`, and
+     propose the **minimal repo-contract fix** (e.g. correct an install/test
+     command, add a missing dep/script, fix the failing baseline check) for the
+     human to apply. Re-run only after the contract is green.
 3. When it finishes, read `<target>/.ralph/last-run.env` and the run's
    `final_status.md` and summarize for the human:
    - outcome (READY_FOR_HUMAN_REVIEW or FAILED_MAX_ITERATIONS)

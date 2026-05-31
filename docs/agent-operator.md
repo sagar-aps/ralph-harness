@@ -51,6 +51,24 @@ preview scripts for `nextjs-postgres`), and adds `.ralph/` + `.agent-handoff.md`
 to `.gitignore`. Then add a PRD JSON under `.agents/tasks/` and fill in the
 scripts.
 
+## Preflight (repo contract)
+
+Before `build` / `review` / `batch` makes a worktree or starts an agent, Ralph runs
+a **preflight** phase against the baseline checkout — the repo's configured
+`install` / `check` / `test` / `e2e` (set under `preflight` in `ralph.target.json`).
+If any step fails, the run is **blocked**: no worktree, no agents, exit status 3,
+`STATUS=PREFLIGHT_FAILED` in `.ralph/last-run.env`, and a `preflight.md` report.
+
+Run it on its own with `ralph preflight --repo <target>`; bypass it with
+`--no-preflight`.
+
+**Operator behavior on preflight failure:** a failing preflight means the repo
+*setup* is broken, not the task. Do **not** implement PRDs or bypass preflight to
+push work through. Read the `preflight.md` report and propose the **minimal
+repo-contract fix** (a corrected install/test command, a missing dependency or
+script, a broken baseline check) for the human to apply, then re-run once the
+contract is green.
+
 ## Running a review
 
 ```bash

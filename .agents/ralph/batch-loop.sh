@@ -141,13 +141,27 @@ $DIRTY"
   fi
 fi
 
-# ---- Run dir + task discovery ----------------------------------------------
+# ---- Run dir ---------------------------------------------------------------
 TS="$(date +%Y%m%d-%H%M%S)-$$"
 BRANCH="${BRANCH:-ralph/batch-$TS}"
 RUN_DIR="$TARGET_REPO/.agent-run/batch-$TS"
 TASKS_DIR="$RUN_DIR/tasks"
 mkdir -p "$TASKS_DIR"
 
+# ---- Preflight (repo contract) — block before any worktree/agent ------------
+if ! bash "$SCRIPT_DIR/preflight.sh" "$TARGET_REPO" "$RUN_DIR/preflight.md"; then
+  mkdir -p "$TARGET_REPO/.ralph"
+  {
+    echo "RUN_ID=batch-$TS"; echo "STATUS=PREFLIGHT_FAILED"; echo "BRANCH="
+    echo "WORKTREE="; echo "BASE_COMMIT=$(git -C "$TARGET_REPO" rev-parse HEAD 2>/dev/null)"
+    echo "PREVIEW_URL="; echo "ARTIFACTS_DIR=$RUN_DIR"; echo "TARGET_REPO=$TARGET_REPO"
+  } > "$TARGET_REPO/.ralph/last-run.env"
+  echo "Preflight failed — repo baseline is not healthy. No worktree created, no agents run."
+  echo "See $RUN_DIR/preflight.md and fix the repo contract first."
+  exit 3
+fi
+
+# ---- Task discovery --------------------------------------------------------
 MANIFEST="$TASKS_DIR/manifest.tsv"
 python3 - "$PLAN" "$TASKS_DIR" "$MANIFEST" <<'PY'
 import os, re, sys

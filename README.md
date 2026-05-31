@@ -303,6 +303,13 @@ built-in defaults.
 ```json
 {
   "check": "./scripts/check.sh",
+  "preflight": {
+    "enabled": true,
+    "install": "npm ci",
+    "check": "./scripts/check.sh",
+    "test": "npm test",
+    "e2e": ""
+  },
   "preview": {
     "enabled": true,
     "up": "./scripts/preview-up.sh",
@@ -315,6 +322,25 @@ built-in defaults.
   }
 }
 ```
+
+### Preflight (repo contract)
+
+Before `build` / `review` / `batch` creates any worktree or starts any agent,
+Ralph runs a **preflight** phase against the current checkout to confirm the
+baseline repo is healthy — so a broken repo never burns an agent run.
+
+- Configure ordered steps under `preflight` in `ralph.target.json`: `install`,
+  `check`, `test`, `e2e` (each optional), plus an optional `commands: [...]` list.
+  Steps run **fail-fast** in the target repo; the first failure blocks the run.
+- A preflight failure **blocks**: no worktree is created, no agent runs, the run
+  exits with status **3** and `STATUS=PREFLIGHT_FAILED` in `.ralph/last-run.env`,
+  and a report is written to the run's `preflight.md`.
+- It's a no-op (pass) if there's no `preflight` block, `enabled` is `false`, or you
+  pass `--no-preflight` (alias `--skip-preflight`).
+- Run it on its own anytime: `ralph preflight --repo /path/to/target`.
+
+When preflight fails, the repo *contract* is broken, not the task — operator agents
+are instructed to propose the minimal repo-contract fix rather than implement PRDs.
 
 ### Website preview + e2e lifecycle
 
