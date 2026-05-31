@@ -40,6 +40,7 @@ const review = {
   type: null,
   run: null,
   cleanup: false,
+  skipCleanup: false,
   deleteBranch: false,
 };
 
@@ -122,7 +123,8 @@ function loadRunMeta(repo, runArg) {
   return { runId, runDir, meta };
 }
 
-// Shared by `cleanup` and `integrate --cleanup`. Conservative by design.
+// Shared by `cleanup` and the default cleanup that `integrate` runs on success.
+// Conservative by design: refuses a dirty worktree without force; keeps the branch.
 function doCleanup(repo, runId, meta, deleteBranch, force) {
   const actions = [];
   const left = [];
@@ -242,7 +244,7 @@ Commands:
   build [n] [--no-commit]             Run single-agent build loop (default)
   review [task] --repo <path>         Run builder/reviewer loop on a TARGET repo
   status --repo <path>                Show the latest run's status
-  integrate --repo <path> [--run]     Merge an approved run branch (after approval)
+  integrate --repo <path> [--run]     Merge an approved run, re-check, then auto-cleanup
   cleanup --repo <path> [--run]       Remove a run's worktree / stop its preview
   init-target --repo <path> [--type]  Scaffold a target repo (generic|nextjs-postgres)
   install-agent-commands              Install operator slash-commands (Claude Code)
@@ -272,8 +274,8 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
   --keep-preview-on-fail              Leave the preview running after a failed run
   --run latest|<run-id>               Select a run for status/integrate/cleanup
   --force                             integrate non-ready / overwrite on install / force cleanup
-  --delete-branch                     cleanup: also delete the run branch
-  --cleanup                           integrate: also clean up the worktree afterwards
+  --delete-branch                     also delete the run branch (cleanup/integrate)
+  --keep-worktree | --skip-cleanup    integrate: don't auto-clean up afterwards
   --type generic|nextjs-postgres      init-target scaffold type
 
 Notes:
@@ -427,6 +429,10 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--cleanup") {
     review.cleanup = true;
+    continue;
+  }
+  if (arg === "--keep-worktree" || arg === "--skip-cleanup") {
+    review.skipCleanup = true;
     continue;
   }
   if (arg === "--delete-branch") {
@@ -831,26 +837,45 @@ async function main() {
     const checkCmd = review.check || cfg.check || "./scripts/check.sh";
     console.log(`\nRe-running check after merge: ${checkCmd}`);
     const chk = spawnSync("bash", ["-lc", checkCmd], { cwd: repo, stdio: "inherit" });
+
+    // SAFETY: a failed post-merge check skips cleanup so the worktree/preview
+    // stay available for debugging. (A failed merge already exited above.)
     if (chk.status !== 0) {
       console.error(
         `\n⚠️  Post-merge check FAILED (exit ${chk.status}). The merge is in your working tree but NOT pushed.`,
       );
-    } else {
-      console.log("\n✅ Post-merge check passed.");
+      console.log(
+        `\nSkipping cleanup so you can debug. Worktree and preview left in place. When ready:\n  ralph cleanup --repo ${repo} --run ${runId}`,
+      );
+      console.log(`Nothing pushed. Push when ready: git -C ${repo} push`);
+      process.exit(2);
     }
+
+    console.log("\n✅ Post-merge check passed.");
     if (cfg.preview && cfg.preview.enabled) {
       console.log(
         `\nNote: preview/e2e were validated on branch ${branch} during the run. They are NOT re-run on integrate by default; re-run \`ralph review\` or your preview scripts to validate the merged result.`,
       );
     }
     console.log(`\nNothing pushed. Push when ready: git -C ${repo} push`);
-    if (review.cleanup) {
-      console.log("\n--cleanup requested:");
-      doCleanup(repo, runId, meta, review.deleteBranch, installForce);
+
+    // DEFAULT: clean up this run (stop preview + remove worktree), keeping the
+    // branch. Opt out with --keep-worktree / --skip-cleanup.
+    if (review.skipCleanup) {
+      console.log(
+        `\nCleanup skipped (--keep-worktree). Clean up when done:\n  ralph cleanup --repo ${repo} --run ${runId}`,
+      );
     } else {
-      console.log(`Cleanup worktree when done: ralph cleanup --repo ${repo} --run ${runId}`);
+      console.log("\nCleaning up this run (default after a successful integrate):");
+      // Never delete the branch as part of the integrate default; only --delete-branch does.
+      doCleanup(repo, runId, meta, review.deleteBranch, installForce);
+      if (!review.deleteBranch && branch) {
+        console.log(
+          `\nBranch ${branch} kept. Delete it yourself when no longer needed:\n  git -C ${repo} branch -D ${branch}`,
+        );
+      }
     }
-    process.exit(chk.status === 0 ? 0 : 2);
+    process.exit(0);
   }
 
   // --- Cleanup a run (worktree + preview) -------------------------------------

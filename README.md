@@ -16,7 +16,23 @@ Ralph treats **files and git** as memory, not the model context:
 
 ## Global CLI (recommended)
 
-Install and run Ralph from anywhere:
+### Local install from this checkout (recommended for the harness)
+
+If you are running this harness from a local clone, link it once so the `ralph`
+command points at your checkout (picks up your edits immediately, no publish):
+
+```bash
+cd /path/to/ralph-harness   # the directory where you cloned this repo
+npm link
+```
+
+After that, use `ralph ...` directly from anywhere:
+
+```bash
+ralph review 1 --repo /path/to/target --builder opencode-z --reviewer claude
+```
+
+### Or install the published package
 
 ```bash
 npm i -g @iannuttall/ralph
@@ -344,10 +360,22 @@ accepts `latest` or a specific run id.
 `ralph integrate` is conservative: it refuses unless the run is
 `READY_FOR_HUMAN_REVIEW` (override with `--force`), refuses if the target is dirty,
 shows a diff summary, merges the run branch into the current branch with
-`git merge --no-ff`, re-runs the check, and **never pushes**. It does not remove the
-worktree unless you pass `--cleanup`. `ralph cleanup` removes the worktree (refuses
-a dirty one without `--force`), optionally stops the preview, and keeps the branch
-unless `--delete-branch`.
+`git merge --no-ff`, re-runs the check, and **never pushes**.
+
+On a successful merge **and** a passing post-merge check, `integrate` then
+**automatically cleans up that run by default**: it stops the preview and removes
+the worktree, **keeping the branch**. Safety rails:
+
+- a failed merge → no cleanup (resolve conflicts manually);
+- a failed post-merge check → no cleanup (worktree/preview left for debugging);
+- a dirty worktree → cleanup refuses to remove it unless `--force`;
+- the branch is never deleted automatically (only `--delete-branch` does that);
+- nothing is ever pushed.
+
+Opt out of the auto-cleanup with `--keep-worktree` (alias `--skip-cleanup`). After
+a kept worktree you can clean up later with `ralph cleanup`. `ralph cleanup`
+removes the worktree (refuses a dirty one without `--force`), optionally stops the
+preview, and keeps the branch unless `--delete-branch`.
 
 ### Operate from a coding agent (`ralph install-agent-commands`)
 

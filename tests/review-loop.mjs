@@ -231,24 +231,42 @@ console.log("4) ralph status reads latest run metadata");
 }
 
 // ---------------------------------------------------------------------------
-console.log("5) ralph integrate refuses unless READY (then integrates on success)");
+function reviewToReady(target) {
+  return ralph(["review", "1", "--repo", target, "--max-iterations", "1"], {
+    RALPH_DRY_RUN: "1",
+    RALPH_WORKTREE_DIR: wtDirFor(target),
+  });
+}
+function lastRunField(target, key) {
+  const m = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8").match(
+    new RegExp(`^${key}=(.*)$`, "m"),
+  );
+  return m ? m[1].trim() : null;
+}
+
+console.log("5a) ralph integrate refuses unless READY");
 {
-  // Refusal: fabricate a non-ready last-run.env.
   const { target } = makeTarget();
   try {
-    ralph(["review", "1", "--repo", target, "--max-iterations", "1"], {
-      RALPH_DRY_RUN: "1",
-      RALPH_WORKTREE_DIR: wtDirFor(target),
-    });
+    reviewToReady(target);
     const lastRunPath = path.join(target, ".ralph", "last-run.env");
     const orig = readFileSync(lastRunPath, "utf-8");
     writeFileSync(lastRunPath, orig.replace("STATUS=READY_FOR_HUMAN_REVIEW", "STATUS=FAILED_MAX_ITERATIONS"));
     const refuse = ralph(["integrate", "--repo", target]);
     check(refuse.status !== 0, "integrate refuses when status != READY");
     check(/not READY_FOR_HUMAN_REVIEW/.test(`${refuse.stdout}${refuse.stderr}`), "refusal explains why");
+  } finally {
+    cleanupTarget(target);
+  }
+}
 
-    // Success: restore READY and integrate.
-    writeFileSync(lastRunPath, orig);
+console.log("5b) ralph integrate default: merge + check + auto-cleanup, branch kept");
+{
+  const { target } = makeTarget({ preview: true });
+  try {
+    reviewToReady(target);
+    const wt = lastRunField(target, "WORKTREE");
+    const branch = lastRunField(target, "BRANCH");
     const mainBefore = git(target, ["rev-parse", "HEAD"]);
     const ok = ralph(["integrate", "--repo", target]);
     const out = `${ok.stdout}${ok.stderr}`;
@@ -256,7 +274,45 @@ console.log("5) ralph integrate refuses unless READY (then integrates on success
     check(out.includes("Merge complete"), "performs a merge");
     check(out.includes("Post-merge check passed"), "re-runs the check after merge");
     check(git(target, ["rev-parse", "HEAD"]) !== mainBefore, "target branch advanced by the merge");
+    check(out.includes("Cleaning up this run"), "auto-cleans up by default");
+    check(out.includes("removed worktree"), "default cleanup removes the worktree");
+    check(!existsSync(wt), "worktree is gone after default integrate");
+    check(git(target, ["branch", "--list", branch]).includes(branch), "branch kept by default");
     check(/Push when ready/.test(out), "tells user to push manually (never auto-pushes)");
+  } finally {
+    cleanupTarget(target);
+  }
+}
+
+console.log("5c) ralph integrate --keep-worktree preserves the worktree");
+{
+  const { target } = makeTarget();
+  try {
+    reviewToReady(target);
+    const wt = lastRunField(target, "WORKTREE");
+    const ok = ralph(["integrate", "--repo", target, "--keep-worktree"]);
+    const out = `${ok.stdout}${ok.stderr}`;
+    check(ok.status === 0, "integrate --keep-worktree exits 0");
+    check(out.includes("Cleanup skipped"), "reports cleanup skipped");
+    check(existsSync(wt), "worktree preserved with --keep-worktree");
+  } finally {
+    cleanupTarget(target);
+  }
+}
+
+console.log("5d) failed post-merge check does NOT auto-cleanup");
+{
+  const { target } = makeTarget();
+  try {
+    reviewToReady(target);
+    const wt = lastRunField(target, "WORKTREE");
+    // Force the post-merge check to fail (review used the real passing check).
+    const r = ralph(["integrate", "--repo", target, "--check", "false"]);
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 2, "exits 2 when post-merge check fails");
+    check(out.includes("Post-merge check FAILED"), "reports the failing post-merge check");
+    check(out.includes("Skipping cleanup"), "skips cleanup on a failed post-merge check");
+    check(existsSync(wt), "worktree preserved when post-merge check fails");
   } finally {
     cleanupTarget(target);
   }

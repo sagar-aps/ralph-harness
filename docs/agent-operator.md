@@ -27,6 +27,18 @@ branch**. Integration is a separate, explicit, human-approved step.
 - Roles and backends are decoupled. Assign them per run with `--builder` /
   `--reviewer`, or in `.agents/ralph/review-config.sh`.
 
+## Installing the harness (recommended: local link)
+
+Run this once from your clone so the `ralph` command points at your checkout:
+
+```bash
+cd /path/to/ralph-harness   # the directory where you cloned this repo
+npm link
+```
+
+After that, use `ralph ...` directly from anywhere (it always reflects your local
+edits — no publish/reinstall needed).
+
 ## One-time setup of a target
 
 ```bash
@@ -89,6 +101,15 @@ the target's current branch with a normal `git merge --no-ff`, and re-runs the
 check command afterward. It **never pushes** — push yourself when ready. Preview/
 e2e are not re-run on integrate by default (re-run `ralph review` if you want to
 re-validate the merged result).
+
+**Default cleanup:** on a successful merge *and* a passing post-merge check,
+`integrate` automatically cleans up that run — it stops the preview and removes the
+worktree, **keeping the branch**. It prints what it did (preview stopped / worktree
+removed / branch kept) and the command to delete the branch if you want to. Safety:
+a failed merge or a failed post-merge check skips cleanup (worktree/preview left for
+debugging), a dirty worktree is not removed without `--force`, and the branch is
+never deleted unless you pass `--delete-branch`. Pass `--keep-worktree` (alias
+`--skip-cleanup`) to integrate without the auto-cleanup.
 
 ## Cleaning up worktrees / previews
 

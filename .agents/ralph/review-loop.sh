@@ -395,8 +395,9 @@ write_final_status() {
     echo ""
     echo "## Next steps"
     echo "- Inspect: git -C \"$WORKDIR\" diff \"$BASE_REF\""
-    echo "- Integrate (after human approval): ralph integrate --repo \"$TARGET_REPO\" --run $RUN_ID"
-    echo "- Cleanup: ralph cleanup --repo \"$TARGET_REPO\" --run $RUN_ID"
+    echo "- Integrate (after human approval; merges, re-checks, then auto-cleans up, keeps branch):"
+    echo "    ralph integrate --repo \"$TARGET_REPO\" --run $RUN_ID"
+    echo "- Cleanup only (no merge): ralph cleanup --repo \"$TARGET_REPO\" --run $RUN_ID"
   } > "$RUN_DIR/final_status.md"
 }
 
@@ -601,7 +602,7 @@ if [[ "$PREVIEW_ENABLED" == "true" && -n "$RALPH_PREVIEW_URL" ]]; then
     echo "  Preview:   $RALPH_PREVIEW_URL  (stopped)"
   fi
 fi
-echo "  Integrate: ralph integrate --repo \"$TARGET_REPO\" --run $RUN_ID"
+echo "  Integrate: ralph integrate --repo \"$TARGET_REPO\" --run $RUN_ID   (merges, re-checks, auto-cleans, keeps branch)"
 echo "  Cleanup:   ralph cleanup --repo \"$TARGET_REPO\" --run $RUN_ID"
 echo "═══════════════════════════════════════════════════════"
 
