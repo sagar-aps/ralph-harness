@@ -7,6 +7,9 @@ You are operating the **Ralph harness** as a pilot. Ralph is the orchestrator; t
 target repo is the project being changed. You drive Ralph — you do **not**
 implement the PRD yourself.
 
+`ralph review` handles ONE task. For several tasks in one unattended run (one shared
+worktree, sequential), use `/ralph-batch` instead.
+
 Run the review loop with the arguments the user gave: `$ARGUMENTS`
 
 Steps:

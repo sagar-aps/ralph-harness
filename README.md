@@ -421,6 +421,54 @@ ralph integrate --repo /path/to/target --run latest
 ralph cleanup   --repo /path/to/target --run latest
 ```
 
+### Batch mode: many tasks, one shared worktree (`ralph batch`)
+
+`ralph review` runs **one** task per worktree. `ralph batch` runs **many** tasks
+**sequentially on a single shared branch + worktree**, so later tasks build on
+earlier ones — ideal for working a backlog unattended (e.g. overnight).
+
+```bash
+ralph batch \
+  --repo /path/to/target \
+  --plan ./prds \
+  --builder claude --reviewer codex \
+  --check ./scripts/check.sh \
+  --max-tasks 10 \
+  --auto-approve-builder \
+  --stop-on-fail
+```
+
+- `--plan` is a **directory of `*.md` tasks** (run in sorted filename order) or a
+  **single `.md` file** split into tasks at its shallowest heading level.
+- One branch/worktree `ralph/batch-<timestamp>` is created for the whole batch.
+  Per task: builder → check → reviewer (read-only) → record result → commit on the
+  branch. Failed tasks are kept (so later tasks can build on them) and clearly
+  marked; `--stop-on-fail` halts at the first failure instead.
+- `--auto-approve-builder` lets the **builder** edit unattended (permission-skipping
+  flags; logged explicitly). It **never** affects the reviewer, which always runs
+  read-only (sandboxed for Codex). Without it the builder runs in manual mode.
+- `--max-tasks <n>` caps how many tasks run (default: all).
+- Guardrails: refuses a dirty target unless `--allow-dirty`; prints the full plan
+  (repo, branch, worktree, builder, reviewer, check, flags) before starting; never
+  merges, pushes, or deletes anything.
+
+Artifacts go to `<target>/.agent-run/batch-<timestamp>/`:
+
+```
+.agent-run/batch-<timestamp>/
+  config.resolved.env        tasks/manifest.tsv  tasks/task-NNN.md
+  task-NNN-builder-prompt.md task-NNN-builder.log
+  task-NNN-check.log         task-NNN-diff.patch task-NNN-handoff.md
+  task-NNN-reviewer.md       task-NNN-result.md
+  batch-context.md           final-report.md
+```
+
+The `final-report.md` lists tasks attempted/completed, per-task files changed,
+checks, reviewer verdicts, failures/blockers, and suggested human-review steps. The
+batch also writes `<target>/.ralph/last-run.env`, so `ralph status` / `ralph integrate`
+/ `ralph cleanup` work on the batch branch just like a single review run. Add it to
+your operator agent with `/ralph-batch` (installed by `ralph install-agent-commands`).
+
 ## State files (.ralph/)
 
 - `progress.md` — append‑only progress log

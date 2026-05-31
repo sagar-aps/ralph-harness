@@ -72,6 +72,33 @@ It ends in one of two states:
 - **`FAILED_MAX_ITERATIONS`** — it could not reach a passing state in the allotted
   iterations. Inspect the artifacts, adjust, and re-run.
 
+## Running a batch (many tasks, one shared worktree)
+
+For a backlog of tasks in one unattended run, use `ralph batch`. It creates ONE
+branch/worktree `ralph/batch-<timestamp>` and runs tasks **sequentially** on it, so
+later tasks build on earlier ones.
+
+```bash
+ralph batch --repo /path/to/target --plan ./prds \
+  --builder claude --reviewer codex \
+  --max-tasks 10 --auto-approve-builder --stop-on-fail
+```
+
+- `--plan` is a directory of `*.md` tasks (sorted) or one `.md` file split at its
+  shallowest heading level.
+- Per task: builder → check → reviewer (read-only) → record → commit on the branch.
+- `--auto-approve-builder` lets the builder edit unattended; it never affects the
+  reviewer (always read-only). Without it the builder runs in manual mode and will
+  likely stall waiting for approval — so pass it for overnight runs.
+- `--stop-on-fail` halts at the first failing task; otherwise failures are marked
+  and the batch continues.
+- Artifacts + `final-report.md` land in `<target>/.agent-run/batch-<timestamp>/`.
+  The batch writes `<target>/.ralph/last-run.env`, so `status` / `integrate` /
+  `cleanup` work on the batch branch exactly like a single review run.
+
+Read the `final-report.md`, summarize for the human, and **ask before integrating**.
+Nothing is ever merged, pushed, or deleted.
+
 ## Inspecting status
 
 ```bash

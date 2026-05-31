@@ -42,6 +42,11 @@ const review = {
   cleanup: false,
   skipCleanup: false,
   deleteBranch: false,
+  // batch mode
+  plan: null,
+  maxTasks: null,
+  autoApproveBuilder: false,
+  stopOnFail: false,
 };
 
 function exists(p) {
@@ -112,11 +117,18 @@ function readTargetConfig(repo) {
 function resolveRun(repo, runArg) {
   const runsDir = path.join(repo, ".ralph", "runs");
   const lastRun = parseEnvFile(path.join(repo, ".ralph", "last-run.env"));
+  // The artifacts dir from last-run.env may live outside .ralph/runs (e.g. batch
+  // runs use .agent-run/batch-<ts>/), so prefer it when it matches the run id.
+  const dirForLastRun = () =>
+    lastRun.ARTIFACTS_DIR && exists(lastRun.ARTIFACTS_DIR)
+      ? lastRun.ARTIFACTS_DIR
+      : path.join(runsDir, lastRun.RUN_ID || "");
   if (!runArg || runArg === "latest") {
-    if (lastRun.RUN_ID && exists(path.join(runsDir, lastRun.RUN_ID))) {
-      return { runId: lastRun.RUN_ID, runDir: path.join(runsDir, lastRun.RUN_ID), lastRun };
+    if (lastRun.RUN_ID) {
+      const rd = dirForLastRun();
+      return { runId: lastRun.RUN_ID, runDir: exists(rd) ? rd : null, lastRun };
     }
-    // Fallback: newest directory by name.
+    // Fallback: newest directory by name under .ralph/runs.
     if (exists(runsDir)) {
       const dirs = fs
         .readdirSync(runsDir)
@@ -129,11 +141,11 @@ function resolveRun(repo, runArg) {
     }
     return { runId: null, runDir: null, lastRun };
   }
-  return {
-    runId: runArg,
-    runDir: path.join(runsDir, runArg),
-    lastRun: lastRun.RUN_ID === runArg ? lastRun : {},
-  };
+  if (runArg === lastRun.RUN_ID) {
+    const rd = dirForLastRun();
+    return { runId: runArg, runDir: exists(rd) ? rd : null, lastRun };
+  }
+  return { runId: runArg, runDir: path.join(runsDir, runArg), lastRun: {} };
 }
 
 // Merge last-run.env with the chosen run's final_status.md / config.resolved.env.
@@ -270,6 +282,7 @@ Commands:
   log "<message>"                     Append to .ralph/activity.log
   build [n] [--no-commit]             Run single-agent build loop (default)
   review [task] --repo <path>         Run builder/reviewer loop on a TARGET repo
+  batch --repo <path> --plan <p>      Run many tasks sequentially in ONE worktree
   status --repo <path>                Show the latest run's status
   integrate --repo <path> [--run]     Merge an approved run, re-check, then auto-cleanup
   cleanup --repo <path> [--run]       Remove a run's worktree / stop its preview
@@ -304,6 +317,12 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
   --delete-branch                     also delete the run branch (cleanup/integrate)
   --keep-worktree | --skip-cleanup    integrate: don't auto-clean up afterwards
   --type generic|nextjs-postgres      init-target scaffold type
+
+Batch options (ralph batch):
+  --plan <dir|file>                   Tasks: a dir of *.md (sorted) or one .md split by heading
+  --max-tasks <n>                     Cap how many tasks run (default: all)
+  --auto-approve-builder              Builder runs unattended (permission-skipping); reviewer stays read-only
+  --stop-on-fail                      Stop at the first failing task
 
 Notes:
 - Uses local .agents/ralph if present; otherwise uses bundled defaults.
@@ -418,6 +437,8 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     "--preview-host": "previewHost",
     "--type": "type",
     "--run": "run",
+    "--plan": "plan",
+    "--max-tasks": "maxTasks",
   };
   let matchedReviewFlag = false;
   for (const [flag, key] of Object.entries(reviewFlags)) {
@@ -464,6 +485,14 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--delete-branch") {
     review.deleteBranch = true;
+    continue;
+  }
+  if (arg === "--auto-approve-builder") {
+    review.autoApproveBuilder = true;
+    continue;
+  }
+  if (arg === "--stop-on-fail") {
+    review.stopOnFail = true;
     continue;
   }
   args.push(arg);
@@ -622,6 +651,40 @@ async function main() {
     process.exit(result.status ?? 1);
   }
 
+  // --- Batch mode: many tasks, ONE shared worktree ----------------------------
+  if (cmd === "batch") {
+    const templateDir = exists(localDir) ? localDir : globalDir;
+    const batchLoop = path.join(templateDir, "batch-loop.sh");
+    if (!exists(batchLoop)) {
+      console.error(`batch-loop.sh not found at ${batchLoop}`);
+      process.exit(1);
+    }
+    const targetRepo = review.repo || process.env.TARGET_REPO;
+    if (!targetRepo) {
+      console.error("ralph batch requires a target repo. Pass --repo <path> or set TARGET_REPO.");
+      process.exit(1);
+    }
+    const plan = review.plan || process.env.PLAN;
+    if (!plan) {
+      console.error("ralph batch requires a plan. Pass --plan <dir-or-file>.");
+      process.exit(1);
+    }
+    const env = { ...process.env };
+    env.TARGET_REPO = path.resolve(cwd, targetRepo);
+    env.PLAN = path.resolve(cwd, plan);
+    if (review.builder || process.env.BUILDER) env.BUILDER = review.builder || process.env.BUILDER;
+    if (review.reviewer || process.env.REVIEWER) env.REVIEWER = review.reviewer || process.env.REVIEWER;
+    if (review.check) env.CHECK_CMD = review.check;
+    if (review.maxTasks) env.MAX_TASKS = review.maxTasks;
+    if (review.branch) env.BRANCH = review.branch;
+    if (review.verdictRegex) env.VERDICT_REGEX = review.verdictRegex;
+    if (review.allowDirty) env.ALLOW_DIRTY = "true";
+    if (review.autoApproveBuilder) env.AUTO_APPROVE_BUILDER = "true";
+    if (review.stopOnFail) env.STOP_ON_FAIL = "true";
+    const result = spawnSync(batchLoop, [], { stdio: "inherit", env });
+    process.exit(result.status ?? 1);
+  }
+
   // --- Install operator commands into a coding agent (v1: Claude Code) --------
   if (cmd === "install-agent-commands") {
     // Operator commands are authored once (canonical, Claude-flavored markdown in
@@ -764,7 +827,7 @@ async function main() {
     const giPath = path.join(repo, ".gitignore");
     let gi = exists(giPath) ? fs.readFileSync(giPath, "utf-8") : "";
     let giChanged = false;
-    for (const entry of [".ralph/", ".agent-handoff.md"]) {
+    for (const entry of [".ralph/", ".agent-run/", ".agent-handoff.md"]) {
       const present = gi.split("\n").some((l) => l.trim() === entry);
       if (!present) {
         gi += (gi && !gi.endsWith("\n") ? "\n" : "") + entry + "\n";
