@@ -37,20 +37,40 @@ function ralph(args, env = {}) {
     env: { ...process.env, RALPH_SKIP_UPDATE_CHECK: "1", ...env },
   });
 }
-function makeTarget() {
+function writeScript(p, body) {
+  writeFileSync(p, body);
+  chmodSync(p, 0o755);
+}
+function makeTarget(opts = {}) {
   const target = mkdtempSync(path.join(tmpdir(), "ralph-batch-"));
   git(target, ["init", "-q"]);
   git(target, ["config", "user.email", "t@e.com"]);
   git(target, ["config", "user.name", "t"]);
   writeFileSync(path.join(target, "README.md"), "# T\n");
   mkdirSync(path.join(target, "scripts"), { recursive: true });
-  const checkSh = path.join(target, "scripts", "check.sh");
-  writeFileSync(checkSh, "#!/usr/bin/env bash\nexit 0\n");
-  chmodSync(checkSh, 0o755);
-  writeFileSync(
-    path.join(target, "ralph.target.json"),
-    JSON.stringify({ check: "./scripts/check.sh", preview: { enabled: false } }, null, 2),
-  );
+  writeScript(path.join(target, "scripts", "check.sh"), "#!/usr/bin/env bash\nexit 0\n");
+  const cfg = { check: "./scripts/check.sh", preview: { enabled: false } };
+  if (opts.preview) {
+    writeScript(
+      path.join(target, "scripts", "preview-up.sh"),
+      "#!/usr/bin/env bash\necho UP app=$RALPH_APP_PORT proj=$RALPH_COMPOSE_PROJECT\nexit 0\n",
+    );
+    writeScript(path.join(target, "scripts", "preview-url.sh"), "#!/usr/bin/env bash\necho http://apps:${RALPH_APP_PORT}\n");
+    writeScript(path.join(target, "scripts", "preview-down.sh"), "#!/usr/bin/env bash\necho DOWN\n");
+    writeScript(
+      path.join(target, "scripts", "e2e.sh"),
+      `#!/usr/bin/env bash\necho "e2e url=$RALPH_PREVIEW_URL"\nexit ${opts.e2eFails ? 1 : 0}\n`,
+    );
+    cfg.preview = {
+      enabled: true,
+      up: "./scripts/preview-up.sh",
+      down: "./scripts/preview-down.sh",
+      url: "./scripts/preview-url.sh",
+      e2e: "./scripts/e2e.sh",
+      host: "apps",
+    };
+  }
+  writeFileSync(path.join(target, "ralph.target.json"), JSON.stringify(cfg, null, 2));
   writeFileSync(path.join(target, ".gitignore"), ".ralph/\n.agent-run/\n.agent-handoff.md\n");
   git(target, ["add", "-A"]);
   git(target, ["commit", "-q", "-m", "init"]);
@@ -198,6 +218,55 @@ console.log("4) single-file plan splits into tasks by heading");
     check(existsSync(path.join(runDir, "task-002-result.md")), "task 2 ran");
     check(!existsSync(path.join(runDir, "task-003-result.md")), "--max-tasks 2 stopped before task 3");
     rmSync(planFile, { force: true });
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("5) preview enabled: end-of-batch preview brings up a URL for review");
+{
+  const { target } = makeTarget({ preview: true });
+  const plan = makePlanDir();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "claude", "--reviewer", "codex", "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target) },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 0, "batch exits 0 (tasks + preview ok)");
+    const runDir = batchRunDir(target);
+    check(existsSync(path.join(runDir, "preview-up.log")), "preview-up.log written (one preview for the whole batch)");
+    check(existsSync(path.join(runDir, "preview-url.txt")), "preview-url.txt written");
+    check(existsSync(path.join(runDir, "e2e.log")), "e2e.log written");
+    const url = readFileSync(path.join(runDir, "preview-url.txt"), "utf-8").trim();
+    check(/^http:\/\/apps:\d+$/.test(url), `preview URL resolved (${url})`);
+    check(out.includes("review the whole batch"), "terminal summary surfaces the preview URL");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(new RegExp(`PREVIEW_URL=${url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(lastRun), "last-run.env records the preview URL");
+    // Exactly one preview (not one per task): only a single preview-up.log.
+    const upLogs = readdirSync(runDir).filter((f) => /^preview-up.*\.log$/.test(f));
+    check(upLogs.length === 1, `exactly one preview-up across the batch (got ${upLogs.length})`);
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("6) preview enabled + failing e2e: COMPLETED_WITH_FAILURES but URL still returned");
+{
+  const { target } = makeTarget({ preview: true, e2eFails: true });
+  const plan = makePlanDir();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "claude", "--reviewer", "codex", "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target) },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 2, "batch exits 2 when end-of-batch e2e fails");
+    check(/COMPLETED_WITH_FAILURES/.test(out), "outcome downgraded to COMPLETED_WITH_FAILURES");
+    const report = readFileSync(path.join(batchRunDir(target), "final-report.md"), "utf-8");
+    check(/End-of-batch e2e FAILED/.test(report), "report lists the e2e failure as a blocker");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/PREVIEW_URL=http:\/\/apps:\d+/.test(lastRun), "URL still returned so the human can inspect");
   } finally {
     cleanup(target);
   }

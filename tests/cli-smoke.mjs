@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,13 +77,24 @@ try {
       console.error("install-agent-commands failed: copilot prompt missing input var / mode.");
       process.exit(1);
     }
-    // Re-run without --force should skip existing files.
+    // Re-running updates by default: unchanged files report as "Unchanged".
     const again = spawnSync(process.execPath, [cliPath, "install-agent-commands", "--agent", "claude"], {
       env,
       encoding: "utf-8",
     });
-    if (!/Skipped \(already exist/.test(`${again.stdout}${again.stderr}`)) {
-      console.error("install-agent-commands failed: expected existing files to be skipped.");
+    if (!/Unchanged:/.test(`${again.stdout}${again.stderr}`)) {
+      console.error("install-agent-commands failed: re-run should report unchanged files.");
+      process.exit(1);
+    }
+    // If the source changes, a re-run should UPDATE the installed file.
+    const dst = path.join(fakeHome, ".claude", "commands", "ralph-review.md");
+    writeFileSync(dst, readFileSync(dst, "utf-8") + "\n<!-- stale local edit -->\n");
+    const upd = spawnSync(process.execPath, [cliPath, "install-agent-commands", "--agent", "claude"], {
+      env,
+      encoding: "utf-8",
+    });
+    if (!/Updated:.*ralph-review/.test(`${upd.stdout}${upd.stderr}`)) {
+      console.error("install-agent-commands failed: expected a changed file to be updated.");
       process.exit(1);
     }
   } finally {

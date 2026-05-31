@@ -681,6 +681,12 @@ async function main() {
     if (review.allowDirty) env.ALLOW_DIRTY = "true";
     if (review.autoApproveBuilder) env.AUTO_APPROVE_BUILDER = "true";
     if (review.stopOnFail) env.STOP_ON_FAIL = "true";
+    // End-of-batch website preview (same knobs as `ralph review`).
+    if (review.preview === true) env.PREVIEW_ENABLED = "true";
+    if (review.preview === false) env.PREVIEW_ENABLED = "false";
+    if (review.appPort) env.RALPH_APP_PORT = review.appPort;
+    if (review.dbPort) env.RALPH_DB_PORT = review.dbPort;
+    if (review.previewHost) env.PREVIEW_HOST = review.previewHost;
     const result = spawnSync(batchLoop, [], { stdio: "inherit", env });
     process.exit(result.status ?? 1);
   }
@@ -773,24 +779,31 @@ async function main() {
     const destDir = target.dir();
     fs.mkdirSync(destDir, { recursive: true });
     const files = fs.readdirSync(srcDir).filter((f) => f.endsWith(".md"));
+    // These are harness-managed command files, so re-running UPDATES them by
+    // default (content-aware: unchanged files are left untouched). That means
+    // `install-agent-commands` is how you push command updates to your agents.
     const installed = [];
-    const skipped = [];
+    const updated = [];
+    const unchanged = [];
     for (const f of files) {
       const base = `ralph-${f.replace(/\.md$/, "")}`; // review.md -> ralph-review
       const dst = path.join(destDir, base + target.ext);
-      if (exists(dst) && !installForce) {
-        skipped.push(base);
+      const content = target.transform(fs.readFileSync(path.join(srcDir, f), "utf-8"));
+      const existed = exists(dst);
+      const same = existed && fs.readFileSync(dst, "utf-8") === content;
+      if (same) {
+        unchanged.push(base);
         continue;
       }
-      const content = target.transform(fs.readFileSync(path.join(srcDir, f), "utf-8"));
       fs.writeFileSync(dst, content);
-      installed.push(base);
+      (existed ? updated : installed).push(base);
     }
     console.log(`Target agent: ${target.label}`);
     console.log(`Source:       ${srcDir}`);
     console.log(`Installed to: ${destDir}`);
     if (installed.length) console.log(`Installed:    ${installed.map((b) => "/" + b).join(", ")}`);
-    if (skipped.length) console.log(`Skipped (already exist; use --force): ${skipped.join(", ")}`);
+    if (updated.length) console.log(`Updated:      ${updated.map((b) => "/" + b).join(", ")}`);
+    if (unchanged.length) console.log(`Unchanged:    ${unchanged.map((b) => "/" + b).join(", ")}`);
     console.log(`\nUse them: ${target.invoke}`);
     process.exit(0);
   }

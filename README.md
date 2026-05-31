@@ -398,7 +398,9 @@ markdown in `agent-commands/ralph/`) and adapted per agent at install time:
 ¹ `~/.config/Code/User/prompts/` (Linux), `~/Library/Application Support/Code/User/prompts/`
 (macOS), `%APPDATA%\Code\User\prompts\` (Windows).
 
-Existing files are kept unless `--force`. Add another agent by adding one entry to
+Re-running **updates** the installed commands (content-aware — unchanged files are
+left alone, changed ones are refreshed, new ones added), so this is also how you push
+command updates to your agents. Add another agent by adding one entry to
 `AGENT_TARGETS` in `bin/ralph`. See **[docs/agent-operator.md](docs/agent-operator.md)**
 for the full operator playbook (harness vs target, roles vs backends, expected
 agent behavior).

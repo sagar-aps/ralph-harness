@@ -47,13 +47,26 @@ PLAN="${PLAN:-}"
 [[ -e "$PLAN" ]] || die "Plan not found: $PLAN"
 PLAN="$(cd "$(dirname "$PLAN")" && pwd)/$(basename "$PLAN")"
 
-# Target config (for the default check command).
+# Target config (check command + optional end-of-batch preview).
 cfg_check=""
+cfg_prev_enabled=""; cfg_up=""; cfg_down=""; cfg_url=""; cfg_e2e=""; cfg_host=""
 if [[ -f "$TARGET_REPO/ralph.target.json" ]]; then
-  cfg_check="$(python3 - "$TARGET_REPO/ralph.target.json" <<'PY'
-import json,sys
-try: print(json.load(open(sys.argv[1])).get("check") or "")
-except Exception: print("")
+  eval "$(python3 - "$TARGET_REPO/ralph.target.json" <<'PY'
+import json, sys, shlex
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+p = d.get("preview", {}) if isinstance(d, dict) else {}
+def emit(k, v):
+    if v is None: v = ""
+    if isinstance(v, bool): v = "true" if v else "false"
+    print(f"{k}={shlex.quote(str(v))}")
+emit("cfg_check", d.get("check"))
+emit("cfg_prev_enabled", p.get("enabled"))
+emit("cfg_up", p.get("up"))
+emit("cfg_down", p.get("down"))
+emit("cfg_url", p.get("url"))
+emit("cfg_e2e", p.get("e2e"))
+emit("cfg_host", p.get("host"))
 PY
 )"
 fi
@@ -69,6 +82,15 @@ VERDICT_REGEX="${VERDICT_REGEX:-^VERDICT: (PASS|FAIL)}"
 BUILDER_PROMPT="${BATCH_BUILDER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_builder.md}"
 REVIEWER_PROMPT="${BATCH_REVIEWER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_reviewer.md}"
 DRY_RUN="${RALPH_DRY_RUN:-}"
+
+# Optional end-of-batch website preview (brought up ONCE after all tasks, so the
+# human can review the whole batch via a URL — same scripts as `ralph review`).
+PREVIEW_ENABLED="${PREVIEW_ENABLED:-${cfg_prev_enabled:-false}}"
+PREVIEW_UP="${PREVIEW_UP:-${cfg_up:-./scripts/preview-up.sh}}"
+PREVIEW_DOWN="${PREVIEW_DOWN:-${cfg_down:-./scripts/preview-down.sh}}"
+PREVIEW_URL_CMD="${PREVIEW_URL_CMD:-${cfg_url:-./scripts/preview-url.sh}}"
+E2E_CMD="${E2E_CMD:-${cfg_e2e:-./scripts/e2e.sh}}"
+PREVIEW_HOST="${PREVIEW_HOST:-${cfg_host:-localhost}}"
 
 # ---- Builder/reviewer command resolution -----------------------------------
 strip_autoapprove() {
@@ -196,6 +218,26 @@ for f in AGENTS.md CLAUDE.md; do
   [[ -f "$WORKDIR/$f" ]] && { AGENTS_PATH="$WORKDIR/$f"; break; }
 done
 
+# Dynamic run environment (ports/compose project) for the end-of-batch preview.
+find_free_port() {
+  python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
+}
+if [[ "$PREVIEW_ENABLED" == "true" ]]; then
+  RALPH_APP_PORT="${RALPH_APP_PORT:-$(find_free_port)}"
+  RALPH_DB_PORT="${RALPH_DB_PORT:-$(find_free_port)}"
+else
+  RALPH_APP_PORT="${RALPH_APP_PORT:-}"; RALPH_DB_PORT="${RALPH_DB_PORT:-}"
+fi
+RALPH_COMPOSE_PROJECT="ralph-batch-$(printf '%s' "$TS" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-')"
+if [[ -n "$RALPH_APP_PORT" ]]; then
+  RALPH_PREVIEW_URL="${RALPH_PREVIEW_URL:-http://$PREVIEW_HOST:$RALPH_APP_PORT}"
+else
+  RALPH_PREVIEW_URL="${RALPH_PREVIEW_URL:-}"
+fi
+export RALPH_RUN_ID="batch-$TS" RALPH_TARGET_REPO="$TARGET_REPO" RALPH_WORKTREE="$WORKDIR" \
+       RALPH_BRANCH="$BRANCH" RALPH_BASE_COMMIT="$BASE_REF" \
+       RALPH_APP_PORT RALPH_DB_PORT RALPH_PREVIEW_URL RALPH_COMPOSE_PROJECT
+
 export WORKDIR BRANCH CHECK_CMD RUN_DIR AGENTS_PATH VERDICT_REGEX \
        TARGET_REPO TASK_TOTAL AUTO_APPROVE_BUILDER
 
@@ -270,6 +312,16 @@ run_backend() {
   echo "ALLOW_DIRTY=$ALLOW_DIRTY"
   echo "TASK_TOTAL=$TASK_TOTAL"
   echo "TASK_RUN_COUNT=$TASK_RUN_COUNT"
+  echo "PREVIEW_ENABLED=$PREVIEW_ENABLED"
+  echo "PREVIEW_UP=$PREVIEW_UP"
+  echo "PREVIEW_DOWN=$PREVIEW_DOWN"
+  echo "PREVIEW_URL_CMD=$PREVIEW_URL_CMD"
+  echo "E2E_CMD=$E2E_CMD"
+  echo "PREVIEW_HOST=$PREVIEW_HOST"
+  echo "RALPH_APP_PORT=$RALPH_APP_PORT"
+  echo "RALPH_DB_PORT=$RALPH_DB_PORT"
+  echo "RALPH_PREVIEW_URL=$RALPH_PREVIEW_URL"
+  echo "RALPH_COMPOSE_PROJECT=$RALPH_COMPOSE_PROJECT"
 } > "$RUN_DIR/config.resolved.env"
 
 echo ""
@@ -284,6 +336,7 @@ echo "  builder:       $BUILDER   -> $BUILDER_CMD"
 echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
 echo "  check:         $CHECK_CMD"
 echo "  auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
+echo "  preview:       $PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  (url after batch: $RALPH_PREVIEW_URL)}"
 echo "  artifacts:     $RUN_DIR"
 echo "═══════════════════════════════════════════════════════"
 if [[ "$AUTO_APPROVE_BUILDER" == "true" ]]; then
@@ -425,13 +478,45 @@ while IFS=$'\t' read -r IDX TITLE FN; do
   fi
 done < "$MANIFEST"
 
-# ---- Final report -----------------------------------------------------------
-if [[ "$FAILED" -eq 0 && "$STOPPED_EARLY" != "true" ]]; then
-  OUTCOME="READY_FOR_HUMAN_REVIEW"
-elif [[ "$STOPPED_EARLY" == "true" ]]; then
+# ---- End-of-batch preview (optional) ---------------------------------------
+# Bring the whole branch up ONCE so the human can review the entire batch via a
+# URL (same scripts as `ralph review`). Left running for review; `ralph cleanup`
+# stops it via the preview-down script.
+PREVIEW_RAN="false"; PREVIEW_UP_OK=""; E2E_OK=""
+if [[ "$PREVIEW_ENABLED" == "true" ]]; then
+  PREVIEW_RAN="true"
+  echo ""
+  echo "── End-of-batch preview ──────────────────────"
+  echo "Running preview-up ($PREVIEW_UP)  [app=$RALPH_APP_PORT db=$RALPH_DB_PORT]..."
+  set +e; ( cd "$WORKDIR" && eval "$PREVIEW_UP" ) > "$RUN_DIR/preview-up.log" 2>&1; UP_STATUS=$?; set -e
+  if [[ "$UP_STATUS" -ne 0 ]]; then
+    PREVIEW_UP_OK="false"
+    echo "preview-up FAILED (status=$UP_STATUS). See $RUN_DIR/preview-up.log"
+  else
+    PREVIEW_UP_OK="true"
+    set +e; ( cd "$WORKDIR" && eval "$PREVIEW_URL_CMD" ) > "$RUN_DIR/preview-url.txt" 2>/dev/null; set -e
+    URL_FROM_SCRIPT="$(head -n1 "$RUN_DIR/preview-url.txt" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$URL_FROM_SCRIPT" ]]; then RALPH_PREVIEW_URL="$URL_FROM_SCRIPT"
+    else printf '%s\n' "$RALPH_PREVIEW_URL" > "$RUN_DIR/preview-url.txt"; fi
+    export RALPH_PREVIEW_URL
+    echo "Preview URL: $RALPH_PREVIEW_URL"
+    echo "Running e2e ($E2E_CMD)..."
+    set +e; ( cd "$WORKDIR" && eval "$E2E_CMD" ) > "$RUN_DIR/e2e.log" 2>&1; E2E_STATUS=$?; set -e
+    if [[ "$E2E_STATUS" -eq 0 ]]; then E2E_OK="true"
+    else E2E_OK="false"; echo "e2e FAILED (status=$E2E_STATUS). See $RUN_DIR/e2e.log"; fi
+    echo "Preview left running for review. Stop it with: ralph cleanup --repo \"$TARGET_REPO\""
+  fi
+fi
+
+# ---- Outcome ----------------------------------------------------------------
+if [[ "$STOPPED_EARLY" == "true" ]]; then
   OUTCOME="STOPPED_ON_FAIL"
-else
+elif [[ "$FAILED" -gt 0 ]]; then
   OUTCOME="COMPLETED_WITH_FAILURES"
+elif [[ "$PREVIEW_RAN" == "true" && ( "$PREVIEW_UP_OK" != "true" || "$E2E_OK" == "false" ) ]]; then
+  OUTCOME="COMPLETED_WITH_FAILURES"
+else
+  OUTCOME="READY_FOR_HUMAN_REVIEW"
 fi
 
 REPORT="$RUN_DIR/final-report.md"
@@ -447,6 +532,11 @@ REPORT="$RUN_DIR/final-report.md"
   echo "- Auto-approve builder: $AUTO_APPROVE_BUILDER  |  Stop-on-fail: $STOP_ON_FAIL"
   echo "- Check command: $CHECK_CMD"
   echo "- Tasks attempted: $ATTEMPTED of $TASK_TOTAL (completed: $COMPLETED, failed: $FAILED)"
+  if [[ "$PREVIEW_RAN" == "true" ]]; then
+    echo "- Preview: ${PREVIEW_UP_OK:+up=$PREVIEW_UP_OK }${E2E_OK:+e2e=$E2E_OK }URL=$RALPH_PREVIEW_URL"
+  else
+    echo "- Preview: disabled"
+  fi
   echo ""
   echo "## Per-task results"
   echo ""
@@ -464,25 +554,40 @@ REPORT="$RUN_DIR/final-report.md"
   done < "$MANIFEST"
   echo ""
   echo "## Failures / blockers"
-  if [[ "$FAILED" -eq 0 ]]; then
-    echo "- none"
-  else
-    while IFS=$'\t' read -r IDX TITLE FN; do
-      [[ -z "$IDX" ]] && continue
-      rf="$RUN_DIR/task-$IDX-result.md"
-      [[ -f "$rf" ]] || continue
-      if grep -q '^- Result: FAIL' "$rf"; then
-        echo "- Task $IDX ($TITLE): see $RUN_DIR/task-$IDX-reviewer.md and task-$IDX-check.log"
-      fi
-    done < "$MANIFEST"
+  blockers=0
+  while IFS=$'\t' read -r IDX TITLE FN; do
+    [[ -z "$IDX" ]] && continue
+    rf="$RUN_DIR/task-$IDX-result.md"
+    [[ -f "$rf" ]] || continue
+    if grep -q '^- Result: FAIL' "$rf"; then
+      echo "- Task $IDX ($TITLE): see $RUN_DIR/task-$IDX-reviewer.md and task-$IDX-check.log"
+      blockers=$((blockers + 1))
+    fi
+  done < "$MANIFEST"
+  if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" != "true" ]]; then
+    echo "- End-of-batch preview FAILED to start: see $RUN_DIR/preview-up.log"
+    blockers=$((blockers + 1))
+  elif [[ "$PREVIEW_RAN" == "true" && "$E2E_OK" == "false" ]]; then
+    echo "- End-of-batch e2e FAILED against $RALPH_PREVIEW_URL: see $RUN_DIR/e2e.log"
+    blockers=$((blockers + 1))
   fi
+  [[ "$blockers" -eq 0 ]] && echo "- none"
   echo ""
   echo "## Suggested human review steps"
-  echo "1. Inspect the branch:    git -C \"$WORKDIR\" log --oneline \"$BASE_REF\"..HEAD"
-  echo "2. Review the full diff:  git -C \"$WORKDIR\" diff \"$BASE_REF\""
-  echo "3. Re-run checks:         ( cd \"$WORKDIR\" && $CHECK_CMD )"
-  echo "4. If satisfied, integrate (after review): ralph integrate --repo \"$TARGET_REPO\""
-  echo "5. Then clean up worktree: ralph cleanup --repo \"$TARGET_REPO\""
+  if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" == "true" ]]; then
+    echo "1. Open the preview and click through the whole batch: $RALPH_PREVIEW_URL"
+    echo "2. Inspect the branch:    git -C \"$WORKDIR\" log --oneline \"$BASE_REF\"..HEAD"
+    echo "3. Review the full diff:  git -C \"$WORKDIR\" diff \"$BASE_REF\""
+    echo "4. Re-run checks:         ( cd \"$WORKDIR\" && $CHECK_CMD )"
+    echo "5. If satisfied, integrate (after review): ralph integrate --repo \"$TARGET_REPO\""
+    echo "6. Clean up (stops preview + removes worktree): ralph cleanup --repo \"$TARGET_REPO\""
+  else
+    echo "1. Inspect the branch:    git -C \"$WORKDIR\" log --oneline \"$BASE_REF\"..HEAD"
+    echo "2. Review the full diff:  git -C \"$WORKDIR\" diff \"$BASE_REF\""
+    echo "3. Re-run checks:         ( cd \"$WORKDIR\" && $CHECK_CMD )"
+    echo "4. If satisfied, integrate (after review): ralph integrate --repo \"$TARGET_REPO\""
+    echo "5. Clean up worktree:     ralph cleanup --repo \"$TARGET_REPO\""
+  fi
   echo ""
   echo "Nothing was merged, pushed, or deleted. The branch and worktree are intact."
 } > "$REPORT"
@@ -495,9 +600,16 @@ mkdir -p "$TARGET_REPO/.ralph"
   echo "BRANCH=$BRANCH"
   echo "WORKTREE=$WORKDIR"
   echo "BASE_COMMIT=$BASE_REF"
-  echo "PREVIEW_URL="
+  if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" == "true" ]]; then
+    echo "PREVIEW_URL=$RALPH_PREVIEW_URL"
+  else
+    echo "PREVIEW_URL="
+  fi
   echo "ARTIFACTS_DIR=$RUN_DIR"
   echo "TARGET_REPO=$TARGET_REPO"
+  echo "RALPH_COMPOSE_PROJECT=$RALPH_COMPOSE_PROJECT"
+  echo "RALPH_APP_PORT=$RALPH_APP_PORT"
+  echo "RALPH_DB_PORT=$RALPH_DB_PORT"
   echo "USE_WORKTREE=true"
 } > "$TARGET_REPO/.ralph/last-run.env"
 
@@ -509,9 +621,14 @@ echo "────────────────────────�
 echo "  Branch:    $BRANCH (NOT merged)"
 echo "  Worktree:  $WORKDIR"
 echo "  Report:    $REPORT"
+if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" == "true" ]]; then
+  echo "  Preview:   $RALPH_PREVIEW_URL  (running — open it to review the whole batch)"
+elif [[ "$PREVIEW_RAN" == "true" ]]; then
+  echo "  Preview:   FAILED to start — see $RUN_DIR/preview-up.log"
+fi
 echo "  Integrate (after review): ralph integrate --repo \"$TARGET_REPO\""
 echo "  Cleanup:   ralph cleanup --repo \"$TARGET_REPO\""
 echo "═══════════════════════════════════════════════════════"
 
-[[ "$FAILED" -eq 0 && "$STOPPED_EARLY" != "true" ]] && exit 0
+[[ "$OUTCOME" == "READY_FOR_HUMAN_REVIEW" ]] && exit 0
 exit 2
