@@ -25,9 +25,13 @@ Keep this file short. It is always loaded into context.
 - Adversarial loop: `.agents/ralph/review-loop.sh` — builder/reviewer on a SEPARATE
   target repo via worktree, optional preview/e2e lifecycle, never merges.
 - Batch loop: `.agents/ralph/batch-loop.sh` — many tasks sequentially in ONE shared
-  worktree; prompts `PROMPT_batch_builder.md` / `PROMPT_batch_reviewer.md`. Artifacts
-  in `<target>/.agent-run/batch-<ts>/`; `--auto-approve-builder` affects only the
-  builder; reviewer always read-only. Never merges/pushes/deletes.
+  worktree; per-task builder/reviewer retry loop (`--max-iterations`); prompts
+  `PROMPT_batch_builder.md` / `PROMPT_batch_reviewer.md`. Artifacts in
+  `<target>/.agent-run/batch-<ts>/`; `--auto-approve-builder` affects only the
+  builder; reviewer always read-only. Never merges/pushes/deletes. Harness-detected
+  agent ERROR (backend non-zero exit, or reviewer with no `VERDICT:`) is retried
+  (`RALPH_AGENT_RETRIES`) then halts the batch with `REVIEWER_UNAVAILABLE` /
+  `BUILDER_UNAVAILABLE` (exit 4); `--resume` continues, skipping already-PASSed tasks.
 - Backends/roles: `.agents/ralph/agents.sh` (`resolve_backend_cmd`); prompts
   `PROMPT_builder.md` / `PROMPT_reviewer.md`; config `review-config.sh`.
 - Target scaffolding templates: `.agents/ralph/target-templates/` (used by

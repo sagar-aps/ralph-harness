@@ -469,16 +469,29 @@ ralph batch \
 - `--plan` is a **directory of `*.md` tasks** (run in sorted filename order) or a
   **single `.md` file** split into tasks at its shallowest heading level.
 - One branch/worktree `ralph/batch-<timestamp>` is created for the whole batch.
-  Per task: builder → check → reviewer (read-only) → record result → commit on the
-  branch. Failed tasks are kept (so later tasks can build on them) and clearly
-  marked; `--stop-on-fail` halts at the first failure instead.
+  Per task: builder → check → reviewer (read-only), retried up to `--max-iterations`
+  (default 5) with feedback, then committed once on the branch. Failed tasks are
+  kept (so later tasks can build on them) and clearly marked; `--stop-on-fail`
+  halts at the first failure instead.
 - `--auto-approve-builder` lets the **builder** edit unattended (permission-skipping
   flags; logged explicitly). It **never** affects the reviewer, which always runs
   read-only (sandboxed for Codex). Without it the builder runs in manual mode.
 - `--max-tasks <n>` caps how many tasks run (default: all).
-- Guardrails: refuses a dirty target unless `--allow-dirty`; prints the full plan
-  (repo, branch, worktree, builder, reviewer, check, flags) before starting; never
-  merges, pushes, or deletes anything.
+- **Agent ERROR vs task FAIL.** A *task* FAIL means the reviewer voted FAIL / checks
+  failed. An *agent* ERROR is a tooling outage the harness detects — the backend
+  exits non-zero, or the reviewer emits no `VERDICT:` line (a missing verdict is
+  **ERROR, never FAIL**). On ERROR the offending agent is retried up to
+  `RALPH_AGENT_RETRIES` times (default 2) with exponential backoff; if it still
+  errors the **whole batch halts** with `REVIEWER_UNAVAILABLE` / `BUILDER_UNAVAILABLE`
+  (exit 4, distinct from `COMPLETED_WITH_FAILURES`), a re-login hint, and a resume
+  command. No builder attempt is consumed and the error output is never fed back.
+- **Resume.** After fixing/re-authenticating the backend, `ralph batch … --resume`
+  reuses the same branch+worktree, **skips tasks that already PASSed** (kept as
+  commits), and continues from where it halted — so an outage never forces you to
+  redo completed tasks. (Also exposed to agents as `/ralph-resume`.)
+- Guardrails: refuses a dirty target unless `--allow-dirty`; runs preflight first;
+  prints the full plan (repo, branch, worktree, builder, reviewer, check, flags)
+  before starting; never merges, pushes, or deletes anything.
 
 Artifacts go to `<target>/.agent-run/batch-<timestamp>/`:
 

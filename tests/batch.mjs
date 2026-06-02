@@ -316,7 +316,120 @@ console.log("8) default per-task budget is 5 attempts");
   }
 }
 
-for (const d of planDirs) {
+// Helpers for ERROR/resume tests: real (non-dry) shell backends + a 2-task plan.
+const stateDirs = [];
+function stateDir() {
+  const d = mkdtempSync(path.join(tmpdir(), "ralph-state-"));
+  stateDirs.push(d);
+  return d;
+}
+function twoTaskPlan() {
+  const dir = mkdtempSync(path.join(tmpdir(), "ralph-plan-"));
+  planDirs.push(dir);
+  writeFileSync(path.join(dir, "01.md"), "# Task one\nfirst\n");
+  writeFileSync(path.join(dir, "02.md"), "# Task two\nsecond\n");
+  return dir;
+}
+// builder: makes a change + handoff so there's something to commit. reviewer: varies.
+const FB = 'bash -c "echo x >> progress.txt; printf \\"# handoff\\n\\" > .agent-handoff.md"';
+const noDelay = { RALPH_AGENT_RETRY_DELAY: "0", RALPH_DRY_RUN: "" };
+
+console.log("9) reviewer ERROR (non-zero exit) -> REVIEWER_UNAVAILABLE, no builder attempt consumed");
+{
+  const { target, mainHead } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "reverr", "--auto-approve-builder", "--max-iterations", "5"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_REVERR_CMD: 'bash -c "echo boom >&2; exit 1"' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 4, "exit code 4 (distinct from 2)");
+    check(/REVIEWER_UNAVAILABLE/.test(out), "outcome REVIEWER_UNAVAILABLE");
+    check(/re-?authenticate|login/i.test(out), "prints a re-login hint");
+    check(/--resume/.test(out), "prints a resume command");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/STATUS=REVIEWER_UNAVAILABLE/.test(lastRun), "last-run.env STATUS=REVIEWER_UNAVAILABLE");
+    const runDir = batchRunDir(target);
+    // never consumed a builder attempt: no 2nd builder attempt for task 001
+    check(!existsSync(path.join(runDir, "task-001-iter-2-builder-prompt.md")), "no 2nd builder attempt (ERROR didn't loop the builder)");
+    // halted before committing/counting the task
+    check(!existsSync(path.join(runDir, "task-001-result.md")), "halted task has no result file");
+    check(git(target, ["rev-parse", "HEAD"]) === mainHead, "target main untouched");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("10) reviewer with NO verdict line (exit 0) is ERROR, not FAIL");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "noverdict", "--auto-approve-builder"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_NOVERDICT_CMD: 'bash -c "echo looks fine to me; exit 0"' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 4, "exit 4 (treated as ERROR/unavailable, not FAIL)");
+    check(/REVIEWER_UNAVAILABLE/.test(out), "missing VERDICT => REVIEWER_UNAVAILABLE (not COMPLETED_WITH_FAILURES)");
+    check(/verdict='none'|verdict=none/.test(out), "logs that no verdict was parsed");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("11) builder ERROR (non-zero exit) -> BUILDER_UNAVAILABLE");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "builderr", "--reviewer", "okrev", "--auto-approve-builder"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_BUILDERR_CMD: 'bash -c "echo crash >&2; exit 1"', AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 4, "exit 4 on builder outage");
+    check(/BUILDER_UNAVAILABLE/.test(out), "outcome BUILDER_UNAVAILABLE");
+    check(/builder ERROR \(exit=1\)/.test(out), "logs builder ERROR with exit code");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("12) resume skips already-PASSed tasks after a halt");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  const st = stateDir();
+  const counter = path.join(st, "n");
+  try {
+    // Reviewer passes the 1st call (task 1), errors afterwards (task 2) -> halt.
+    const flakyRev = `bash -c 'c=$(cat ${counter} 2>/dev/null || echo 0); c=$((c+1)); echo $c > ${counter}; if [ $c -le 1 ]; then printf "VERDICT: PASS\\n"; else echo down; exit 1; fi'`;
+    const r1 = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "flaky", "--auto-approve-builder"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_FLAKY_CMD: flakyRev },
+    );
+    check(r1.status === 4, "run 1 halts (REVIEWER_UNAVAILABLE)");
+    check(existsSync(path.join(batchRunDir(target), "task-001-result.md")), "task 1 completed+recorded before the halt");
+
+    // "Fix" the backend: resume with an always-PASS reviewer.
+    const r2 = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev", "--auto-approve-builder", "--resume"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out = `${r2.stdout}${r2.stderr}`;
+    check(r2.status === 0, "resume completes (exit 0)");
+    check(/already complete \(resume\), skipping/.test(out), "task 1 skipped on resume (not rebuilt)");
+    check(/READY_FOR_HUMAN_REVIEW/.test(out), "resume reaches READY_FOR_HUMAN_REVIEW");
+    const t2 = readFileSync(path.join(batchRunDir(target), "task-002-result.md"), "utf-8");
+    check(/- Result: PASS/.test(t2), "task 2 now PASSes on resume");
+  } finally {
+    cleanup(target);
+  }
+}
+
+for (const d of [...planDirs, ...stateDirs]) {
   try {
     rmSync(d, { recursive: true, force: true });
   } catch {}

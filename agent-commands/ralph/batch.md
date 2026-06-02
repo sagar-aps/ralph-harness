@@ -38,11 +38,18 @@ Steps:
 4. When it finishes, read the final report at
    `<target>/.agent-run/batch-<timestamp>/final-report.md` (and `<target>/.ralph/last-run.env`)
    and summarize for the human:
-   - outcome (READY_FOR_HUMAN_REVIEW / COMPLETED_WITH_FAILURES / STOPPED_ON_FAIL)
+   - outcome (READY_FOR_HUMAN_REVIEW / COMPLETED_WITH_FAILURES / STOPPED_ON_FAIL /
+     REVIEWER_UNAVAILABLE / BUILDER_UNAVAILABLE)
    - tasks attempted / completed / failed
    - per-task verdicts and files changed
    - any failures/blockers and where their logs are
    - the branch + worktree path
+   - **If the outcome is `REVIEWER_UNAVAILABLE` or `BUILDER_UNAVAILABLE`** (exit 4):
+     the backend hit an ERROR (non-zero exit, or the reviewer gave no `VERDICT:`)
+     on every retry — a tooling outage, NOT a task failure. Do NOT treat it as a
+     failed PRD. Tell the human to re-authenticate / check quota for that CLI, then
+     resume with `/ralph-resume` (skips already-PASSed tasks). No builder attempt
+     was consumed and no error text was fed back as feedback.
 5. Then **ask the human** to review the branch. Only after they approve, integrate
    with `/ralph-integrate` (or `ralph integrate --repo <path>`), then offer
    `/ralph-cleanup`.

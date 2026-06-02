@@ -75,7 +75,15 @@ BUILDER="${BUILDER:-opencode}"
 REVIEWER="${REVIEWER:-claude}"
 CHECK_CMD="${CHECK_CMD:-${cfg_check:-./scripts/check.sh}}"
 MAX_TASKS="${MAX_TASKS:-0}"
-MAX_ITERATIONS="${MAX_ITERATIONS:-5}"   # per-task builder/reviewer retries
+MAX_ITERATIONS="${MAX_ITERATIONS:-5}"   # per-task builder/reviewer attempts (verdict loop)
+# Infra-error handling for the agent backends (distinct from PASS/FAIL): a backend
+# that exits non-zero, or a reviewer with no parseable VERDICT, is an ERROR. We
+# retry the SAME agent invocation (not a new builder attempt) up to AGENT_RETRIES
+# times with exponential backoff; if still ERROR we halt the whole batch.
+AGENT_RETRIES="${RALPH_AGENT_RETRIES:-2}"
+AGENT_RETRY_DELAY="${RALPH_AGENT_RETRY_DELAY:-2}"   # seconds; doubles each retry
+AGENT_ERROR_ATTEMPTS=$((AGENT_RETRIES + 1))
+RESUME="${RESUME:-}"   # non-empty => resume the last batch run, skipping done tasks
 AUTO_APPROVE_BUILDER="${AUTO_APPROVE_BUILDER:-false}"
 STOP_ON_FAIL="${STOP_ON_FAIL:-false}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-false}"
@@ -142,12 +150,39 @@ $DIRTY"
   fi
 fi
 
+# ---- Resume vs fresh run ----------------------------------------------------
+RESUMING="false"
+COMPLETED_SET=" "
+if [[ -n "$RESUME" ]]; then
+  LRE="$TARGET_REPO/.ralph/last-run.env"
+  [[ -f "$LRE" ]] || die "Cannot resume: no prior run recorded at $LRE"
+  prev_run_id="$(grep -m1 '^RUN_ID=' "$LRE" | cut -d= -f2-)"
+  prev_branch="$(grep -m1 '^BRANCH=' "$LRE" | cut -d= -f2-)"
+  prev_wt="$(grep -m1 '^WORKTREE=' "$LRE" | cut -d= -f2-)"
+  prev_art="$(grep -m1 '^ARTIFACTS_DIR=' "$LRE" | cut -d= -f2-)"
+  prev_base="$(grep -m1 '^BASE_COMMIT=' "$LRE" | cut -d= -f2-)"
+  [[ "$prev_run_id" == batch-* ]] || die "Cannot resume: last run '$prev_run_id' is not a batch run."
+  [[ -n "$prev_branch" && -n "$prev_wt" && -d "$prev_wt" ]] \
+    || die "Cannot resume: prior worktree is missing ($prev_wt). Start a fresh batch instead."
+  RESUMING="true"
+  TS="${prev_run_id#batch-}"
+  BRANCH="$prev_branch"
+  WORKDIR="$prev_wt"
+  RUN_DIR="$prev_art"
+  TASKS_DIR="$RUN_DIR/tasks"
+  BASE_REF="${prev_base:-$(git -C "$WORKDIR" rev-parse HEAD)}"
+  mkdir -p "$TASKS_DIR"
+  echo "Resuming batch $prev_run_id on branch $BRANCH (worktree $WORKDIR)"
+fi
+
 # ---- Run dir ---------------------------------------------------------------
-TS="$(date +%Y%m%d-%H%M%S)-$$"
-BRANCH="${BRANCH:-ralph/batch-$TS}"
-RUN_DIR="$TARGET_REPO/.agent-run/batch-$TS"
-TASKS_DIR="$RUN_DIR/tasks"
-mkdir -p "$TASKS_DIR"
+if [[ "$RESUMING" != "true" ]]; then
+  TS="$(date +%Y%m%d-%H%M%S)-$$"
+  BRANCH="${BRANCH:-ralph/batch-$TS}"
+  RUN_DIR="$TARGET_REPO/.agent-run/batch-$TS"
+  TASKS_DIR="$RUN_DIR/tasks"
+  mkdir -p "$TASKS_DIR"
+fi
 
 # ---- Preflight (repo contract) — block before any worktree/agent ------------
 if ! bash "$SCRIPT_DIR/preflight.sh" "$TARGET_REPO" "$RUN_DIR/preflight.md"; then
@@ -220,13 +255,29 @@ else
   TASK_RUN_COUNT="$TASK_TOTAL"
 fi
 
-# ---- Shared worktree (created ONCE) ----------------------------------------
-BASE_REF="$(git -C "$TARGET_REPO" rev-parse HEAD)"
-WT_BASE="${RALPH_WORKTREE_DIR:-$(dirname "$TARGET_REPO")/.ralph-worktrees}"
-mkdir -p "$WT_BASE"
-WORKDIR="$WT_BASE/$(basename "$TARGET_REPO")-batch-$TS"
-git -C "$TARGET_REPO" worktree add -b "$BRANCH" "$WORKDIR" >/dev/null \
-  || die "Failed to create worktree."
+# ---- Shared worktree (created ONCE; reused on resume) ----------------------
+if [[ "$RESUMING" == "true" ]]; then
+  # Reuse the prior worktree/branch; figure out which tasks already PASSed so we
+  # don't redo them.
+  cur_branch="$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [[ "$cur_branch" == "$BRANCH" ]] \
+    || die "Cannot resume: worktree $WORKDIR is on '$cur_branch', expected '$BRANCH'."
+  for rf in "$RUN_DIR"/task-*-result.md; do
+    [[ -f "$rf" ]] || continue
+    if grep -q '^- Result: PASS' "$rf"; then
+      idx="$(basename "$rf" | sed -E 's/^task-([0-9]+)-result\.md$/\1/')"
+      COMPLETED_SET+="$idx "
+    fi
+  done
+  echo "Resume: already-complete tasks =${COMPLETED_SET}"
+else
+  BASE_REF="$(git -C "$TARGET_REPO" rev-parse HEAD)"
+  WT_BASE="${RALPH_WORKTREE_DIR:-$(dirname "$TARGET_REPO")/.ralph-worktrees}"
+  mkdir -p "$WT_BASE"
+  WORKDIR="$WT_BASE/$(basename "$TARGET_REPO")-batch-$TS"
+  git -C "$TARGET_REPO" worktree add -b "$BRANCH" "$WORKDIR" >/dev/null \
+    || die "Failed to create worktree."
+fi
 
 AGENTS_PATH="(none)"
 for f in AGENTS.md CLAUDE.md; do
@@ -313,6 +364,50 @@ run_backend() {
   return "$status"
 }
 
+# Run the BUILDER for one task attempt, retrying ONLY on infra ERROR (non-zero
+# exit of the backend tool — not a code/check failure, which surfaces via check).
+# Returns 0 if the builder ran; 1 if it errored after all retries (caller halts).
+run_builder_attempt() {  # <prompt_file> <log_file>
+  local prompt="$1" log="$2" i rc delay="$AGENT_RETRY_DELAY"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[RALPH_DRY_RUN] builder skipped." > "$log"
+    printf 'batch dry-run task %s iter %s: %s\n' "$IDX" "$ITER" "$TITLE" >> "$WORKDIR/batch-dry-run.txt"
+    printf '# Handoff (dry run) task %s iter %s\n- simulated change\n' "$IDX" "$ITER" > "$HANDOFF_PATH"
+    return 0
+  fi
+  for (( i=1; i<=AGENT_ERROR_ATTEMPTS; i++ )); do
+    set +e; run_backend "$BUILDER_CMD" "$prompt" "$log"; rc=$?; set -e
+    [[ "$rc" -eq 0 ]] && return 0
+    AGENT_ERROR_EXIT="$rc"
+    echo "    builder ERROR (exit=$rc) — invocation $i/$AGENT_ERROR_ATTEMPTS"
+    if [[ "$i" -lt "$AGENT_ERROR_ATTEMPTS" ]]; then sleep "$delay"; delay=$((delay * 2)); fi
+  done
+  return 1
+}
+
+# Run the REVIEWER, classifying the outcome as PASS | FAIL | ERROR (harness-detected,
+# never trusted from model text). ERROR = backend non-zero exit OR no VERDICT line.
+# Retries ONLY on ERROR with backoff. Sets REVIEWER_OUTCOME and VERDICT.
+run_reviewer_attempt() {  # <prompt_file> <out_file>
+  local prompt="$1" out="$2" i rc v delay="$AGENT_RETRY_DELAY"
+  for (( i=1; i<=AGENT_ERROR_ATTEMPTS; i++ )); do
+    if [[ "$DRY_RUN" == "1" ]]; then
+      { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$out"; rc=0
+    else
+      set +e; run_backend "$REVIEWER_CMD" "$prompt" "$out"; rc=$?; set -e
+    fi
+    v="$(grep -E "$VERDICT_REGEX" "$out" 2>/dev/null | tail -n1 | grep -oE 'PASS|FAIL' | tail -n1 || true)"
+    if [[ "$rc" -eq 0 && -n "$v" ]]; then
+      VERDICT="$v"; REVIEWER_OUTCOME="$v"; return 0
+    fi
+    AGENT_ERROR_EXIT="$rc"
+    echo "    reviewer ERROR (exit=$rc, verdict='${v:-none}') — invocation $i/$AGENT_ERROR_ATTEMPTS"
+    if [[ "$i" -lt "$AGENT_ERROR_ATTEMPTS" ]]; then sleep "$delay"; delay=$((delay * 2)); fi
+  done
+  REVIEWER_OUTCOME="ERROR"; VERDICT=""
+  return 1
+}
+
 # ---- Config snapshot + banner ----------------------------------------------
 {
   echo "RUN_ID=batch-$TS"
@@ -332,6 +427,9 @@ run_backend() {
   echo "TASK_TOTAL=$TASK_TOTAL"
   echo "TASK_RUN_COUNT=$TASK_RUN_COUNT"
   echo "MAX_ITERATIONS=$MAX_ITERATIONS"
+  echo "AGENT_RETRIES=$AGENT_RETRIES"
+  echo "AGENT_RETRY_DELAY=$AGENT_RETRY_DELAY"
+  echo "RESUMING=$RESUMING"
   echo "PREVIEW_ENABLED=$PREVIEW_ENABLED"
   echo "PREVIEW_UP=$PREVIEW_UP"
   echo "PREVIEW_DOWN=$PREVIEW_DOWN"
@@ -355,7 +453,8 @@ echo "  tasks:         $TASK_RUN_COUNT of $TASK_TOTAL discovered"
 echo "  builder:       $BUILDER   -> $BUILDER_CMD"
 echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
 echo "  check:         $CHECK_CMD"
-echo "  max attempts/task: $MAX_ITERATIONS   auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
+echo "  max attempts/task: $MAX_ITERATIONS   agent-error retries: $AGENT_RETRIES   resume: $RESUMING"
+echo "  auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
 echo "  preview:       $PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  (url after batch: $RALPH_PREVIEW_URL)}"
 echo "  artifacts:     $RUN_DIR"
 echo "═══════════════════════════════════════════════════════"
@@ -377,8 +476,11 @@ CONTEXT_FILE="$RUN_DIR/batch-context.md"
   echo ""
 } > "$CONTEXT_FILE"
 
-ATTEMPTED=0; COMPLETED=0; FAILED=0
+ATTEMPTED=0; COMPLETED=0; FAILED=0; SKIPPED=0
 STOPPED_EARLY="false"
+AGENT_ERROR_ROLE=""        # "builder" | "reviewer" when an unrecoverable ERROR halts the batch
+AGENT_ERROR_EXIT=""
+HALTED_TASK=""
 
 # ---- Sequential task loop ---------------------------------------------------
 # Read the manifest on a dedicated fd (3) so stdin-reading backends (e.g.
@@ -386,6 +488,13 @@ STOPPED_EARLY="false"
 # truncate the loop to a single task.
 while IFS=$'\t' read -r IDX TITLE FN <&3; do
   [[ -z "$IDX" ]] && continue
+  # Resume: skip tasks that already PASSed in the prior run (don't redo them).
+  if [[ "$RESUMING" == "true" && "$COMPLETED_SET" == *" $IDX "* ]]; then
+    echo "── Task $IDX/$TASK_TOTAL: $TITLE — already complete (resume), skipping ──"
+    SKIPPED=$((SKIPPED + 1)); COMPLETED=$((COMPLETED + 1))
+    { echo "## Task $IDX — $TITLE  [PASS] (completed in a prior run)"; echo ""; } >> "$CONTEXT_FILE"
+    continue
+  fi
   if [[ "$ATTEMPTED" -ge "$TASK_RUN_COUNT" ]]; then break; fi
   ATTEMPTED=$((ATTEMPTED + 1))
   TASK_FILE="$TASKS_DIR/$FN"
@@ -423,15 +532,12 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
            R_CONTEXT_FILE="$CONTEXT_FILE" HANDOFF_PATH \
            R_ITER="$ITER" R_PREV_REVIEW_FILE="$PREV_REVIEW" R_PREV_CHECK_FILE="$PREV_CHECK"
 
-    # 1. Builder
+    # 1. Builder (retry on infra ERROR; halt the batch if unrecoverable)
     render_prompt "$BUILDER_PROMPT" "$BUILDER_PROMPT_R"
     echo "    builder ($BUILDER)..."
-    if [[ "$DRY_RUN" == "1" ]]; then
-      echo "[RALPH_DRY_RUN] builder skipped." > "$BUILDER_LOG"
-      printf 'batch dry-run task %s iter %s: %s\n' "$IDX" "$ITER" "$TITLE" >> "$WORKDIR/batch-dry-run.txt"
-      printf '# Handoff (dry run) task %s iter %s\n- simulated change\n' "$IDX" "$ITER" > "$HANDOFF_PATH"
-    else
-      set +e; run_backend "$BUILDER_CMD" "$BUILDER_PROMPT_R" "$BUILDER_LOG"; set -e
+    if ! run_builder_attempt "$BUILDER_PROMPT_R" "$BUILDER_LOG"; then
+      AGENT_ERROR_ROLE="builder"; HALTED_TASK="$IDX"
+      break
     fi
 
     # 2. Check
@@ -449,25 +555,26 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     if [[ -f "$HANDOFF_PATH" ]]; then cp "$HANDOFF_PATH" "$ITER_HANDOFF"
     else echo "(builder did not write a handoff)" > "$ITER_HANDOFF"; fi
 
-    # 5. Reviewer (read-only)
+    # 5. Reviewer — harness classifies PASS | FAIL | ERROR (ERROR retried w/ backoff)
     export R_CHECK_STATUS="$CHECK_STATUS" R_DIFF_FILE="$ITER_DIFF" \
            R_CHECK_FILE="$ITER_CHECK_LOG" R_HANDOFF_FILE="$ITER_HANDOFF"
     render_prompt "$REVIEWER_PROMPT" "$REVIEWER_PROMPT_R"
     echo "    reviewer ($REVIEWER, read-only)..."
-    if [[ "$DRY_RUN" == "1" ]]; then
-      { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$ITER_REVIEWER_OUT"
-    else
-      set +e; run_backend "$REVIEWER_CMD" "$REVIEWER_PROMPT_R" "$ITER_REVIEWER_OUT"; set -e
-    fi
-    VERDICT="$(grep -E "$VERDICT_REGEX" "$ITER_REVIEWER_OUT" 2>/dev/null | tail -n1 | grep -oE 'PASS|FAIL' | tail -n1 || true)"
-    [[ -z "$VERDICT" ]] && VERDICT="FAIL"
-    echo "    verdict: $VERDICT (check=$CHECK_STATUS)"
+    run_reviewer_attempt "$REVIEWER_PROMPT_R" "$ITER_REVIEWER_OUT" || true
 
     # Point the canonical per-task artifacts at this (latest) attempt.
     cp "$ITER_CHECK_LOG" "$CHECK_LOG" 2>/dev/null || true
     cp "$ITER_DIFF" "$DIFF_PATCH" 2>/dev/null || true
     cp "$ITER_HANDOFF" "$HANDOFF_SNAP" 2>/dev/null || true
     cp "$ITER_REVIEWER_OUT" "$REVIEWER_OUT" 2>/dev/null || true
+
+    if [[ "$REVIEWER_OUTCOME" == "ERROR" ]]; then
+      # Harness-detected reviewer failure (bad exit / no VERDICT). Do NOT consume a
+      # builder attempt and do NOT feed the error output back — halt the batch.
+      AGENT_ERROR_ROLE="reviewer"; HALTED_TASK="$IDX"
+      break
+    fi
+    echo "    verdict: $VERDICT (check=$CHECK_STATUS)"
 
     if [[ "$VERDICT" == "PASS" && "$CHECK_STATUS" -eq 0 ]]; then
       TASK_STATUS="PASS"
@@ -477,6 +584,13 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     PREV_REVIEW="$ITER_REVIEWER_OUT"; PREV_CHECK="$ITER_CHECK_LOG"
     [[ "$ITER" -lt "$MAX_ITERATIONS" ]] && echo "    not passing — retrying with feedback"
   done
+
+  # Unrecoverable agent (builder/reviewer) ERROR → halt: do not commit, do not
+  # count this task as PASS/FAIL.
+  if [[ -n "$AGENT_ERROR_ROLE" ]]; then
+    echo "Task $IDX HALTED — $AGENT_ERROR_ROLE backend unavailable (ERROR after $AGENT_ERROR_ATTEMPTS attempts)."
+    break
+  fi
 
   if [[ "$TASK_STATUS" == "PASS" ]]; then COMPLETED=$((COMPLETED + 1))
   else FAILED=$((FAILED + 1)); fi
@@ -533,7 +647,7 @@ done 3< "$MANIFEST"
 # URL (same scripts as `ralph review`). Left running for review; `ralph cleanup`
 # stops it via the preview-down script.
 PREVIEW_RAN="false"; PREVIEW_UP_OK=""; E2E_OK=""
-if [[ "$PREVIEW_ENABLED" == "true" ]]; then
+if [[ "$PREVIEW_ENABLED" == "true" && -z "$AGENT_ERROR_ROLE" ]]; then
   PREVIEW_RAN="true"
   echo ""
   echo "── End-of-batch preview ──────────────────────"
@@ -559,7 +673,12 @@ if [[ "$PREVIEW_ENABLED" == "true" ]]; then
 fi
 
 # ---- Outcome ----------------------------------------------------------------
-if [[ "$STOPPED_EARLY" == "true" ]]; then
+# An unrecoverable agent ERROR is its OWN terminal state, distinct from
+# COMPLETED_WITH_FAILURES (which means tasks ran and some failed review).
+if [[ -n "$AGENT_ERROR_ROLE" ]]; then
+  if [[ "$AGENT_ERROR_ROLE" == "reviewer" ]]; then OUTCOME="REVIEWER_UNAVAILABLE"
+  else OUTCOME="BUILDER_UNAVAILABLE"; fi
+elif [[ "$STOPPED_EARLY" == "true" ]]; then
   OUTCOME="STOPPED_ON_FAIL"
 elif [[ "$FAILED" -gt 0 ]]; then
   OUTCOME="COMPLETED_WITH_FAILURES"
@@ -581,11 +700,34 @@ REPORT="$RUN_DIR/final-report.md"
   echo "- Builder: $BUILDER  |  Reviewer: $REVIEWER (read-only)"
   echo "- Auto-approve builder: $AUTO_APPROVE_BUILDER  |  Stop-on-fail: $STOP_ON_FAIL"
   echo "- Check command: $CHECK_CMD"
-  echo "- Tasks attempted: $ATTEMPTED of $TASK_TOTAL (completed: $COMPLETED, failed: $FAILED)"
+  echo "- Tasks attempted: $ATTEMPTED of $TASK_TOTAL (completed: $COMPLETED, failed: $FAILED, skipped-on-resume: $SKIPPED)"
   if [[ "$PREVIEW_RAN" == "true" ]]; then
     echo "- Preview: ${PREVIEW_UP_OK:+up=$PREVIEW_UP_OK }${E2E_OK:+e2e=$E2E_OK }URL=$RALPH_PREVIEW_URL"
+  elif [[ -n "$AGENT_ERROR_ROLE" ]]; then
+    echo "- Preview: skipped (batch halted on $AGENT_ERROR_ROLE error)"
   else
     echo "- Preview: disabled"
+  fi
+  if [[ -n "$AGENT_ERROR_ROLE" ]]; then
+    echo ""
+    echo "## ⚠ Halted: $AGENT_ERROR_ROLE backend unavailable"
+    echo ""
+    echo "The **$AGENT_ERROR_ROLE** backend (\`$([[ "$AGENT_ERROR_ROLE" == reviewer ]] && echo "$REVIEWER" || echo "$BUILDER")\`) returned an"
+    echo "ERROR — a non-zero exit$([[ "$AGENT_ERROR_ROLE" == reviewer ]] && echo ", or no \`VERDICT:\` line,") — on every one of"
+    echo "$AGENT_ERROR_ATTEMPTS attempts (last exit: ${AGENT_ERROR_EXIT:-?}) while working task $HALTED_TASK."
+    echo "This is treated as a tooling outage, NOT a task failure: no builder attempt was"
+    echo "consumed and the error output was NOT fed back as feedback."
+    echo ""
+    echo "Most likely the CLI is logged out, rate-limited, or misconfigured. Re-authenticate"
+    echo "or check quota, e.g.:"
+    echo "  - claude:   run \`claude\` once to (re)login"
+    echo "  - codex:    \`codex login\`"
+    echo "  - droid:    re-run its login flow"
+    echo "  - opencode: re-check its auth/plan"
+    echo ""
+    echo "Then RESUME — already-PASSed tasks stay committed and are skipped; the batch"
+    echo "picks up at task $HALTED_TASK:"
+    echo "  ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
   fi
   echo ""
   echo "## Per-task results"
@@ -667,11 +809,19 @@ mkdir -p "$TARGET_REPO/.ralph"
 echo ""
 echo "═══════════════════════════════════════════════════════"
 echo "  Batch $OUTCOME"
-echo "  attempted=$ATTEMPTED completed=$COMPLETED failed=$FAILED"
+echo "  attempted=$ATTEMPTED completed=$COMPLETED failed=$FAILED skipped-on-resume=$SKIPPED"
 echo "───────────────────────────────────────────────────────"
 echo "  Branch:    $BRANCH (NOT merged)"
 echo "  Worktree:  $WORKDIR"
 echo "  Report:    $REPORT"
+if [[ -n "$AGENT_ERROR_ROLE" ]]; then
+  agent_name="$([[ "$AGENT_ERROR_ROLE" == reviewer ]] && echo "$REVIEWER" || echo "$BUILDER")"
+  echo "  ⚠ Halted: $AGENT_ERROR_ROLE backend ($agent_name) unavailable after $AGENT_ERROR_ATTEMPTS attempts (last exit ${AGENT_ERROR_EXIT:-?})."
+  echo "  Re-authenticate that CLI, then resume (completed tasks are skipped):"
+  echo "    ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
+  echo "═══════════════════════════════════════════════════════"
+  exit 4
+fi
 if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" == "true" ]]; then
   echo "  Preview:   $RALPH_PREVIEW_URL  (running — open it to review the whole batch)"
 elif [[ "$PREVIEW_RAN" == "true" ]]; then
