@@ -75,6 +75,7 @@ BUILDER="${BUILDER:-opencode}"
 REVIEWER="${REVIEWER:-claude}"
 CHECK_CMD="${CHECK_CMD:-${cfg_check:-./scripts/check.sh}}"
 MAX_TASKS="${MAX_TASKS:-0}"
+MAX_ITERATIONS="${MAX_ITERATIONS:-5}"   # per-task builder/reviewer retries
 AUTO_APPROVE_BUILDER="${AUTO_APPROVE_BUILDER:-false}"
 STOP_ON_FAIL="${STOP_ON_FAIL:-false}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-false}"
@@ -253,7 +254,7 @@ export RALPH_RUN_ID="batch-$TS" RALPH_TARGET_REPO="$TARGET_REPO" RALPH_WORKTREE=
        RALPH_APP_PORT RALPH_DB_PORT RALPH_PREVIEW_URL RALPH_COMPOSE_PROJECT
 
 export WORKDIR BRANCH CHECK_CMD RUN_DIR AGENTS_PATH VERDICT_REGEX \
-       TARGET_REPO TASK_TOTAL AUTO_APPROVE_BUILDER
+       TARGET_REPO TASK_TOTAL AUTO_APPROVE_BUILDER MAX_ITERATIONS
 
 # ---- Helpers ----------------------------------------------------------------
 render_prompt() {
@@ -285,6 +286,10 @@ repl = {
     "HANDOFF": fc("R_HANDOFF_FILE", "(handoff not written)"),
     "AUTO_APPROVE": env.get("AUTO_APPROVE_BUILDER", ""),
     "VERDICT_REGEX": env.get("VERDICT_REGEX", ""),
+    "ATTEMPT": env.get("R_ITER", ""),
+    "MAX_ITERATIONS": env.get("MAX_ITERATIONS", ""),
+    "PREVIOUS_REVIEW": fc("R_PREV_REVIEW_FILE", "none (first attempt)"),
+    "PREVIOUS_CHECK": fc("R_PREV_CHECK_FILE", "none (first attempt)"),
 }
 src = Path(tmpl).read_text()
 for k, v in repl.items():
@@ -326,6 +331,7 @@ run_backend() {
   echo "ALLOW_DIRTY=$ALLOW_DIRTY"
   echo "TASK_TOTAL=$TASK_TOTAL"
   echo "TASK_RUN_COUNT=$TASK_RUN_COUNT"
+  echo "MAX_ITERATIONS=$MAX_ITERATIONS"
   echo "PREVIEW_ENABLED=$PREVIEW_ENABLED"
   echo "PREVIEW_UP=$PREVIEW_UP"
   echo "PREVIEW_DOWN=$PREVIEW_DOWN"
@@ -349,7 +355,7 @@ echo "  tasks:         $TASK_RUN_COUNT of $TASK_TOTAL discovered"
 echo "  builder:       $BUILDER   -> $BUILDER_CMD"
 echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
 echo "  check:         $CHECK_CMD"
-echo "  auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
+echo "  max attempts/task: $MAX_ITERATIONS   auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
 echo "  preview:       $PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  (url after batch: $RALPH_PREVIEW_URL)}"
 echo "  artifacts:     $RUN_DIR"
 echo "═══════════════════════════════════════════════════════"
@@ -382,82 +388,111 @@ while IFS=$'\t' read -r IDX TITLE FN; do
   TASK_FILE="$TASKS_DIR/$FN"
 
   echo ""
-  echo "── Task $IDX/$TASK_TOTAL: $TITLE ──────────────────────"
+  echo "── Task $IDX/$TASK_TOTAL: $TITLE  (up to $MAX_ITERATIONS attempt(s)) ──"
 
   HANDOFF_PATH="$WORKDIR/.agent-handoff.md"
-  BUILDER_PROMPT_R="$RUN_DIR/task-$IDX-builder-prompt.md"
-  BUILDER_LOG="$RUN_DIR/task-$IDX-builder.log"
-  CHECK_LOG="$RUN_DIR/task-$IDX-check.log"
-  DIFF_PATCH="$RUN_DIR/task-$IDX-diff.patch"
-  HANDOFF_SNAP="$RUN_DIR/task-$IDX-handoff.md"
-  REVIEWER_PROMPT_R="$RUN_DIR/task-$IDX-reviewer-prompt.md"
-  REVIEWER_OUT="$RUN_DIR/task-$IDX-reviewer.md"
   RESULT_FILE="$RUN_DIR/task-$IDX-result.md"
-
   HEAD_BEFORE="$(git -C "$WORKDIR" rev-parse HEAD)"
 
-  export R_TASK_NUM="$IDX" R_TASK_TITLE="$TITLE" R_TASK_FILE="$TASK_FILE" \
-         R_CONTEXT_FILE="$CONTEXT_FILE" HANDOFF_PATH
+  # Per-task retry loop: builder -> check -> reviewer, feeding FAIL feedback back
+  # to the builder, until check passes AND the reviewer says PASS, or we run out
+  # of attempts. Mirrors `ralph review`, but the task is committed once at the end.
+  TASK_STATUS="FAIL"; ITERS_USED=0
+  PREV_REVIEW=""; PREV_CHECK=""
+  # Final-iteration artifacts (the result file points at these).
+  DIFF_PATCH="$RUN_DIR/task-$IDX-diff.patch"
+  CHECK_LOG="$RUN_DIR/task-$IDX-check.log"
+  HANDOFF_SNAP="$RUN_DIR/task-$IDX-handoff.md"
+  REVIEWER_OUT="$RUN_DIR/task-$IDX-reviewer.md"
 
-  # 1. Builder
-  render_prompt "$BUILDER_PROMPT" "$BUILDER_PROMPT_R"
-  echo "Running builder ($BUILDER)..."
-  if [[ "$DRY_RUN" == "1" ]]; then
-    echo "[RALPH_DRY_RUN] builder skipped." > "$BUILDER_LOG"
-    printf 'batch dry-run task %s: %s\n' "$IDX" "$TITLE" >> "$WORKDIR/batch-dry-run.txt"
-    printf '# Handoff (dry run) task %s\n- simulated change\n' "$IDX" > "$HANDOFF_PATH"
-  else
-    set +e; run_backend "$BUILDER_CMD" "$BUILDER_PROMPT_R" "$BUILDER_LOG"; set -e
-  fi
+  for ITER in $(seq 1 "$MAX_ITERATIONS"); do
+    ITERS_USED="$ITER"
+    echo "  • attempt $ITER/$MAX_ITERATIONS"
+    BUILDER_PROMPT_R="$RUN_DIR/task-$IDX-iter-$ITER-builder-prompt.md"
+    BUILDER_LOG="$RUN_DIR/task-$IDX-iter-$ITER-builder.log"
+    ITER_CHECK_LOG="$RUN_DIR/task-$IDX-iter-$ITER-check.log"
+    ITER_DIFF="$RUN_DIR/task-$IDX-iter-$ITER-diff.patch"
+    ITER_HANDOFF="$RUN_DIR/task-$IDX-iter-$ITER-handoff.md"
+    REVIEWER_PROMPT_R="$RUN_DIR/task-$IDX-iter-$ITER-reviewer-prompt.md"
+    ITER_REVIEWER_OUT="$RUN_DIR/task-$IDX-iter-$ITER-reviewer.md"
 
-  # 2. Check
-  echo "Running check ($CHECK_CMD)..."
-  set +e; ( cd "$WORKDIR" && eval "$CHECK_CMD" ) > "$CHECK_LOG" 2>&1; CHECK_STATUS=$?; set -e
-  echo "Check exit status: $CHECK_STATUS"
+    export R_TASK_NUM="$IDX" R_TASK_TITLE="$TITLE" R_TASK_FILE="$TASK_FILE" \
+           R_CONTEXT_FILE="$CONTEXT_FILE" HANDOFF_PATH \
+           R_ITER="$ITER" R_PREV_REVIEW_FILE="$PREV_REVIEW" R_PREV_CHECK_FILE="$PREV_CHECK"
 
-  # 3. Diff for this task
-  git -C "$WORKDIR" add -A >/dev/null 2>&1 || true
-  git -C "$WORKDIR" diff --cached "$HEAD_BEFORE" > "$DIFF_PATCH" 2>/dev/null \
-    || git -C "$WORKDIR" diff "$HEAD_BEFORE" > "$DIFF_PATCH" 2>/dev/null || true
-  CHANGED_FILES="$(git -C "$WORKDIR" diff --cached --name-only "$HEAD_BEFORE" 2>/dev/null || true)"
+    # 1. Builder
+    render_prompt "$BUILDER_PROMPT" "$BUILDER_PROMPT_R"
+    echo "    builder ($BUILDER)..."
+    if [[ "$DRY_RUN" == "1" ]]; then
+      echo "[RALPH_DRY_RUN] builder skipped." > "$BUILDER_LOG"
+      printf 'batch dry-run task %s iter %s: %s\n' "$IDX" "$ITER" "$TITLE" >> "$WORKDIR/batch-dry-run.txt"
+      printf '# Handoff (dry run) task %s iter %s\n- simulated change\n' "$IDX" "$ITER" > "$HANDOFF_PATH"
+    else
+      set +e; run_backend "$BUILDER_CMD" "$BUILDER_PROMPT_R" "$BUILDER_LOG"; set -e
+    fi
 
-  # 4. Handoff snapshot
-  if [[ -f "$HANDOFF_PATH" ]]; then cp "$HANDOFF_PATH" "$HANDOFF_SNAP"
-  else echo "(builder did not write a handoff)" > "$HANDOFF_SNAP"; fi
+    # 2. Check
+    echo "    check ($CHECK_CMD)..."
+    set +e; ( cd "$WORKDIR" && eval "$CHECK_CMD" ) > "$ITER_CHECK_LOG" 2>&1; CHECK_STATUS=$?; set -e
+    echo "    check exit: $CHECK_STATUS"
 
-  # 5. Reviewer (read-only)
-  export R_CHECK_STATUS="$CHECK_STATUS" R_DIFF_FILE="$DIFF_PATCH" \
-         R_CHECK_FILE="$CHECK_LOG" R_HANDOFF_FILE="$HANDOFF_SNAP"
-  render_prompt "$REVIEWER_PROMPT" "$REVIEWER_PROMPT_R"
-  echo "Running reviewer ($REVIEWER, read-only)..."
-  if [[ "$DRY_RUN" == "1" ]]; then
-    { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$REVIEWER_OUT"
-  else
-    set +e; run_backend "$REVIEWER_CMD" "$REVIEWER_PROMPT_R" "$REVIEWER_OUT"; set -e
-  fi
-  VERDICT="$(grep -E "$VERDICT_REGEX" "$REVIEWER_OUT" 2>/dev/null | tail -n1 | grep -oE 'PASS|FAIL' | tail -n1 || true)"
-  [[ -z "$VERDICT" ]] && VERDICT="FAIL"
+    # 3. Diff for this task so far (vs the task's starting commit)
+    git -C "$WORKDIR" add -A >/dev/null 2>&1 || true
+    git -C "$WORKDIR" diff --cached "$HEAD_BEFORE" > "$ITER_DIFF" 2>/dev/null \
+      || git -C "$WORKDIR" diff "$HEAD_BEFORE" > "$ITER_DIFF" 2>/dev/null || true
+    CHANGED_FILES="$(git -C "$WORKDIR" diff --cached --name-only "$HEAD_BEFORE" 2>/dev/null || true)"
 
-  if [[ "$VERDICT" == "PASS" && "$CHECK_STATUS" -eq 0 ]]; then
-    TASK_STATUS="PASS"; COMPLETED=$((COMPLETED + 1))
-  else
-    TASK_STATUS="FAIL"; FAILED=$((FAILED + 1))
-  fi
-  echo "Task $IDX result: $TASK_STATUS (check=$CHECK_STATUS verdict=$VERDICT)"
+    # 4. Handoff snapshot
+    if [[ -f "$HANDOFF_PATH" ]]; then cp "$HANDOFF_PATH" "$ITER_HANDOFF"
+    else echo "(builder did not write a handoff)" > "$ITER_HANDOFF"; fi
 
-  # 6. Commit this task's work on the shared branch (kept even if FAIL, so later
-  #    tasks build on it; clearly labelled).
+    # 5. Reviewer (read-only)
+    export R_CHECK_STATUS="$CHECK_STATUS" R_DIFF_FILE="$ITER_DIFF" \
+           R_CHECK_FILE="$ITER_CHECK_LOG" R_HANDOFF_FILE="$ITER_HANDOFF"
+    render_prompt "$REVIEWER_PROMPT" "$REVIEWER_PROMPT_R"
+    echo "    reviewer ($REVIEWER, read-only)..."
+    if [[ "$DRY_RUN" == "1" ]]; then
+      { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$ITER_REVIEWER_OUT"
+    else
+      set +e; run_backend "$REVIEWER_CMD" "$REVIEWER_PROMPT_R" "$ITER_REVIEWER_OUT"; set -e
+    fi
+    VERDICT="$(grep -E "$VERDICT_REGEX" "$ITER_REVIEWER_OUT" 2>/dev/null | tail -n1 | grep -oE 'PASS|FAIL' | tail -n1 || true)"
+    [[ -z "$VERDICT" ]] && VERDICT="FAIL"
+    echo "    verdict: $VERDICT (check=$CHECK_STATUS)"
+
+    # Point the canonical per-task artifacts at this (latest) attempt.
+    cp "$ITER_CHECK_LOG" "$CHECK_LOG" 2>/dev/null || true
+    cp "$ITER_DIFF" "$DIFF_PATCH" 2>/dev/null || true
+    cp "$ITER_HANDOFF" "$HANDOFF_SNAP" 2>/dev/null || true
+    cp "$ITER_REVIEWER_OUT" "$REVIEWER_OUT" 2>/dev/null || true
+
+    if [[ "$VERDICT" == "PASS" && "$CHECK_STATUS" -eq 0 ]]; then
+      TASK_STATUS="PASS"
+      break
+    fi
+    # Feed this attempt's reviewer + check logs back into the next builder attempt.
+    PREV_REVIEW="$ITER_REVIEWER_OUT"; PREV_CHECK="$ITER_CHECK_LOG"
+    [[ "$ITER" -lt "$MAX_ITERATIONS" ]] && echo "    not passing — retrying with feedback"
+  done
+
+  if [[ "$TASK_STATUS" == "PASS" ]]; then COMPLETED=$((COMPLETED + 1))
+  else FAILED=$((FAILED + 1)); fi
+  echo "Task $IDX result: $TASK_STATUS after $ITERS_USED/$MAX_ITERATIONS attempt(s)"
+
+  # Commit this task's work on the shared branch (kept even if FAIL, so later
+  # tasks build on it; clearly labelled).
   if [[ -n "$(git -C "$WORKDIR" status --porcelain)" ]]; then
     git -C "$WORKDIR" add -A >/dev/null 2>&1 || true
     git -C "$WORKDIR" commit -qm "ralph batch task $IDX: $TITLE [$TASK_STATUS]" >/dev/null 2>&1 || true
   fi
   HEAD_AFTER="$(git -C "$WORKDIR" rev-parse HEAD)"
 
-  # 7. Per-task result file
+  # Per-task result file
   {
     echo "# Task $IDX — $TITLE"
     echo ""
     echo "- Result: $TASK_STATUS"
+    echo "- Attempts: $ITERS_USED of $MAX_ITERATIONS"
     echo "- Check exit: $CHECK_STATUS"
     echo "- Reviewer verdict: $VERDICT"
     echo "- Commit: $HEAD_BEFORE -> $HEAD_AFTER"
@@ -465,9 +500,7 @@ while IFS=$'\t' read -r IDX TITLE FN; do
     echo "## Files changed"
     if [[ -n "$CHANGED_FILES" ]]; then printf '%s\n' "$CHANGED_FILES" | sed 's/^/- /'; else echo "- (none)"; fi
     echo ""
-    echo "## Artifacts"
-    echo "- Builder prompt: $BUILDER_PROMPT_R"
-    echo "- Builder log: $BUILDER_LOG"
+    echo "## Artifacts (final attempt; per-attempt logs are task-$IDX-iter-N-*)"
     echo "- Check log: $CHECK_LOG"
     echo "- Diff: $DIFF_PATCH"
     echo "- Handoff: $HANDOFF_SNAP"
@@ -554,17 +587,18 @@ REPORT="$RUN_DIR/final-report.md"
   echo ""
   echo "## Per-task results"
   echo ""
-  echo "| # | Title | Result | Check | Verdict | Files |"
-  echo "|---|-------|--------|-------|---------|-------|"
+  echo "| # | Title | Result | Attempts | Check | Verdict | Files |"
+  echo "|---|-------|--------|----------|-------|---------|-------|"
   while IFS=$'\t' read -r IDX TITLE FN; do
     [[ -z "$IDX" ]] && continue
     rf="$RUN_DIR/task-$IDX-result.md"
     [[ -f "$rf" ]] || continue
     res="$(grep -m1 '^- Result:' "$rf" | sed 's/^- Result: //')"
+    att="$(grep -m1 '^- Attempts:' "$rf" | sed 's/^- Attempts: //')"
     chk="$(grep -m1 '^- Check exit:' "$rf" | sed 's/^- Check exit: //')"
     ver="$(grep -m1 '^- Reviewer verdict:' "$rf" | sed 's/^- Reviewer verdict: //')"
     nfiles="$(awk '/^## Files changed/{f=1;next} /^## /{f=0} f&&/^- /{c++} END{print c+0}' "$rf")"
-    echo "| $IDX | $TITLE | $res | $chk | $ver | $nfiles |"
+    echo "| $IDX | $TITLE | $res | $att | $chk | $ver | $nfiles |"
   done < "$MANIFEST"
   echo ""
   echo "## Failures / blockers"

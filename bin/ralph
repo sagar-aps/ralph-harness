@@ -324,6 +324,7 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
 Batch options (ralph batch):
   --plan <dir|file>                   Tasks: a dir of *.md (sorted) or one .md split by heading
   --max-tasks <n>                     Cap how many tasks run (default: all)
+  --max-iterations <n>                Per-task builder/reviewer retries (default: 5)
   --auto-approve-builder              Builder runs unattended (permission-skipping); reviewer stays read-only
   --stop-on-fail                      Stop at the first failing task
 
@@ -688,6 +689,7 @@ async function main() {
     if (review.reviewer || process.env.REVIEWER) env.REVIEWER = review.reviewer || process.env.REVIEWER;
     if (review.check) env.CHECK_CMD = review.check;
     if (review.maxTasks) env.MAX_TASKS = review.maxTasks;
+    if (review.maxIterations) env.MAX_ITERATIONS = review.maxIterations;
     if (review.branch) env.BRANCH = review.branch;
     if (review.verdictRegex) env.VERDICT_REGEX = review.verdictRegex;
     if (review.allowDirty) env.ALLOW_DIRTY = "true";

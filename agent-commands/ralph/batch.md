@@ -1,6 +1,6 @@
 ---
 description: Run many PRDs/tasks sequentially in ONE shared worktree via the Ralph batch loop
-argument-hint: --repo <path> --plan <dir|file> [--builder <b>] [--reviewer <r>] [--auto-approve-builder] [--stop-on-fail] [--max-tasks <n>]
+argument-hint: --repo <path> --plan <dir|file> [--builder <b>] [--reviewer <r>] [--auto-approve-builder] [--stop-on-fail] [--max-tasks <n>] [--max-iterations <n>]
 ---
 
 You are operating the **Ralph harness** as a pilot for an unattended, multi-task
@@ -22,6 +22,9 @@ Steps:
      The REVIEWER always stays read-only — never change that.
    - `--stop-on-fail` halts at the first failing task; otherwise the batch
      continues and marks failures.
+   - `--max-iterations <n>` is the per-task retry budget (default 5): each task
+     loops builder → check → reviewer, feeding FAIL feedback back to the builder,
+     until it passes or the budget is exhausted, then commits once and moves on.
    - If `--repo` or `--plan` is missing, ask the user before running.
 2. Ralph runs a **preflight** (repo-contract install/check/test/e2e) first. If it
    fails, the batch exits with `PREFLIGHT_FAILED` and creates NO worktree. The
@@ -29,7 +32,8 @@ Steps:
    preflight. Read `<run-dir>/preflight.md` and propose the **minimal repo-contract
    fix** for the human; re-run only once the contract is green.
 3. Otherwise the batch uses ONE worktree/branch `ralph/batch-<timestamp>` and runs,
-   per task: builder → check → reviewer (read-only) → record result → commit.
+   per task: builder → check → reviewer (read-only), retrying up to
+   `--max-iterations` with feedback, then commits once and moves on.
    It never merges, pushes, or deletes anything.
 4. When it finishes, read the final report at
    `<target>/.agent-run/batch-<timestamp>/final-report.md` (and `<target>/.ralph/last-run.env`)

@@ -48,7 +48,7 @@ function makeTarget(opts = {}) {
   git(target, ["config", "user.name", "t"]);
   writeFileSync(path.join(target, "README.md"), "# T\n");
   mkdirSync(path.join(target, "scripts"), { recursive: true });
-  writeScript(path.join(target, "scripts", "check.sh"), "#!/usr/bin/env bash\nexit 0\n");
+  writeScript(path.join(target, "scripts", "check.sh"), `#!/usr/bin/env bash\nexit ${opts.checkFails ? 1 : 0}\n`);
   const cfg = { check: "./scripts/check.sh", preview: { enabled: false } };
   if (opts.preview) {
     writeScript(
@@ -267,6 +267,50 @@ console.log("6) preview enabled + failing e2e: COMPLETED_WITH_FAILURES but URL s
     check(/End-of-batch e2e FAILED/.test(report), "report lists the e2e failure as a blocker");
     const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
     check(/PREVIEW_URL=http:\/\/apps:\d+/.test(lastRun), "URL still returned so the human can inspect");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("7) --max-iterations: a task retries up to N times before failing");
+{
+  const { target } = makeTarget({ checkFails: true }); // check never passes -> task can't pass
+  const plan = makePlanDir();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--max-tasks", "1", "--max-iterations", "3", "--builder", "claude", "--reviewer", "codex", "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target) },
+    );
+    check(r.status === 2, "batch exits 2 (task could not pass)");
+    const runDir = batchRunDir(target);
+    // Three builder attempts were made for task 001.
+    for (const n of [1, 2, 3]) {
+      check(existsSync(path.join(runDir, `task-001-iter-${n}-builder.log`)), `attempt ${n} ran (iter-${n} artifacts)`);
+    }
+    check(!existsSync(path.join(runDir, "task-001-iter-4-builder.log")), "stopped at max-iterations (no 4th attempt)");
+    const result = readFileSync(path.join(runDir, "task-001-result.md"), "utf-8");
+    check(/Attempts: 3 of 3/.test(result), "result records 3 of 3 attempts");
+    check(/- Result: FAIL/.test(result), "task marked FAIL after exhausting attempts");
+    // Builder prompt on attempt 2 carries the previous check feedback.
+    const b2 = readFileSync(path.join(runDir, "task-001-iter-2-builder-prompt.md"), "utf-8");
+    check(/Attempt 2 of 3/.test(b2), "attempt 2 prompt knows it is attempt 2 of 3");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("8) default per-task budget is 5 attempts");
+{
+  const { target } = makeTarget({ checkFails: true });
+  const plan = makePlanDir();
+  try {
+    ralph(["batch", "--repo", target, "--plan", plan, "--max-tasks", "1", "--builder", "claude", "--reviewer", "codex", "--auto-approve-builder"], {
+      RALPH_DRY_RUN: "1",
+      RALPH_WORKTREE_DIR: wtBase(target),
+    });
+    const runDir = batchRunDir(target);
+    check(existsSync(path.join(runDir, "task-001-iter-5-builder.log")), "5th attempt ran by default");
+    check(!existsSync(path.join(runDir, "task-001-iter-6-builder.log")), "no 6th attempt (default budget = 5)");
   } finally {
     cleanup(target);
   }

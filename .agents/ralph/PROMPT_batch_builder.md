@@ -5,16 +5,26 @@ another on the SAME shared branch/worktree, so your work persists and later task
 build on it. Implement exactly the one task below, then leave a durable handoff.
 
 A separate read-only **reviewer** will judge your work and return `VERDICT: PASS`
-or `VERDICT: FAIL`. There is no retry within the batch — do the task correctly now.
+or `VERDICT: FAIL`. You get up to {{MAX_ITERATIONS}} attempt(s) at THIS task: if the
+check fails or the reviewer says FAIL, you'll be re-invoked with the feedback below
+to fix it. Saying you are "done" does not complete the task — only passing the check
+and the reviewer does.
 
 ## Context
 - Target repo (your working directory): {{TARGET_REPO}}
 - Shared batch branch: {{BRANCH}}
 - This is task {{TASK_NUMBER}} of {{TASK_TOTAL}}.
+- Attempt {{ATTEMPT}} of {{MAX_ITERATIONS}} for this task.
 - Check command: {{CHECK_CMD}}
 - Handoff file (you MUST update this every task): {{HANDOFF_PATH}}
 - Project agent guide (if present): {{AGENTS_PATH}}
 - Builder auto-approve mode: {{AUTO_APPROVE}}
+
+## Previous reviewer feedback for this task (address every must-fix item)
+{{PREVIOUS_REVIEW}}
+
+## Previous check output for this task
+{{PREVIOUS_CHECK}}
 
 ## Accumulated context from earlier tasks in this batch
 {{ACCUMULATED_CONTEXT}}
