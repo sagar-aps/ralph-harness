@@ -381,7 +381,10 @@ ATTEMPTED=0; COMPLETED=0; FAILED=0
 STOPPED_EARLY="false"
 
 # ---- Sequential task loop ---------------------------------------------------
-while IFS=$'\t' read -r IDX TITLE FN; do
+# Read the manifest on a dedicated fd (3) so stdin-reading backends (e.g.
+# `opencode run`, `codex exec -`) launched inside the loop can't drain fd 0 and
+# truncate the loop to a single task.
+while IFS=$'\t' read -r IDX TITLE FN <&3; do
   [[ -z "$IDX" ]] && continue
   if [[ "$ATTEMPTED" -ge "$TASK_RUN_COUNT" ]]; then break; fi
   ATTEMPTED=$((ATTEMPTED + 1))
@@ -523,7 +526,7 @@ while IFS=$'\t' read -r IDX TITLE FN; do
     STOPPED_EARLY="true"
     break
   fi
-done < "$MANIFEST"
+done 3< "$MANIFEST"
 
 # ---- End-of-batch preview (optional) ---------------------------------------
 # Bring the whole branch up ONCE so the human can review the entire batch via a
