@@ -497,6 +497,19 @@ ralph batch \
   flags; logged explicitly). It **never** affects the reviewer, which always runs
   read-only (sandboxed for Codex). Without it the builder runs in manual mode.
 - `--max-tasks <n>` caps how many tasks run (default: all).
+- **`--verify <cmd>` — acceptance gate (a heavier check at PASS-time).** The
+  per-attempt `--check` should be fast (lint, typecheck, unit tests) so iteration is
+  cheap. `--verify` (or `ralph.target.json` `.verify`) runs a heavier command — full
+  suite, production build, or an issue's **Acceptance** criteria — **only once per
+  task**, when the fast check passed *and* the reviewer voted PASS. If verify fails,
+  the task is not accepted: its log is fed back to the builder as `{{PREVIOUS_VERIFY}}`
+  and it iterates. Empty = disabled (default). Whole-system e2e still belongs in the
+  end-of-batch preview lifecycle, not here.
+- **`--primer <file>` — orchestrator-supplied repo orientation.** Renders into a
+  `{{PRIMER}}` slot at the top of every builder prompt (run-scoped; no need to edit
+  the target's `AGENTS.md`). Use it to inject a repo map / conventions / "where to
+  look" so the builder doesn't re-derive structure each attempt. Also settable as
+  `ralph.target.json` `.primer` (path relative to the target repo).
 - **Agent ERROR vs task FAIL.** A *task* FAIL means the reviewer voted FAIL / checks
   failed. An *agent* ERROR is a tooling outage the harness detects — the backend
   exits non-zero, or the reviewer emits no `VERDICT:` line (a missing verdict is

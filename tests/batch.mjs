@@ -556,6 +556,55 @@ console.log("15) a bogus/empty verdict is still ERROR, not silently BLOCKED");
   }
 }
 
+console.log("16) --verify acceptance gate runs at PASS-time and can force another attempt");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    // Verify fails on attempt 1, passes on attempt 2 — proves the gate runs only
+    // after check+reviewer are happy, yet can still bounce the task back to iterate.
+    const VERIFY = 'bash -c \'test "${R_ITER:-1}" -ge 2\'';
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev", "--verify", VERIFY, "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 0, "batch reaches READY (exit 0) once verify passes");
+    check(/verify exit: 1/.test(out), "verify ran and FAILED on attempt 1 despite reviewer PASS");
+    check(/verify exit: 0/.test(out), "verify PASSED on a later attempt");
+    check(/Task 001 result: PASS after 2\//.test(out), "reviewer-PASS + verify-fail forced a 2nd attempt");
+    check(/READY_FOR_HUMAN_REVIEW/.test(out), "outcome READY_FOR_HUMAN_REVIEW");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("17) --primer injects orchestrator orientation into the builder prompt");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  const primerDir = mkdtempSync(path.join(tmpdir(), "ralph-primer-"));
+  const primerFile = path.join(primerDir, "primer.md");
+  const SENTINEL = "PRIMER-SENTINEL-9f3a routers live in backend/app/routers";
+  writeFileSync(primerFile, `# Repo map\n${SENTINEL}\n`);
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev", "--primer", primerFile, "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(/primer:\s+\S/.test(out), "banner shows a primer is loaded");
+    const runsRoot = path.join(target, ".agent-run");
+    const dirs = readdirSync(runsRoot).filter((x) => x.startsWith("batch-")).sort();
+    const rd = path.join(runsRoot, dirs[dirs.length - 1]);
+    const prompt = readFileSync(path.join(rd, "task-001-iter-1-builder-prompt.md"), "utf-8");
+    check(prompt.includes(SENTINEL), "primer text is rendered into the builder prompt ({{PRIMER}})");
+  } finally {
+    cleanup(target);
+    rmSync(primerDir, { recursive: true, force: true });
+  }
+}
+
 for (const d of [...planDirs, ...stateDirs]) {
   try {
     rmSync(d, { recursive: true, force: true });

@@ -24,6 +24,8 @@ const review = {
   reviewer: null,
   maxIterations: null,
   check: null,
+  verify: null,
+  primer: null,
   task: null,
   taskIndex: null,
   branch: null,
@@ -344,6 +346,9 @@ Batch options (ralph batch):
   --plan <dir|file>                   Tasks: a dir of *.md (sorted) or one .md split by heading
   --max-tasks <n>                     Cap how many tasks run (default: all)
   --max-iterations <n>                Per-task builder/reviewer attempts (default: 5)
+  --verify <cmd>                      Acceptance gate run ONCE per task when check passes + reviewer PASSes
+                                      (heavier than --check; a non-zero verify sends the task back to iterate)
+  --primer <file>                     Repo-orientation text injected into every builder prompt ({{PRIMER}})
   --auto-approve-builder              Builder runs unattended (permission-skipping); reviewer stays read-only
   --stop-on-fail                      Stop at the first failing task
   --resume                            Resume the last batch run, skipping already-completed tasks
@@ -458,6 +463,8 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     "--reviewer": "reviewer",
     "--max-iterations": "maxIterations",
     "--check": "check",
+    "--verify": "verify",
+    "--primer": "primer",
     "--task": "task",
     "--branch": "branch",
     "--verdict-regex": "verdictRegex",
@@ -713,6 +720,8 @@ async function main() {
     if (review.builder || process.env.BUILDER) env.BUILDER = review.builder || process.env.BUILDER;
     if (review.reviewer || process.env.REVIEWER) env.REVIEWER = review.reviewer || process.env.REVIEWER;
     if (review.check) env.CHECK_CMD = review.check;
+    if (review.verify) env.VERIFY_CMD = review.verify;
+    if (review.primer) env.RALPH_PRIMER_FILE = path.resolve(cwd, review.primer);
     if (review.maxTasks) env.MAX_TASKS = review.maxTasks;
     if (review.maxIterations) env.MAX_ITERATIONS = review.maxIterations;
     if (review.branch) env.BRANCH = review.branch;

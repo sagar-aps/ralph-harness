@@ -52,7 +52,7 @@ PLAN="${PLAN:-}"
 PLAN="$(cd "$(dirname "$PLAN")" && pwd)/$(basename "$PLAN")"
 
 # Target config (check command + optional end-of-batch preview).
-cfg_check=""
+cfg_check=""; cfg_verify=""; cfg_primer=""
 cfg_prev_enabled=""; cfg_up=""; cfg_down=""; cfg_url=""; cfg_e2e=""; cfg_host=""
 if [[ -f "$TARGET_REPO/ralph.target.json" ]]; then
   eval "$(python3 - "$TARGET_REPO/ralph.target.json" <<'PY'
@@ -65,6 +65,8 @@ def emit(k, v):
     if isinstance(v, bool): v = "true" if v else "false"
     print(f"{k}={shlex.quote(str(v))}")
 emit("cfg_check", d.get("check"))
+emit("cfg_verify", d.get("verify"))
+emit("cfg_primer", d.get("primer"))
 emit("cfg_prev_enabled", p.get("enabled"))
 emit("cfg_up", p.get("up"))
 emit("cfg_down", p.get("down"))
@@ -78,6 +80,14 @@ fi
 BUILDER="${BUILDER:-opencode}"
 REVIEWER="${REVIEWER:-claude}"
 CHECK_CMD="${CHECK_CMD:-${cfg_check:-./scripts/check.sh}}"
+# Acceptance/verify gate: a heavier check run ONCE per task at PASS-time (when the
+# fast check passed AND the reviewer approved). Empty = disabled (today's behavior).
+VERIFY_CMD="${VERIFY_CMD:-${cfg_verify:-}}"
+# Orchestrator-supplied repo primer injected into every builder prompt as {{PRIMER}}.
+# A file path; relative paths resolve against the target repo. Empty = no primer.
+PRIMER_FILE="${RALPH_PRIMER_FILE:-${cfg_primer:-}}"
+if [[ -n "$PRIMER_FILE" && "$PRIMER_FILE" != /* ]]; then PRIMER_FILE="$TARGET_REPO/$PRIMER_FILE"; fi
+export R_PRIMER_FILE="$PRIMER_FILE"
 MAX_TASKS="${MAX_TASKS:-0}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5}"   # per-task builder/reviewer attempts (verdict loop)
 # Infra-error handling for the agent backends (distinct from PASS/FAIL): a backend
@@ -345,6 +355,8 @@ repl = {
     "MAX_ITERATIONS": env.get("MAX_ITERATIONS", ""),
     "PREVIOUS_REVIEW": fc("R_PREV_REVIEW_FILE", "none (first attempt)"),
     "PREVIOUS_CHECK": fc("R_PREV_CHECK_FILE", "none (first attempt)"),
+    "PREVIOUS_VERIFY": fc("R_PREV_VERIFY_FILE", "none"),
+    "PRIMER": fc("R_PRIMER_FILE", "(no primer provided)"),
 }
 src = Path(tmpl).read_text()
 for k, v in repl.items():
@@ -462,6 +474,8 @@ on_interrupt() {
   echo "BUILDER_CMD=$BUILDER_CMD"
   echo "REVIEWER_CMD=$REVIEWER_CMD"
   echo "CHECK_CMD=$CHECK_CMD"
+  echo "VERIFY_CMD=$VERIFY_CMD"
+  echo "PRIMER_FILE=$PRIMER_FILE"
   echo "AUTO_APPROVE_BUILDER=$AUTO_APPROVE_BUILDER"
   echo "STOP_ON_FAIL=$STOP_ON_FAIL"
   echo "ALLOW_DIRTY=$ALLOW_DIRTY"
@@ -494,6 +508,8 @@ echo "  tasks:         $TASK_RUN_COUNT of $TASK_TOTAL discovered"
 echo "  builder:       $BUILDER   -> $BUILDER_CMD"
 echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
 echo "  check:         $CHECK_CMD"
+echo "  verify:        ${VERIFY_CMD:-(none)}"
+echo "  primer:        ${PRIMER_FILE:-(none)}"
 echo "  max attempts/task: $MAX_ITERATIONS   agent-error retries: $AGENT_RETRIES   resume: $RESUMING"
 echo "  auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
 echo "  preview:       $PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  (url after batch: $RALPH_PREVIEW_URL)}"
@@ -555,11 +571,12 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   # Per-task retry loop: builder -> check -> reviewer, feeding FAIL feedback back
   # to the builder, until check passes AND the reviewer says PASS, or we run out
   # of attempts. Mirrors `ralph review`, but the task is committed once at the end.
-  TASK_STATUS="FAIL"; ITERS_USED=0
-  PREV_REVIEW=""; PREV_CHECK=""
+  TASK_STATUS="FAIL"; ITERS_USED=0; VERIFY_STATUS=""
+  PREV_REVIEW=""; PREV_CHECK=""; PREV_VERIFY=""
   # Final-iteration artifacts (the result file points at these).
   DIFF_PATCH="$RUN_DIR/task-$IDX-diff.patch"
   CHECK_LOG="$RUN_DIR/task-$IDX-check.log"
+  VERIFY_LOG="$RUN_DIR/task-$IDX-verify.log"
   HANDOFF_SNAP="$RUN_DIR/task-$IDX-handoff.md"
   REVIEWER_OUT="$RUN_DIR/task-$IDX-reviewer.md"
 
@@ -569,6 +586,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     BUILDER_PROMPT_R="$RUN_DIR/task-$IDX-iter-$ITER-builder-prompt.md"
     BUILDER_LOG="$RUN_DIR/task-$IDX-iter-$ITER-builder.log"
     ITER_CHECK_LOG="$RUN_DIR/task-$IDX-iter-$ITER-check.log"
+    ITER_VERIFY_LOG="$RUN_DIR/task-$IDX-iter-$ITER-verify.log"
     ITER_DIFF="$RUN_DIR/task-$IDX-iter-$ITER-diff.patch"
     ITER_HANDOFF="$RUN_DIR/task-$IDX-iter-$ITER-handoff.md"
     REVIEWER_PROMPT_R="$RUN_DIR/task-$IDX-iter-$ITER-reviewer-prompt.md"
@@ -576,7 +594,8 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
 
     export R_TASK_NUM="$IDX" R_TASK_TITLE="$TITLE" R_TASK_FILE="$TASK_FILE" \
            R_CONTEXT_FILE="$CONTEXT_FILE" HANDOFF_PATH \
-           R_ITER="$ITER" R_PREV_REVIEW_FILE="$PREV_REVIEW" R_PREV_CHECK_FILE="$PREV_CHECK"
+           R_ITER="$ITER" R_PREV_REVIEW_FILE="$PREV_REVIEW" R_PREV_CHECK_FILE="$PREV_CHECK" \
+           R_PREV_VERIFY_FILE="$PREV_VERIFY"
 
     # 1. Builder (retry on infra ERROR; halt the batch if unrecoverable)
     render_prompt "$BUILDER_PROMPT" "$BUILDER_PROMPT_R"
@@ -631,8 +650,23 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
       break
     fi
     if [[ "$VERDICT" == "PASS" && "$CHECK_STATUS" -eq 0 ]]; then
-      TASK_STATUS="PASS"
-      break
+      # Acceptance/verify gate: the heavier check runs ONLY now — the fast check
+      # passed AND the reviewer approved — so the expensive suite/build runs once
+      # per task instead of on every attempt. A non-zero verify sends the task back
+      # to iterate, with the verify log fed to the builder as {{PREVIOUS_VERIFY}}.
+      VERIFY_STATUS=0
+      if [[ -n "$VERIFY_CMD" ]]; then
+        echo "    verify ($VERIFY_CMD)..."
+        set +e; ( cd "$WORKDIR" && eval "$VERIFY_CMD" ) > "$ITER_VERIFY_LOG" 2>&1; VERIFY_STATUS=$?; set -e
+        echo "    verify exit: $VERIFY_STATUS"
+        cp "$ITER_VERIFY_LOG" "$VERIFY_LOG" 2>/dev/null || true
+      fi
+      if [[ "$VERIFY_STATUS" -eq 0 ]]; then
+        TASK_STATUS="PASS"
+        break
+      fi
+      echo "    reviewer approved but verify FAILED (exit $VERIFY_STATUS) — iterating"
+      PREV_VERIFY="$ITER_VERIFY_LOG"
     fi
     # Feed this attempt's reviewer + check logs back into the next builder attempt.
     PREV_REVIEW="$ITER_REVIEWER_OUT"; PREV_CHECK="$ITER_CHECK_LOG"
@@ -666,6 +700,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     echo "- Result: $TASK_STATUS"
     echo "- Attempts: $ITERS_USED of $MAX_ITERATIONS"
     echo "- Check exit: $CHECK_STATUS"
+    [[ -n "$VERIFY_CMD" ]] && echo "- Verify exit: ${VERIFY_STATUS:-not reached}"
     echo "- Reviewer verdict: $VERDICT"
     echo "- Commit: $HEAD_BEFORE -> $HEAD_AFTER"
     echo ""

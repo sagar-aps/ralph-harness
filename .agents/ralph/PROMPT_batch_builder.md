@@ -10,6 +10,9 @@ THIS task: if the check fails or the reviewer says FAIL, you'll be re-invoked wi
 feedback below to fix it. Saying you are "done" does not complete the task — only
 passing the check and the reviewer does.
 
+## Repo primer (orientation — read first)
+{{PRIMER}}
+
 ## Context
 - Target repo (your working directory): {{TARGET_REPO}}
 - Shared batch branch: {{BRANCH}}
@@ -25,6 +28,11 @@ passing the check and the reviewer does.
 
 ## Previous check output for this task
 {{PREVIOUS_CHECK}}
+
+## Previous acceptance/verify failure (resolve this to complete the task)
+The reviewer approved a prior attempt, but the acceptance gate (heavier verify)
+failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
+{{PREVIOUS_VERIFY}}
 
 ## Accumulated context from earlier tasks in this batch
 {{ACCUMULATED_CONTEXT}}
