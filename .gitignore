@@ -16,6 +16,9 @@ pnpm-debug.log*
 # Local Ralph state
 .ralph/
 
+# Untracked local agent/backend config (copy from config.local.sh.example)
+.agents/ralph/config.local.sh
+
 # Temp
 .tmp/
 

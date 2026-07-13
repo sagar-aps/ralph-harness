@@ -46,6 +46,13 @@ if [ -f "$CONFIG_FILE" ]; then
   # shellcheck source=/dev/null
   . "$CONFIG_FILE"
 fi
+# Untracked local overrides (gitignored) — sourced last so they win. Copy
+# config.local.sh.example to config.local.sh to define/override backends & roles.
+LOCAL_CONFIG_FILE="${SCRIPT_DIR}/config.local.sh"
+if [ -f "$LOCAL_CONFIG_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$LOCAL_CONFIG_FILE"
+fi
 
 DEFAULT_AGENT_NAME="${DEFAULT_AGENT:-codex}"
 resolve_agent_cmd() {

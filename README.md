@@ -196,6 +196,26 @@ decoupled: any backend can be assigned to any role.
 - The reviewer is read-only **by prompt**; pick a sandboxed backend
   (`--reviewer codex-readonly`) to also enforce it at the tool level.
 
+#### Configure agents locally (`config.local.sh`)
+
+Don't edit the tracked config for machine-specific setup — the agent binaries you
+have, the exact command that runs them, your default roles. Put those in an
+**untracked** `config.local.sh` instead:
+
+```bash
+cp .agents/ralph/config.local.sh.example .agents/ralph/config.local.sh
+# then edit — e.g. define a backend the harness doesn't ship with:
+#   AGENT_ZLAUDE_CMD='zlaude -p --dangerously-skip-permissions "$(cat {prompt})"'
+#   : "${BUILDER:=zlaude}"        # your default builder (a --builder flag still wins)
+```
+
+`config.local.sh` is git-ignored and sourced **last**, so it overrides the shipped
+defaults without merge conflicts or leaking your setup. Precedence, highest first:
+**CLI flag → env var → `config.local.sh` → `config.sh`/`review-config.sh` →
+`agents.sh` defaults.** A backend is just an `AGENT_<NAME>_CMD` whose template
+contains `{prompt}` (a quoted prompt-file path is substituted) or reads the prompt
+from stdin — see `config.local.sh.example` for the full set of examples.
+
 ### Run one PRD/task
 
 ```bash

@@ -31,6 +31,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/config.sh"; }
 [[ -f "$SCRIPT_DIR/review-config.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/review-config.sh"; }
+# Untracked local overrides (gitignored) — sourced LAST so they win. Copy
+# config.local.sh.example to config.local.sh to define/override backends & roles.
+[[ -f "$SCRIPT_DIR/config.local.sh" ]] && { # shellcheck source=/dev/null
+  . "$SCRIPT_DIR/config.local.sh"; }
 
 die() { echo "ralph: $*" >&2; exit 1; }
 

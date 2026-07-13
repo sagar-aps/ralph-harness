@@ -1,0 +1,48 @@
+# Ralph LOCAL config — copy this file to `config.local.sh` and edit.
+#
+#     cp .agents/ralph/config.local.sh.example .agents/ralph/config.local.sh
+#
+# `config.local.sh` is git-IGNORED, so it's the right place for anything
+# machine- or person-specific: which agent binaries you have, what commands run
+# them, and your preferred default roles. It is sourced LAST (after agents.sh,
+# config.sh and review-config.sh), so whatever you set here wins over the shipped
+# defaults. Nothing here is committed, so you won't get merge conflicts or leak
+# your local setup.
+#
+# Precedence (highest first):  CLI flag  >  environment variable  >  THIS FILE  >
+#                              config.sh / review-config.sh  >  agents.sh defaults
+#
+# ---------------------------------------------------------------------------
+# 1) Define a brand-new backend  (no code change needed)
+# ---------------------------------------------------------------------------
+# A backend is just a command template named AGENT_<NAME>_CMD, where <NAME> is
+# the backend name UPPERCASED with dashes turned into underscores. The template
+# either contains {prompt} (replaced with a quoted prompt-file path) OR reads the
+# prompt from stdin. Once defined, use it as any role: `--builder <name>`.
+#
+# Example: a "zlaude" backend (Claude Code wired to the Z.AI plan):
+# AGENT_ZLAUDE_CMD='zlaude -p --dangerously-skip-permissions "$(cat {prompt})"'
+#   ...then:  ralph batch --builder zlaude --reviewer codex-readonly ...
+
+# ---------------------------------------------------------------------------
+# 2) Override an existing backend's command
+# ---------------------------------------------------------------------------
+# Don't have codex? Point the name at whatever you use, or change its flags.
+# AGENT_OPENCODE_Z_CMD='opencode run --model glm-4.6 "$(cat {prompt})"'
+# AGENT_CLAUDE_CMD='claude -p --dangerously-skip-permissions "$(cat {prompt})"'
+
+# ---------------------------------------------------------------------------
+# 3) Set your default roles so you don't pass flags every time
+# ---------------------------------------------------------------------------
+# Use `: "${VAR:=value}"` (conditional) so an explicit --builder/--reviewer flag
+# still overrides these. Plain `VAR=value` would beat the flag — usually not what
+# you want.
+# : "${BUILDER:=opencode-z}"
+# : "${REVIEWER:=codex-readonly}"
+
+# ---------------------------------------------------------------------------
+# 4) Workflow defaults (optional)
+# ---------------------------------------------------------------------------
+# : "${MAX_ITERATIONS:=15}"       # per-task builder/reviewer attempts in batch
+# : "${CHECK_CMD:=./scripts/check.sh}"
+# : "${VERDICT_REGEX:=^VERDICT: (PASS|FAIL)}"
