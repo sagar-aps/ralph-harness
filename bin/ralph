@@ -107,6 +107,23 @@ function parseEnvFile(file) {
   return out;
 }
 
+// Ensure each entry exists in <repo>/.gitignore (creating the file if needed).
+// Returns true if the file was changed.
+function ensureGitignore(repo, entries) {
+  const giPath = path.join(repo, ".gitignore");
+  let gi = exists(giPath) ? fs.readFileSync(giPath, "utf-8") : "";
+  let changed = false;
+  for (const entry of entries) {
+    const present = gi.split("\n").some((l) => l.trim() === entry);
+    if (!present) {
+      gi += (gi && !gi.endsWith("\n") ? "\n" : "") + entry + "\n";
+      changed = true;
+    }
+  }
+  if (changed) fs.writeFileSync(giPath, gi);
+  return changed;
+}
+
 function readTargetConfig(repo) {
   const file = path.join(repo, "ralph.target.json");
   if (!exists(file)) return {};
@@ -882,18 +899,14 @@ async function main() {
       created.push(".agents/tasks/");
     }
 
-    const giPath = path.join(repo, ".gitignore");
-    let gi = exists(giPath) ? fs.readFileSync(giPath, "utf-8") : "";
-    let giChanged = false;
-    for (const entry of [".ralph/", ".agent-run/", ".agent-handoff.md"]) {
-      const present = gi.split("\n").some((l) => l.trim() === entry);
-      if (!present) {
-        gi += (gi && !gi.endsWith("\n") ? "\n" : "") + entry + "\n";
-        giChanged = true;
-      }
-    }
-    if (giChanged) {
-      fs.writeFileSync(giPath, gi);
+    if (
+      ensureGitignore(repo, [
+        ".ralph/",
+        ".agent-run/",
+        ".agent-handoff.md",
+        ".agents/ralph/config.local.sh",
+      ])
+    ) {
       updated.push(".gitignore");
     }
 
@@ -1135,6 +1148,11 @@ async function main() {
       if (exists(readmeSrc)) fs.copyFileSync(readmeSrc, readmeDst);
       if (exists(diagramSrc)) fs.copyFileSync(diagramSrc, diagramDst);
       if (exists(imageSrc)) fs.copyFileSync(imageSrc, imageDst);
+      // Keep the user's untracked local agent config out of version control.
+      const projectRoot = path.resolve(localDir, "..", "..");
+      if (ensureGitignore(projectRoot, [".agents/ralph/config.local.sh"])) {
+        console.log("Updated .gitignore (ignoring .agents/ralph/config.local.sh)");
+      }
     }
     if (installSkills) {
       await runInstallSkills();
