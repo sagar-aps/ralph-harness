@@ -505,10 +505,20 @@ ralph batch \
   errors the **whole batch halts** with `REVIEWER_UNAVAILABLE` / `BUILDER_UNAVAILABLE`
   (exit 4, distinct from `COMPLETED_WITH_FAILURES`), a re-login hint, and a resume
   command. No builder attempt is consumed and the error output is never fed back.
-- **Resume.** After fixing/re-authenticating the backend, `ralph batch … --resume`
-  reuses the same branch+worktree, **skips tasks that already PASSed** (kept as
-  commits), and continues from where it halted — so an outage never forces you to
-  redo completed tasks. (Also exposed to agents as `/ralph-resume`.)
+- **Task BLOCKED (needs a human).** Beyond PASS/FAIL, the reviewer may vote
+  `VERDICT: BLOCKED` when a task is well-defined but not completable *in scope* —
+  contradictory/impossible acceptance, needs access or a product decision, or an
+  out-of-scope architectural change. BLOCKED is **terminal for that task**: it
+  short-circuits the retry loop (no point burning attempts), commits the partial work
+  plus the reviewer's blocker report, and — if no task hard-failed — the batch ends
+  `COMPLETED_WITH_BLOCKERS`. Guardrails: the builder can only *request* it via its
+  handoff; the read-only reviewer decides, and a missing/empty verdict is `ERROR`,
+  never inferred as BLOCKED. Especially useful in bug/issue mode, where a "bug" often
+  turns out to need a human decision. After you unblock it, `--resume` retries it.
+- **Resume.** After fixing/re-authenticating the backend (or unblocking a task),
+  `ralph batch … --resume` reuses the same branch+worktree, **skips tasks that already
+  PASSed** (kept as commits), and continues from where it halted — so an outage never
+  forces you to redo completed tasks. (Also exposed to agents as `/ralph-resume`.)
 - Guardrails: refuses a dirty target unless `--allow-dirty`; runs preflight first;
   prints the full plan (repo, branch, worktree, builder, reviewer, check, flags)
   before starting; never merges, pushes, or deletes anything.

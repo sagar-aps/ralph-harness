@@ -500,6 +500,62 @@ console.log("13) interrupt (SIGINT) mid-task leaves a resumable pointer");
   }
 }
 
+console.log("14) reviewer BLOCKED short-circuits the task and escalates (COMPLETED_WITH_BLOCKERS)");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    // Reviewer blocks task 1 (structural), passes task 2 — proves BLOCKED is terminal
+    // for its task but the batch continues to independent tasks.
+    const BLOCKREV =
+      `bash -c 'if [ "$R_TASK_NUM" = "001" ]; then printf "### Must-fix issues\\n- none\\n\\n### Blocker report\\n- acceptance is self-contradictory\\n\\nVERDICT: BLOCKED\\n"; else printf "VERDICT: PASS\\n"; fi'`;
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "blockrev", "--auto-approve-builder"],
+      { RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_BLOCKREV_CMD: BLOCKREV },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 2, "exit 2 (ran, not ready — needs human)");
+    check(/verdict: BLOCKED/.test(out), "reviewer BLOCKED verdict is recognized");
+    check(/Task 001 result: BLOCKED after 1\//.test(out), "blocked task short-circuits at attempt 1 (no retry loop)");
+    check(/Batch COMPLETED_WITH_BLOCKERS/.test(out), "outcome COMPLETED_WITH_BLOCKERS");
+    check(/Task 002 result: PASS/.test(out), "independent task 2 still ran and PASSed");
+
+    const runsRoot = path.join(target, ".agent-run");
+    const dirs = readdirSync(runsRoot).filter((x) => x.startsWith("batch-")).sort();
+    const rd = path.join(runsRoot, dirs[dirs.length - 1]);
+    check(!existsSync(path.join(rd, "task-001-iter-2-builder.log")), "no 2nd builder attempt for the blocked task");
+    const rep = readFileSync(path.join(rd, "final-report.md"), "utf-8");
+    check(/\|\s*001\s*\|.*\|\s*BLOCKED\s*\|/.test(rep), "per-task table marks task 1 BLOCKED");
+    check(/BLOCKED — needs human/.test(rep), "failures/blockers section flags the blocked task for a human");
+    check(/blocked: 1/.test(rep), "report counts blocked tasks");
+
+    const lr = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/STATUS=COMPLETED_WITH_BLOCKERS/.test(lr), "last-run.env records COMPLETED_WITH_BLOCKERS");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("15) a bogus/empty verdict is still ERROR, not silently BLOCKED");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    // Reviewer prints no VERDICT line at all -> harness must treat as ERROR
+    // (REVIEWER_UNAVAILABLE), never infer BLOCKED/FAIL from absence.
+    const NOVERDICT = 'bash -c "printf \\"just some prose, no verdict line\\n\\""';
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "noverdict", "--auto-approve-builder"],
+      { RALPH_AGENT_RETRY_DELAY: "0", RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_NOVERDICT_CMD: NOVERDICT },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(/REVIEWER_UNAVAILABLE/.test(out), "missing verdict => ERROR (REVIEWER_UNAVAILABLE), not BLOCKED");
+    check(!/COMPLETED_WITH_BLOCKERS/.test(out), "no verdict is never treated as BLOCKED");
+  } finally {
+    cleanup(target);
+  }
+}
+
 for (const d of [...planDirs, ...stateDirs]) {
   try {
     rmSync(d, { recursive: true, force: true });

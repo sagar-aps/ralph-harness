@@ -91,7 +91,7 @@ RESUME="${RESUME:-}"   # non-empty => resume the last batch run, skipping done t
 AUTO_APPROVE_BUILDER="${AUTO_APPROVE_BUILDER:-false}"
 STOP_ON_FAIL="${STOP_ON_FAIL:-false}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-false}"
-VERDICT_REGEX="${VERDICT_REGEX:-^VERDICT: (PASS|FAIL)}"
+VERDICT_REGEX="${VERDICT_REGEX:-^VERDICT: (PASS|FAIL|BLOCKED)}"
 BUILDER_PROMPT="${BATCH_BUILDER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_builder.md}"
 REVIEWER_PROMPT="${BATCH_REVIEWER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_reviewer.md}"
 DRY_RUN="${RALPH_DRY_RUN:-}"
@@ -400,7 +400,7 @@ run_reviewer_attempt() {  # <prompt_file> <out_file>
     else
       set +e; run_backend "$REVIEWER_CMD" "$prompt" "$out"; rc=$?; set -e
     fi
-    v="$(grep -E "$VERDICT_REGEX" "$out" 2>/dev/null | tail -n1 | grep -oE 'PASS|FAIL' | tail -n1 || true)"
+    v="$(grep -E "$VERDICT_REGEX" "$out" 2>/dev/null | tail -n1 | grep -oE 'PASS|FAIL|BLOCKED' | tail -n1 || true)"
     if [[ "$rc" -eq 0 && -n "$v" ]]; then
       VERDICT="$v"; REVIEWER_OUTCOME="$v"; return 0
     fi
@@ -517,7 +517,7 @@ CONTEXT_FILE="$RUN_DIR/batch-context.md"
   echo ""
 } > "$CONTEXT_FILE"
 
-ATTEMPTED=0; COMPLETED=0; FAILED=0; SKIPPED=0
+ATTEMPTED=0; COMPLETED=0; FAILED=0; SKIPPED=0; BLOCKED_COUNT=0
 STOPPED_EARLY="false"
 AGENT_ERROR_ROLE=""        # "builder" | "reviewer" when an unrecoverable ERROR halts the batch
 AGENT_ERROR_EXIT=""
@@ -622,6 +622,14 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     fi
     echo "    verdict: $VERDICT (check=$CHECK_STATUS)"
 
+    # BLOCKED: the reviewer judges the task unfixable within its scope (contradictory/
+    # impossible acceptance, needs access or a product decision, or an architectural
+    # change well beyond this task). Terminal — stop retrying and escalate to a human.
+    # The partial work + the reviewer's blocker report are committed for the human.
+    if [[ "$VERDICT" == "BLOCKED" ]]; then
+      TASK_STATUS="BLOCKED"
+      break
+    fi
     if [[ "$VERDICT" == "PASS" && "$CHECK_STATUS" -eq 0 ]]; then
       TASK_STATUS="PASS"
       break
@@ -639,6 +647,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   fi
 
   if [[ "$TASK_STATUS" == "PASS" ]]; then COMPLETED=$((COMPLETED + 1))
+  elif [[ "$TASK_STATUS" == "BLOCKED" ]]; then BLOCKED_COUNT=$((BLOCKED_COUNT + 1))
   else FAILED=$((FAILED + 1)); fi
   echo "Task $IDX result: $TASK_STATUS after $ITERS_USED/$MAX_ITERATIONS attempt(s)"
 
@@ -681,8 +690,8 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     echo ""
   } >> "$CONTEXT_FILE"
 
-  if [[ "$TASK_STATUS" == "FAIL" && "$STOP_ON_FAIL" == "true" ]]; then
-    echo "Task $IDX failed and --stop-on-fail is set. Stopping batch."
+  if [[ ( "$TASK_STATUS" == "FAIL" || "$TASK_STATUS" == "BLOCKED" ) && "$STOP_ON_FAIL" == "true" ]]; then
+    echo "Task $IDX ended $TASK_STATUS and --stop-on-fail is set. Stopping batch."
     STOPPED_EARLY="true"
     break
   fi
@@ -730,6 +739,10 @@ elif [[ "$FAILED" -gt 0 ]]; then
   OUTCOME="COMPLETED_WITH_FAILURES"
 elif [[ "$PREVIEW_RAN" == "true" && ( "$PREVIEW_UP_OK" != "true" || "$E2E_OK" == "false" ) ]]; then
   OUTCOME="COMPLETED_WITH_FAILURES"
+elif [[ "$BLOCKED_COUNT" -gt 0 ]]; then
+  # No hard failures, but the reviewer flagged one or more tasks as structurally
+  # blocked — its own terminal state that needs a human decision, not a rerun.
+  OUTCOME="COMPLETED_WITH_BLOCKERS"
 else
   OUTCOME="READY_FOR_HUMAN_REVIEW"
 fi
@@ -746,7 +759,7 @@ REPORT="$RUN_DIR/final-report.md"
   echo "- Builder: $BUILDER  |  Reviewer: $REVIEWER (read-only)"
   echo "- Auto-approve builder: $AUTO_APPROVE_BUILDER  |  Stop-on-fail: $STOP_ON_FAIL"
   echo "- Check command: $CHECK_CMD"
-  echo "- Tasks attempted: $ATTEMPTED of $TASK_TOTAL (completed: $COMPLETED, failed: $FAILED, skipped-on-resume: $SKIPPED)"
+  echo "- Tasks attempted: $ATTEMPTED of $TASK_TOTAL (completed: $COMPLETED, failed: $FAILED, blocked: $BLOCKED_COUNT, skipped-on-resume: $SKIPPED)"
   if [[ "$PREVIEW_RAN" == "true" ]]; then
     echo "- Preview: ${PREVIEW_UP_OK:+up=$PREVIEW_UP_OK }${E2E_OK:+e2e=$E2E_OK }URL=$RALPH_PREVIEW_URL"
   elif [[ -n "$AGENT_ERROR_ROLE" ]]; then
@@ -799,7 +812,10 @@ REPORT="$RUN_DIR/final-report.md"
     rf="$RUN_DIR/task-$IDX-result.md"
     [[ -f "$rf" ]] || continue
     if grep -q '^- Result: FAIL' "$rf"; then
-      echo "- Task $IDX ($TITLE): see $RUN_DIR/task-$IDX-reviewer.md and task-$IDX-check.log"
+      echo "- [FAIL] Task $IDX ($TITLE): see $RUN_DIR/task-$IDX-reviewer.md and task-$IDX-check.log"
+      blockers=$((blockers + 1))
+    elif grep -q '^- Result: BLOCKED' "$rf"; then
+      echo "- [BLOCKED — needs human] Task $IDX ($TITLE): the reviewer judged it unfixable in scope. Read its blocker report in $RUN_DIR/task-$IDX-reviewer.md (and the builder handoff task-$IDX-handoff.md), decide/unblock, then \`--resume\`."
       blockers=$((blockers + 1))
     fi
   done < "$MANIFEST"
@@ -838,7 +854,7 @@ write_last_run "$OUTCOME"
 echo ""
 echo "═══════════════════════════════════════════════════════"
 echo "  Batch $OUTCOME"
-echo "  attempted=$ATTEMPTED completed=$COMPLETED failed=$FAILED skipped-on-resume=$SKIPPED"
+echo "  attempted=$ATTEMPTED completed=$COMPLETED failed=$FAILED blocked=$BLOCKED_COUNT skipped-on-resume=$SKIPPED"
 echo "───────────────────────────────────────────────────────"
 echo "  Branch:    $BRANCH (NOT merged)"
 echo "  Worktree:  $WORKDIR"
@@ -855,6 +871,11 @@ if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" == "true" ]]; then
   echo "  Preview:   $RALPH_PREVIEW_URL  (running — open it to review the whole batch)"
 elif [[ "$PREVIEW_RAN" == "true" ]]; then
   echo "  Preview:   FAILED to start — see $RUN_DIR/preview-up.log"
+fi
+if [[ "$BLOCKED_COUNT" -gt 0 ]]; then
+  echo "  ⚠ $BLOCKED_COUNT task(s) BLOCKED (need a human decision) — see 'Failures / blockers' in the report."
+  echo "    After you unblock them, resume to retry only the unfinished tasks:"
+  echo "    ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
 fi
 echo "  Integrate (after review): ralph integrate --repo \"$TARGET_REPO\""
 echo "  Cleanup:   ralph cleanup --repo \"$TARGET_REPO\""

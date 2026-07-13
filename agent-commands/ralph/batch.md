@@ -38,9 +38,9 @@ Steps:
 4. When it finishes, read the final report at
    `<target>/.agent-run/batch-<timestamp>/final-report.md` (and `<target>/.ralph/last-run.env`)
    and summarize for the human:
-   - outcome (READY_FOR_HUMAN_REVIEW / COMPLETED_WITH_FAILURES / STOPPED_ON_FAIL /
-     REVIEWER_UNAVAILABLE / BUILDER_UNAVAILABLE)
-   - tasks attempted / completed / failed
+   - outcome (READY_FOR_HUMAN_REVIEW / COMPLETED_WITH_FAILURES / COMPLETED_WITH_BLOCKERS /
+     STOPPED_ON_FAIL / REVIEWER_UNAVAILABLE / BUILDER_UNAVAILABLE)
+   - tasks attempted / completed / failed / blocked
    - per-task verdicts and files changed
    - any failures/blockers and where their logs are
    - the branch + worktree path
@@ -50,6 +50,13 @@ Steps:
      failed PRD. Tell the human to re-authenticate / check quota for that CLI, then
      resume with `/ralph-resume` (skips already-PASSed tasks). No builder attempt
      was consumed and no error text was fed back as feedback.
+   - **If the outcome is `COMPLETED_WITH_BLOCKERS`** (exit 2): the reviewer judged
+     one or more tasks BLOCKED — well-defined but not completable in scope
+     (contradictory/impossible acceptance, needs access or a product decision, or an
+     out-of-scope architectural change). This is NOT a code failure and NOT a tooling
+     outage. Relay each blocked task's blocker report (what must a human decide/provide)
+     from `task-<n>-reviewer.md`; once the human unblocks it, resume to retry only the
+     unfinished tasks.
 5. Then **ask the human** to review the branch. Only after they approve, integrate
    with `/ralph-integrate` (or `ralph integrate --repo <path>`), then offer
    `/ralph-cleanup`.
