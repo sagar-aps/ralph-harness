@@ -303,6 +303,39 @@ git -C /path/to/target worktree remove <worktree path>
 - A `PASS` requires a passing check command, passing preview/e2e (if enabled),
   **and** a `VERDICT: PASS`; a missing/garbled verdict line is treated as `FAIL`.
 
+### Common pitfalls (target setup)
+
+One-time target-setup gotchas hit when driving real repos through the batch loop.
+
+1. **Commit the `init-target` scaffolding to the target's `main` before the first
+   run.** `ralph init-target` writes the `.gitignore` entries (`.ralph/`,
+   `.agent-run/`, `.agent-handoff.md`, `.agents/ralph/config.local.sh`),
+   `ralph.target.json`, and `scripts/check.sh` to the *working tree* — it does not
+   commit them. Batch worktrees branch off the target's **committed** `main`, so if
+   these aren't committed the worktree's `.gitignore` lacks the artifact entries and
+   the builder's `git add -A` stages the harness artifacts (`.agent-handoff.md`,
+   `.agent-run/`) into the task diff. Commit them with a one-line chore PR first.
+
+2. **`CHECK_CMD` / `VERIFY_CMD` must be a single command or a script path.** The loop
+   runs them via `eval "$CMD"`. An inline shell **brace-group `{ ...; }`** or
+   command substitution `$(...)` in that string is truncated at the `}`, leaving an
+   unterminated group → `syntax error: unexpected end of file` on *every* attempt —
+   a vacuous, code-independent failure that retries until `MAX_ITERATIONS` even when
+   the work is correct and the reviewer voted `VERDICT: PASS`. Put complex check
+   logic in a script and point the variable at its path (e.g.
+   `CHECK_CMD=/path/to/my-check.sh`). Keep acceptance (`VERIFY_CMD`) simple too
+   (`! grep ...`, `npm test -- foo`) or route it through a script. (Same `}` caveat
+   as the `{prompt}` note in `agents.sh`.)
+
+3. **Worktrees lack gitignored deps; don't paper over it with a symlink.** A worktree
+   is a fresh `git worktree add`, so gitignored dirs (`node_modules/`, `venv/`,
+   `target/`) are absent. If your check needs them, **copy** them into the worktree
+   (e.g. `cp -a "$MAIN/node_modules" node_modules`, or `cp -al` for a fast hardlink
+   copy when the check only reads). Do **not** `ln -s`: a symlink named
+   `node_modules` is *not* matched by a `node_modules/` (dir-only) gitignore pattern,
+   so `git add -A` stages the symlink — an absolute, machine-specific path — into the
+   diff. A real directory is matched and ignored.
+
 ### Scaffold a target repo (`ralph init-target`)
 
 ```bash
@@ -311,7 +344,8 @@ ralph init-target --repo /path/to/target --type nextjs-postgres
 ```
 
 Creates `.agents/tasks/`, a `ralph.target.json` config, `scripts/check.sh`, adds
-`.ralph/` + `.agent-handoff.md` to `.gitignore`, and (for `nextjs-postgres`) adds
+`.ralph/`, `.agent-run/`, `.agent-handoff.md`, and `.agents/ralph/config.local.sh`
+to `.gitignore`, and (for `nextjs-postgres`) adds
 executable `scripts/preview-up.sh`, `preview-down.sh`, `preview-url.sh`, `e2e.sh`
 templates. Existing files are not overwritten unless you pass `--force`.
 
