@@ -1,6 +1,6 @@
 // Smoke tests for `ralph batch` (sequential multi-task, one shared worktree).
 // Uses RALPH_DRY_RUN=1 so no real agents run; the check command still runs.
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -424,6 +424,77 @@ console.log("12) resume skips already-PASSed tasks after a halt");
     check(/READY_FOR_HUMAN_REVIEW/.test(out), "resume reaches READY_FOR_HUMAN_REVIEW");
     const t2 = readFileSync(path.join(batchRunDir(target), "task-002-result.md"), "utf-8");
     check(/- Result: PASS/.test(t2), "task 2 now PASSes on resume");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("13) interrupt (SIGINT) mid-task leaves a resumable pointer");
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    // Builder commits task 1 quickly, then HANGS on task 2 so we can interrupt mid-run.
+    const FB_HANG =
+      `bash -c 'echo x >> progress.txt; printf "# h\\n" > .agent-handoff.md; if [ "$R_TASK_NUM" = "002" ]; then sleep 60; fi'`;
+    const env = {
+      ...process.env,
+      RALPH_SKIP_UPDATE_CHECK: "1",
+      RALPH_AGENT_RETRY_DELAY: "0",
+      RALPH_WORKTREE_DIR: wtBase(target),
+      AGENT_FBH_CMD: FB_HANG,
+      AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""',
+    };
+    // detached:true => new process group, so a group SIGINT hits the shell + agent
+    // (emulating a terminal Ctrl-C), letting batch-loop's trap fire.
+    const child = spawn(
+      process.execPath,
+      [cliPath, "batch", "--repo", target, "--plan", plan, "--builder", "fbh", "--reviewer", "okrev", "--auto-approve-builder"],
+      { env, stdio: "ignore", detached: true },
+    );
+    const runsRoot = path.join(target, ".agent-run");
+    let runDir = null;
+    for (let waited = 0; waited < 40000 && runDir === null; waited += 200) {
+      if (existsSync(runsRoot)) {
+        const dirs = readdirSync(runsRoot).filter((x) => x.startsWith("batch-")).sort();
+        if (dirs.length) {
+          const rd = path.join(runsRoot, dirs[dirs.length - 1]);
+          // task 1 committed (result file) AND task 2 builder has started (hanging)
+          if (existsSync(path.join(rd, "task-001-result.md")) && existsSync(path.join(rd, "task-002-iter-1-builder.log"))) {
+            runDir = rd;
+          }
+        }
+      }
+      if (runDir === null) await sleep(200);
+    }
+    check(runDir !== null, "task 1 committed and task 2 builder running before interrupt");
+    try {
+      process.kill(-child.pid, "SIGINT"); // signal the whole group (like Ctrl-C)
+    } catch {
+      child.kill("SIGINT");
+    }
+    await new Promise((res) => child.on("exit", res));
+    // Give batch-loop's trap a moment to write INTERRUPTED.
+    for (let w = 0; w < 3000; w += 150) {
+      const lr = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+      if (/STATUS=INTERRUPTED/.test(lr)) break;
+      await sleep(150);
+    }
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/STATUS=(INTERRUPTED|RUNNING)/.test(lastRun), "interrupt left a resumable pointer (INTERRUPTED/RUNNING, not stale)");
+    check(/^BRANCH=ralph\/batch-/m.test(lastRun), "pointer records the batch branch");
+    check(/^WORKTREE=.+/m.test(lastRun), "pointer records the worktree");
+
+    // Resume with a non-hanging builder; task 1 must be skipped.
+    const r2 = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev", "--auto-approve-builder", "--resume"],
+      { RALPH_AGENT_RETRY_DELAY: "0", RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB, AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out2 = `${r2.stdout}${r2.stderr}`;
+    check(r2.status === 0, "resume after interrupt completes (exit 0)");
+    check(/already complete \(resume\), skipping/.test(out2), "task 1 skipped on resume after interrupt");
+    check(/READY_FOR_HUMAN_REVIEW/.test(out2), "resume reaches READY_FOR_HUMAN_REVIEW");
   } finally {
     cleanup(target);
   }

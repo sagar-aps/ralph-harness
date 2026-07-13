@@ -408,6 +408,43 @@ run_reviewer_attempt() {  # <prompt_file> <out_file>
   return 1
 }
 
+# Write the resume pointer. Called early with RUNNING (so a Ctrl-C / kill mid-run
+# is still resumable), on interrupt with INTERRUPTED, and at the end with the
+# final OUTCOME. `ralph status/integrate/cleanup/--resume` all read this file.
+write_last_run() {
+  local status="$1"
+  mkdir -p "$TARGET_REPO/.ralph"
+  {
+    echo "RUN_ID=batch-$TS"
+    echo "STATUS=$status"
+    echo "BRANCH=$BRANCH"
+    echo "WORKTREE=$WORKDIR"
+    echo "BASE_COMMIT=$BASE_REF"
+    if [[ "${PREVIEW_RAN:-false}" == "true" && "${PREVIEW_UP_OK:-}" == "true" ]]; then
+      echo "PREVIEW_URL=$RALPH_PREVIEW_URL"
+    else
+      echo "PREVIEW_URL="
+    fi
+    echo "ARTIFACTS_DIR=$RUN_DIR"
+    echo "TARGET_REPO=$TARGET_REPO"
+    echo "RALPH_COMPOSE_PROJECT=${RALPH_COMPOSE_PROJECT:-}"
+    echo "RALPH_APP_PORT=${RALPH_APP_PORT:-}"
+    echo "RALPH_DB_PORT=${RALPH_DB_PORT:-}"
+    echo "USE_WORKTREE=true"
+  } > "$TARGET_REPO/.ralph/last-run.env"
+}
+
+# On Ctrl-C / kill, leave a valid resume pointer + hint (work so far is committed).
+on_interrupt() {
+  trap - INT TERM
+  write_last_run "INTERRUPTED"
+  echo ""
+  echo "Batch INTERRUPTED (signal). Completed tasks are committed on $BRANCH."
+  echo "Resume (skips already-PASSed tasks):"
+  echo "  ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
+  exit 130
+}
+
 # ---- Config snapshot + banner ----------------------------------------------
 {
   echo "RUN_ID=batch-$TS"
@@ -481,6 +518,11 @@ STOPPED_EARLY="false"
 AGENT_ERROR_ROLE=""        # "builder" | "reviewer" when an unrecoverable ERROR halts the batch
 AGENT_ERROR_EXIT=""
 HALTED_TASK=""
+
+# Resume pointer is valid from the first task onward, and a signal leaves it
+# INTERRUPTED (not stale) so `--resume` works even if you stop the run on purpose.
+write_last_run "RUNNING"
+trap on_interrupt INT TERM
 
 # ---- Sequential task loop ---------------------------------------------------
 # Read the manifest on a dedicated fd (3) so stdin-reading backends (e.g.
@@ -785,26 +827,9 @@ REPORT="$RUN_DIR/final-report.md"
   echo "Nothing was merged, pushed, or deleted. The branch and worktree are intact."
 } > "$REPORT"
 
-# Make `ralph status / integrate / cleanup` work on the batch branch too.
-mkdir -p "$TARGET_REPO/.ralph"
-{
-  echo "RUN_ID=batch-$TS"
-  echo "STATUS=$OUTCOME"
-  echo "BRANCH=$BRANCH"
-  echo "WORKTREE=$WORKDIR"
-  echo "BASE_COMMIT=$BASE_REF"
-  if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" == "true" ]]; then
-    echo "PREVIEW_URL=$RALPH_PREVIEW_URL"
-  else
-    echo "PREVIEW_URL="
-  fi
-  echo "ARTIFACTS_DIR=$RUN_DIR"
-  echo "TARGET_REPO=$TARGET_REPO"
-  echo "RALPH_COMPOSE_PROJECT=$RALPH_COMPOSE_PROJECT"
-  echo "RALPH_APP_PORT=$RALPH_APP_PORT"
-  echo "RALPH_DB_PORT=$RALPH_DB_PORT"
-  echo "USE_WORKTREE=true"
-} > "$TARGET_REPO/.ralph/last-run.env"
+# Final resume/status pointer (also read by status / integrate / cleanup).
+trap - INT TERM
+write_last_run "$OUTCOME"
 
 echo ""
 echo "═══════════════════════════════════════════════════════"
