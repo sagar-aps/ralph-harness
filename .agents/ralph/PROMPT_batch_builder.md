@@ -46,6 +46,9 @@ failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
 - Build on the existing state from earlier tasks — read before editing; reuse what
   is already there rather than duplicating it.
 - No placeholders or stubs; implement completely.
+- If this task removes or renames a symbol, module, file, or config key, grep the whole
+  repo for remaining references and resolve or justify each before finishing — a
+  "removal" is not done while dangling references remain (in code, docs, skills, or config).
 - If the project has `{{AGENTS_PATH}}` / CLAUDE.md, follow its build/test instructions.
 - Run the check command (`{{CHECK_CMD}}`) yourself and fix what it reports.
 - Do NOT weaken, skip, or delete tests to make checks pass. You may update tests only
@@ -69,6 +72,11 @@ failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
 
 ## Files touched
 - ...
+
+## Verification — confirmed locally vs. needs CI/deploy
+- What the local check proved: ...
+- What can only be confirmed in CI/deploy after merge, and why: ...
+- Root-cause mechanism for anything not locally verifiable: ...
 
 ## Important facts discovered (for later tasks)
 - ...
