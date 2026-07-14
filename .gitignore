@@ -25,3 +25,12 @@ pnpm-debug.log*
 # Coverage / build
 coverage/
 dist/
+
+# Local task-plan inputs for the Memorix loop (not the harness)
+.plans-memorix/
+
+# Staged task plans waiting on a dependency
+.plans-staging/
+
+# Per-issue plan dirs (parallel runs)
+.plans-*/
