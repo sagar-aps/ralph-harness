@@ -33,7 +33,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/review-config.sh"; }
 # Untracked local overrides (gitignored) — sourced LAST so they win. Copy
 # config.local.sh.example to config.local.sh to define/override backends & roles.
-[[ -f "$SCRIPT_DIR/config.local.sh" ]] && { # shellcheck source=/dev/null
+# RALPH_NO_LOCAL_CONFIG=1 skips it — used by the test suite so a developer's machine
+# config (e.g. a repo-specific CHECK_CMD) can't leak into hermetic test runs.
+[[ "${RALPH_NO_LOCAL_CONFIG:-}" != "1" && -f "$SCRIPT_DIR/config.local.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/config.local.sh"; }
 
 die() { echo "ralph: $*" >&2; exit 1; }
@@ -105,6 +107,15 @@ VERDICT_REGEX="${VERDICT_REGEX:-^VERDICT: (PASS|FAIL|BLOCKED)}"
 BUILDER_PROMPT="${BATCH_BUILDER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_builder.md}"
 REVIEWER_PROMPT="${BATCH_REVIEWER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_reviewer.md}"
 DRY_RUN="${RALPH_DRY_RUN:-}"
+
+# Managed mode: when a Manager role gates this repo, append the managed-builder
+# addendum to the builder prompt (arbitrate via Manager, label-mechanical task
+# selection, emergent-finding comments, identity floor). Default OFF — when off the
+# builder prompt is left untouched and its rendered output is byte-identical to today.
+# See docs/agent-operator.md and .agents/ralph/PROMPT_managed_addendum.md.
+MANAGED_MODE="${MANAGED_MODE:-false}"
+case "$MANAGED_MODE" in 1|true|TRUE|yes|on|ON) MANAGED_MODE=true ;; *) MANAGED_MODE=false ;; esac
+MANAGED_ADDENDUM_FILE="${MANAGED_ADDENDUM_FILE:-$SCRIPT_DIR/PROMPT_managed_addendum.md}"
 
 # Optional end-of-batch website preview (brought up ONCE after all tasks, so the
 # human can review the whole batch via a URL — same scripts as `ralph review`).
@@ -196,6 +207,15 @@ if [[ "$RESUMING" != "true" ]]; then
   RUN_DIR="$TARGET_REPO/.agent-run/batch-$TS"
   TASKS_DIR="$RUN_DIR/tasks"
   mkdir -p "$TASKS_DIR"
+fi
+
+# Build the effective builder prompt once. Managed mode appends the addendum; when
+# off, BUILDER_PROMPT is left untouched so the rendered prompt stays byte-identical.
+if [[ "$MANAGED_MODE" == "true" ]]; then
+  [[ -f "$MANAGED_ADDENDUM_FILE" ]] || die "MANAGED_MODE is on but addendum not found: $MANAGED_ADDENDUM_FILE"
+  EFFECTIVE_BUILDER_PROMPT="$RUN_DIR/builder-prompt-managed.md"
+  { cat "$BUILDER_PROMPT"; printf '\n'; cat "$MANAGED_ADDENDUM_FILE"; } > "$EFFECTIVE_BUILDER_PROMPT"
+  BUILDER_PROMPT="$EFFECTIVE_BUILDER_PROMPT"
 fi
 
 # ---- Preflight (repo contract) — block before any worktree/agent ------------
@@ -510,6 +530,7 @@ echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
 echo "  check:         $CHECK_CMD"
 echo "  verify:        ${VERIFY_CMD:-(none)}"
 echo "  primer:        ${PRIMER_FILE:-(none)}"
+echo "  managed mode:  $MANAGED_MODE${MANAGED_MODE:+}$([[ "$MANAGED_MODE" == "true" ]] && echo "  (addendum: $MANAGED_ADDENDUM_FILE)")"
 echo "  max attempts/task: $MAX_ITERATIONS   agent-error retries: $AGENT_RETRIES   resume: $RESUMING"
 echo "  auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
 echo "  preview:       $PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  (url after batch: $RALPH_PREVIEW_URL)}"
@@ -793,6 +814,7 @@ REPORT="$RUN_DIR/final-report.md"
   echo "- Base commit: $BASE_REF"
   echo "- Plan: $PLAN"
   echo "- Builder: $BUILDER  |  Reviewer: $REVIEWER (read-only)"
+  echo "- Managed mode: $MANAGED_MODE"
   echo "- Auto-approve builder: $AUTO_APPROVE_BUILDER  |  Stop-on-fail: $STOP_ON_FAIL"
   echo "- Check command: $CHECK_CMD"
   echo "- Tasks attempted: $ATTEMPTED of $TASK_TOTAL (completed: $COMPLETED, failed: $FAILED, blocked: $BLOCKED_COUNT, skipped-on-resume: $SKIPPED)"

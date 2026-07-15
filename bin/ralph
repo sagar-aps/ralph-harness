@@ -44,6 +44,8 @@ const review = {
   cleanup: false,
   skipCleanup: false,
   deleteBranch: false,
+  pr: false,
+  merged: false,
   // batch mode
   plan: null,
   maxTasks: null,
@@ -255,6 +257,50 @@ function doCleanup(repo, runId, meta, deleteBranch, force) {
   return 0;
 }
 
+// --- PR-integration helpers (used by `integrate --pr` and `cleanup --merged`) ---
+function ghAvailable() {
+  return spawnSync("gh", ["--version"], { encoding: "utf-8" }).status === 0;
+}
+
+// The remote's default branch (PR base), e.g. "main". Falls back sensibly.
+function defaultBranch(repo) {
+  const r = git(repo, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+  if (r.status === 0 && r.stdout.trim()) return r.stdout.trim().replace(/^origin\//, "");
+  for (const b of ["main", "master"]) {
+    if (git(repo, ["rev-parse", "--verify", `refs/remotes/origin/${b}`]).status === 0) return b;
+  }
+  return "main";
+}
+
+// Issue numbers to auto-close, inferred from a `fix/<N>-slug` branch name.
+function issueRefsFromBranch(branch) {
+  const m = String(branch).match(/\/(\d{1,6})[-_]/);
+  return m ? [m[1]] : [];
+}
+
+// A readable PR title derived from the run's story title or the branch name.
+function prTitle(meta, branch) {
+  if (meta.STORY_TITLE) return meta.STORY_TITLE;
+  const m = String(branch).match(/^([^/]+)\/(\d+)[-_](.+)$/);
+  if (m) return `${m[1]}(#${m[2]}): ${m[3].replace(/[-_]/g, " ")}`;
+  return `ralph: ${branch}`;
+}
+
+// The existing PR (any state) for a head branch, or null.
+function prForBranch(repo, branch) {
+  const r = spawnSync(
+    "gh",
+    ["pr", "list", "--head", branch, "--state", "all", "--json", "url,state", "-q", ".[0]"],
+    { cwd: repo, encoding: "utf-8" },
+  );
+  if (r.status !== 0 || !r.stdout.trim()) return null;
+  try {
+    return JSON.parse(r.stdout.trim());
+  } catch {
+    return null;
+  }
+}
+
 function readPackageMeta() {
   try {
     const pkgPath = path.join(repoRoot, "package.json");
@@ -309,8 +355,11 @@ Commands:
   preflight --repo <path>             Run the repo-contract preflight only
   status --repo <path>                Show the latest run's status
   integrate --repo <path> [--run]     Merge an approved run, re-check, then auto-cleanup
+                                      (or --pr: push branch + open a PR instead of merging main)
   cleanup --repo <path> [--run]       Remove a run's worktree / stop its preview
-  init-target --repo <path> [--type]  Scaffold a target repo (generic|nextjs-postgres)
+                                      (or --merged: sweep every worktree whose PR is merged)
+  init-target --repo <path> [--type]  Scaffold a target repo (generic|nextjs-postgres);
+                                      also installs the Manager skill (.claude/skills/manager/)
   install-agent-commands [--agent X]  Install operator commands (claude|codex|copilot)
   overview                            Render a human overview from PRD JSON
   help                                Show this message
@@ -338,8 +387,11 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
   --keep-preview-on-fail              Leave the preview running after a failed run
   --run latest|<run-id>               Select a run for status/integrate/cleanup
   --force                             integrate non-ready / overwrite on install / force cleanup
-  --delete-branch                     also delete the run branch (cleanup/integrate)
+  --delete-branch                     also delete the run branch (cleanup/integrate/--merged)
   --keep-worktree | --skip-cleanup    integrate: don't auto-clean up afterwards
+  --pr                                integrate via pull request: push branch + gh pr create
+                                      (keeps the branch, removes the worktree; needs gh)
+  --merged                            cleanup: remove every worktree whose PR is already merged (needs gh)
   --type generic|nextjs-postgres      init-target scaffold type
 
 Batch options (ralph batch):
@@ -521,6 +573,14 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--delete-branch") {
     review.deleteBranch = true;
+    continue;
+  }
+  if (arg === "--pr") {
+    review.pr = true;
+    continue;
+  }
+  if (arg === "--merged") {
+    review.merged = true;
     continue;
   }
   if (arg === "--auto-approve-builder") {
@@ -978,12 +1038,46 @@ async function main() {
       created.push("ralph.target.json");
     }
 
+    // Manager role skill (repo-agnostic; enables manager mode). Installs the portable
+    // charter template and the canonical label protocol into the target's Claude skills
+    // dir, so an owner can type `/manager` in a fresh session and the role reconstructs
+    // itself. The charter is NEVER overwritten once present (the Manager fills in its
+    // Project facts on first run and edits it in place) unless --force is given.
+    const mgrSkillDir = path.join(repo, ".claude", "skills", "manager");
+    const mgrSkillSrc = path.join(templateDir, "target-templates", "manager-SKILL.md");
+    if (exists(mgrSkillSrc)) {
+      fs.mkdirSync(mgrSkillDir, { recursive: true });
+      const mgrSkillDst = path.join(mgrSkillDir, "SKILL.md");
+      if (exists(mgrSkillDst) && !installForce) {
+        skipped.push(".claude/skills/manager/SKILL.md");
+      } else {
+        fs.copyFileSync(mgrSkillSrc, mgrSkillDst);
+        created.push(".claude/skills/manager/SKILL.md");
+      }
+      // Canonical label protocol, co-installed so the skill is self-contained.
+      const labelsSrc = path.join(templateDir, "references", "LABELS.md");
+      const labelsDst = path.join(mgrSkillDir, "LABELS.md");
+      if (exists(labelsSrc)) {
+        if (exists(labelsDst) && !installForce) {
+          skipped.push(".claude/skills/manager/LABELS.md");
+        } else {
+          fs.copyFileSync(labelsSrc, labelsDst);
+          created.push(".claude/skills/manager/LABELS.md");
+        }
+      }
+    }
+
     console.log(`Initialized target (${type}): ${repo}`);
     if (created.length) console.log(`Created: ${created.join(", ")}`);
     if (updated.length) console.log(`Updated: ${updated.join(", ")}`);
     if (skipped.length) console.log(`Skipped (exist; use --force): ${skipped.join(", ")}`);
     console.log(
       `\nNext: add a PRD JSON under .agents/tasks/, edit scripts/, then run:\n  ralph review 1 --repo ${repo}`,
+    );
+    console.log(
+      `\nManager mode: open a Claude session in the target repo and type \`/manager\` to boot the\n` +
+        `verification role (it fills .claude/skills/manager/SKILL.md "Project facts" on first run).\n` +
+        `To run the builder under a Manager, set MANAGED_MODE=1 (see docs/agent-operator.md).`,
     );
     process.exit(0);
   }
@@ -1049,6 +1143,68 @@ async function main() {
       console.error("No branch recorded for this run.");
       process.exit(1);
     }
+
+    // --- PR-based integration (for repos that gate main behind pull requests) ---
+    // Push the branch and open a PR instead of merging into local main. The branch
+    // lives on origin afterwards, so the worktree is removed here (branch kept for
+    // the PR). Never touches the local main branch.
+    if (review.pr) {
+      if (!ghAvailable()) {
+        console.error("`--pr` needs the GitHub CLI. Install `gh` and run `gh auth login`, or integrate without --pr.");
+        process.exit(1);
+      }
+      const originUrl = git(repo, ["remote", "get-url", "origin"]).stdout.trim();
+      if (!originUrl) {
+        console.error("No `origin` remote in the target repo; cannot open a PR.");
+        process.exit(1);
+      }
+      const base = defaultBranch(repo);
+      if (branch === base) {
+        console.error(`Run branch is the base branch (${base}); nothing to PR.`);
+        process.exit(1);
+      }
+      console.log(`Opening PR for run ${runId}`);
+      console.log(`- Head branch: ${branch}`);
+      console.log(`- Base branch: ${base}`);
+
+      const existing = prForBranch(repo, branch);
+      if (existing && existing.url) {
+        console.log(`\nA PR already exists for ${branch}: ${existing.url} (${existing.state}). Skipping create.`);
+      } else {
+        const push = git(repo, ["push", "-u", "origin", branch], { stdio: "inherit", encoding: undefined });
+        if (push.status !== 0) {
+          console.error("git push failed; nothing was opened.");
+          process.exit(push.status ?? 1);
+        }
+        const issues = issueRefsFromBranch(branch);
+        const bodyLines = [`Automated ralph run \`${runId}\` on branch \`${branch}\`.`, ""];
+        if (issues.length) bodyLines.push(...issues.map((n) => `Fixes #${n}`), "");
+        bodyLines.push(
+          `Builder: ${meta.BUILDER || "?"} · Reviewer: ${meta.REVIEWER || "?"} (read-only).`,
+          "Reviewed in-loop (READY_FOR_HUMAN_REVIEW); NOT merged — human review required.",
+        );
+        const create = spawnSync(
+          "gh",
+          ["pr", "create", "--base", base, "--head", branch, "--title", prTitle(meta, branch), "--body", bodyLines.join("\n")],
+          { cwd: repo, stdio: "inherit" },
+        );
+        if (create.status !== 0) {
+          console.error("`gh pr create` failed; the branch is pushed — open the PR manually.");
+          process.exit(create.status ?? 1);
+        }
+      }
+
+      // Worktree cleanup at PR-open time (branch kept for the PR). Opt out with
+      // --keep-worktree / --skip-cleanup.
+      if (review.skipCleanup) {
+        console.log(`\nCleanup skipped (--keep-worktree). Remove later:\n  ralph cleanup --repo ${repo} --run ${runId}`);
+      } else {
+        console.log("\nRemoving the run's worktree (branch kept for the PR):");
+        doCleanup(repo, runId, meta, false, installForce);
+      }
+      process.exit(0);
+    }
+
     const dirty = git(repo, ["status", "--porcelain"])
       .stdout.split("\n")
       .filter((l) => l && !/\.ralph\//.test(l));
@@ -1126,6 +1282,71 @@ async function main() {
       process.exit(1);
     }
     const repo = path.resolve(cwd, targetRepo);
+
+    // --- Sweep mode: remove every worktree whose branch's PR is already MERGED ---
+    // The PR-state-aware janitor for repos integrated via pull request, where the
+    // per-run integrate cleanup never fires. Idempotent; skips dirty/unmerged.
+    if (review.merged) {
+      if (!ghAvailable()) {
+        console.error("`--merged` needs the GitHub CLI (gh) to check PR state.");
+        process.exit(1);
+      }
+      const mainRepo = path.resolve(repo);
+      const listing = git(repo, ["worktree", "list", "--porcelain"]).stdout;
+      const entries = [];
+      let cur = {};
+      for (const line of listing.split("\n")) {
+        if (line.startsWith("worktree ")) cur = { path: line.slice(9) };
+        else if (line.startsWith("branch ")) cur.branch = line.slice(7).replace(/^refs\/heads\//, "");
+        else if (line === "" && cur.path) {
+          entries.push(cur);
+          cur = {};
+        }
+      }
+      if (cur.path) entries.push(cur);
+      console.log(`Merged-worktree sweep (${repo}):`);
+      let removed = 0;
+      let kept = 0;
+      for (const e of entries) {
+        if (path.resolve(e.path) === mainRepo) continue; // never the primary checkout
+        if (!e.branch) {
+          console.log(`  • SKIP ${e.path} (detached HEAD)`);
+          kept += 1;
+          continue;
+        }
+        const pr = prForBranch(repo, e.branch);
+        if (!pr || pr.state !== "MERGED") {
+          console.log(`  • SKIP ${e.branch} (PR ${pr ? pr.state : "none"})`);
+          kept += 1;
+          continue;
+        }
+        const wtDirty = git(e.path, ["status", "--porcelain"]).stdout
+          .split("\n")
+          .filter((l) => l && !/\.ralph\//.test(l) && !/\.agent-run\//.test(l) && !/\.agent-handoff\.md/.test(l));
+        if (wtDirty.length && !installForce) {
+          console.log(`  • SKIP ${e.branch} (uncommitted changes — use --force)`);
+          kept += 1;
+          continue;
+        }
+        const r = git(repo, ["worktree", "remove", "--force", e.path]);
+        if (r.status === 0) {
+          console.log(`  ✔ removed worktree ${e.branch} (PR merged)`);
+          removed += 1;
+          if (review.deleteBranch) {
+            const d = git(repo, ["branch", "-D", e.branch]);
+            if (d.status === 0) console.log(`    ✔ deleted branch ${e.branch}`);
+            else console.log(`    • could not delete branch ${e.branch}: ${(d.stderr || "").trim()}`);
+          }
+        } else {
+          console.log(`  ✖ failed to remove ${e.path}: ${(r.stderr || "").trim()}`);
+          kept += 1;
+        }
+      }
+      git(repo, ["worktree", "prune"]);
+      console.log(`\nSweep complete: removed ${removed}, kept ${kept}.`);
+      process.exit(0);
+    }
+
     const { runId, meta } = loadRunMeta(repo, review.run);
     if (!runId) {
       console.error("No run found to clean up.");

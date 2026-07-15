@@ -48,8 +48,72 @@ ralph init-target --repo /path/to/target --type nextjs-postgres   # + preview/e2
 
 This creates `.agents/tasks/`, `ralph.target.json`, `scripts/check.sh` (and the
 preview scripts for `nextjs-postgres`), and adds `.ralph/` + `.agent-handoff.md`
-to `.gitignore`. Then add a PRD JSON under `.agents/tasks/` and fill in the
-scripts.
+to `.gitignore`. It also installs the **Manager role skill** at
+`.claude/skills/manager/SKILL.md` (plus the canonical `LABELS.md`) — see
+[Manager mode](#manager-mode) below. Then add a PRD JSON under `.agents/tasks/` and
+fill in the scripts.
+
+`init-target` never overwrites an already-present manager charter (the Manager fills
+in its per-repo "Project facts" on first run and edits the file in place); pass
+`--force` only if you deliberately want to reset installed files to the templates.
+
+## Manager mode
+
+Manager mode is an optional three-party workflow layered on top of the builder loop:
+
+- **Owner** (human) — supplies intent and final authority, and the few actions agents
+  are denied (credential rotation, destructive DB ops, IAM-denied cloud calls).
+- **Manager** (an interactive Claude session on the strongest model) — the verification
+  gate: owns `## Acceptance` sections, reviews and merges every PR, deploys prod, runs a
+  periodic maintenance round, and turns owner intent into implementable issues.
+- **Builder** (this harness) — implements issues labeled `now` + `spec:ready`, one task
+  per branch/PR, and answers to the Manager instead of to a human.
+
+The two roles share one contract: the [label protocol](../.agents/ralph/references/LABELS.md)
+(the single canonical file both the Manager charter and the managed-builder addendum
+point at) and per-issue `## Acceptance` sections the Manager verifies against deployed
+reality.
+
+**Install it.** `ralph init-target` (above) drops the Manager charter into the target
+repo at `.claude/skills/manager/SKILL.md` and the label protocol at
+`.claude/skills/manager/LABELS.md`. To boot the role, open a Claude session *in the
+target repo* and type `/manager`: on first run it fills the charter's "Project facts"
+section (deploy entrypoints, environments, required CI check, secret traps, denied
+operations) and creates the protocol labels; on later runs it reconstructs state from
+GitHub alone (`gh pr list`, `gh issue list --label now`, latest CI, `git log`).
+
+**Enable the managed builder.** Managed mode is **OFF by default** — with it off, the
+builder prompts render byte-for-byte as they do today. Turn it on with `MANAGED_MODE=1`
+(env var, or set it in `.agents/ralph/config.local.sh` / `review-config.sh`). When on,
+the harness appends the [managed-builder addendum](../.agents/ralph/PROMPT_managed_addendum.md)
+to the builder prompt, adding exactly six behaviors:
+
+1. Arbitration questions go to the Manager as a PR/issue comment + a `blocked:manager`
+   label; the builder then parks that task and takes another — it never asks a human and
+   never guesses through the question.
+2. Task selection is label-mechanical: only `now` + `spec:ready`; never `spec:draft`,
+   `blocked:owner`, `blocked:manager`, or `decision-needed`; no acceptance section →
+   not eligible.
+3. It re-reads issue/PR comments (newer than the body) before starting and before every
+   push, and addresses must-fix review items explicitly.
+4. Emergent findings (wrong docs, dead code, spec-vs-reality drift) are posted as
+   structured `**Emergent finding**` comments for the Manager to triage — never opened as
+   issues or fixed en passant.
+5. Identity floor: the builder never approves/merges a PR, never pushes the default
+   branch, never deploys prod.
+6. It does not restate the base loop — those six are the only additions.
+
+```bash
+MANAGED_MODE=1 ralph batch --repo /path/to/target --plan .agents/tasks/plan.md
+MANAGED_MODE=1 ralph review 1 --repo /path/to/target
+```
+
+**Identity prerequisite.** The hard gate depends on two distinct GitHub identities — a
+Manager identity (GitHub App / machine account) and a builder identity — so the Manager
+can formally approve/merge what the builder cannot. Without them the Manager falls back
+to review-comment + squash-merge, which works and keeps the audit trail but gives no
+enforced approval gate. Set the identities up separately; nothing in manager mode
+hard-requires them.
 
 ## Preflight (repo contract)
 

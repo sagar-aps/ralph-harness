@@ -45,7 +45,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/review-config.sh"; }
 # Untracked local overrides (gitignored) — sourced LAST so they win. Copy
 # config.local.sh.example to config.local.sh to define/override backends & roles.
-[[ -f "$SCRIPT_DIR/config.local.sh" ]] && { # shellcheck source=/dev/null
+# RALPH_NO_LOCAL_CONFIG=1 skips it — used by the test suite so a developer's machine
+# config (e.g. a repo-specific CHECK_CMD) can't leak into hermetic test runs.
+[[ "${RALPH_NO_LOCAL_CONFIG:-}" != "1" && -f "$SCRIPT_DIR/config.local.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/config.local.sh"; }
 
 die() { echo "ralph: $*" >&2; exit 1; }
@@ -99,6 +101,14 @@ BUILDER_PROMPT="${BUILDER_PROMPT:-$SCRIPT_DIR/PROMPT_builder.md}"
 REVIEWER_PROMPT="${REVIEWER_PROMPT:-$SCRIPT_DIR/PROMPT_reviewer.md}"
 DRY_RUN="${RALPH_DRY_RUN:-}"
 
+# Managed mode: append the managed-builder addendum to the builder prompt (arbitrate
+# via a Manager instead of a human, label-mechanical task selection, emergent-finding
+# comments, identity floor). Default OFF — when off the builder prompt is untouched and
+# its rendered output is byte-identical to today. See docs/agent-operator.md.
+MANAGED_MODE="${MANAGED_MODE:-false}"
+case "$MANAGED_MODE" in 1|true|TRUE|yes|on|ON) MANAGED_MODE=true ;; *) MANAGED_MODE=false ;; esac
+MANAGED_ADDENDUM_FILE="${MANAGED_ADDENDUM_FILE:-$SCRIPT_DIR/PROMPT_managed_addendum.md}"
+
 # Preview lifecycle resolution.
 PREVIEW_ENABLED="${PREVIEW_ENABLED:-${cfg_prev_enabled:-false}}"
 PREVIEW_UP="${PREVIEW_UP:-${cfg_up:-./scripts/preview-up.sh}}"
@@ -148,6 +158,15 @@ fi
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_DIR="$TARGET_REPO/.ralph/runs/$RUN_ID"
 mkdir -p "$RUN_DIR"
+
+# Build the effective builder prompt once. Managed mode appends the addendum; when
+# off, BUILDER_PROMPT is left untouched so the rendered prompt stays byte-identical.
+if [[ "$MANAGED_MODE" == "true" ]]; then
+  [[ -f "$MANAGED_ADDENDUM_FILE" ]] || die "MANAGED_MODE is on but addendum not found: $MANAGED_ADDENDUM_FILE"
+  EFFECTIVE_BUILDER_PROMPT="$RUN_DIR/builder-prompt-managed.md"
+  { cat "$BUILDER_PROMPT"; printf '\n'; cat "$MANAGED_ADDENDUM_FILE"; } > "$EFFECTIVE_BUILDER_PROMPT"
+  BUILDER_PROMPT="$EFFECTIVE_BUILDER_PROMPT"
+fi
 
 # ---- Preflight (repo contract) — block before any worktree/agent ------------
 if ! bash "$SCRIPT_DIR/preflight.sh" "$TARGET_REPO" "$RUN_DIR/preflight.md"; then
