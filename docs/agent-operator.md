@@ -74,19 +74,40 @@ The two roles share one contract: the [label protocol](../.agents/ralph/referenc
 point at) and per-issue `## Acceptance` sections the Manager verifies against deployed
 reality.
 
-**Install it.** `ralph init-target` (above) drops the Manager charter into the target
-repo at `.claude/skills/manager/SKILL.md` and the label protocol at
-`.claude/skills/manager/LABELS.md`. To boot the role, open a Claude session *in the
-target repo* and type `/manager`: on first run it fills the charter's "Project facts"
-section (deploy entrypoints, environments, required CI check, secret traps, denied
-operations) and creates the protocol labels; on later runs it reconstructs state from
-GitHub alone (`gh pr list`, `gh issue list --label now`, latest CI, `git log`).
+**Install both role skills.** `ralph init-target` (above) drops two self-contained
+charters into the target repo — the Manager at `.claude/skills/manager/SKILL.md` and the
+managed builder at `.claude/skills/builder/SKILL.md` — plus a co-located copy of the
+[label protocol](../.agents/ralph/references/LABELS.md) next to each. Both are bootable
+from a cold session with no reading of the ralph harness.
 
-**Enable the managed builder.** Managed mode is **OFF by default** — with it off, the
-builder prompts render byte-for-byte as they do today. Turn it on with `MANAGED_MODE=1`
-(env var, or set it in `.agents/ralph/config.local.sh` / `review-config.sh`). When on,
-the harness appends the [managed-builder addendum](../.agents/ralph/PROMPT_managed_addendum.md)
-to the builder prompt, adding exactly six behaviors:
+**Boot the Manager.** Open a Claude session *in the target repo* and type `/manager`: on
+first run it fills the charter's "Project facts" section (deploy entrypoints,
+environments, required CI check, secret traps, denied operations) and creates the
+protocol labels; on later runs it reconstructs state from GitHub alone (`gh pr list`,
+`gh issue list --label now`, latest CI, `git log`).
+
+**Boot the managed builder (interactive — the usual path).** Open a *separate* session
+in the target repo and type `/builder` (or just: "you are the managed builder, target
+repo is `.`, go"). The `builder` skill boots it cold — it reconstructs state from GitHub
+(`gh issue list --label now --label spec:ready`, `gh pr list --author @me`), picks the
+top eligible issue, and works one issue → one PR under the Manager. The skill is the
+single source of the builder's behavior; you do not need the harness running for this.
+
+**Automated builder runs (alternative).** To drive the builder through the harness loop
+instead of an interactive session, set `MANAGED_MODE=1` (env var, or in
+`.agents/ralph/config.local.sh` / `review-config.sh`). It is **OFF by default** — with it
+off the builder prompts render byte-for-byte as they do today. When on, the harness
+appends the [managed-builder addendum](../.agents/ralph/PROMPT_managed_addendum.md) to the
+builder prompt (the same behaviors as the `/builder` skill, adapted to the harness's
+one-task-per-invocation loop):
+
+```bash
+MANAGED_MODE=1 ralph batch --repo /path/to/target --plan .agents/tasks/plan.md
+MANAGED_MODE=1 ralph review 1 --repo /path/to/target
+```
+
+**The six managed behaviors** (identical across the `/builder` skill and the harness
+addendum):
 
 1. Arbitration questions go to the Manager as a PR/issue comment + a `blocked:manager`
    label; the builder then parks that task and takes another — it never asks a human and
@@ -101,12 +122,7 @@ to the builder prompt, adding exactly six behaviors:
    issues or fixed en passant.
 5. Identity floor: the builder never approves/merges a PR, never pushes the default
    branch, never deploys prod.
-6. It does not restate the base loop — those six are the only additions.
-
-```bash
-MANAGED_MODE=1 ralph batch --repo /path/to/target --plan .agents/tasks/plan.md
-MANAGED_MODE=1 ralph review 1 --repo /path/to/target
-```
+6. It does not restate the base loop — those behaviors are the only additions.
 
 **Identity prerequisite.** The hard gate depends on two distinct GitHub identities — a
 Manager identity (GitHub App / machine account) and a builder identity — so the Manager
