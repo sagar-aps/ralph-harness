@@ -39,7 +39,7 @@ function git(cwd, args) {
 function ralph(args, env = {}) {
   return spawnSync(process.execPath, [cliPath, ...args], {
     encoding: "utf-8",
-    env: { ...process.env, RALPH_SKIP_UPDATE_CHECK: "1", ...env },
+    env: { ...process.env, RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", ...env },
   });
 }
 

@@ -34,7 +34,7 @@ function git(cwd, args) {
 function ralph(args, env = {}) {
   return spawnSync(process.execPath, [cliPath, ...args], {
     encoding: "utf-8",
-    env: { ...process.env, RALPH_SKIP_UPDATE_CHECK: "1", ...env },
+    env: { ...process.env, RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", ...env },
   });
 }
 function writeScript(p, body) {
@@ -441,6 +441,7 @@ console.log("13) interrupt (SIGINT) mid-task leaves a resumable pointer");
     const env = {
       ...process.env,
       RALPH_SKIP_UPDATE_CHECK: "1",
+      RALPH_NO_LOCAL_CONFIG: "1",
       RALPH_AGENT_RETRY_DELAY: "0",
       RALPH_WORKTREE_DIR: wtBase(target),
       AGENT_FBH_CMD: FB_HANG,

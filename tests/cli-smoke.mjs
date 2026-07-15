@@ -49,13 +49,21 @@ try {
 {
   const fakeHome = mkdtempSync(path.join(tmpdir(), "ralph-home-"));
   try {
-    const env = { ...process.env, HOME: fakeHome, RALPH_SKIP_UPDATE_CHECK: "1" };
+    const env = { ...process.env, HOME: fakeHome, RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1" };
     for (const agent of ["claude", "codex", "copilot"]) {
       run(process.execPath, [cliPath, "install-agent-commands", "--agent", agent], { env });
     }
     const claude = path.join(fakeHome, ".claude", "commands", "ralph-review.md");
     const codex = path.join(fakeHome, ".codex", "prompts", "ralph-review.md");
-    const copilot = path.join(fakeHome, ".config", "Code", "User", "prompts", "ralph-review.prompt.md");
+    // The VS Code user-prompts dir is OS-specific (bin/ralph -> copilotUserPromptsDir);
+    // resolve it the same way so this test passes on macOS/Windows/Linux alike.
+    const codeUserPrompts =
+      process.platform === "darwin"
+        ? path.join(fakeHome, "Library", "Application Support", "Code", "User", "prompts")
+        : process.platform === "win32"
+          ? path.join(process.env.APPDATA || path.join(fakeHome, "AppData", "Roaming"), "Code", "User", "prompts")
+          : path.join(fakeHome, ".config", "Code", "User", "prompts");
+    const copilot = path.join(codeUserPrompts, "ralph-review.prompt.md");
     for (const [label, p] of [["claude", claude], ["codex", codex], ["copilot", copilot]]) {
       if (!existsSync(p)) {
         console.error(`install-agent-commands failed: missing ${label} file ${p}`);

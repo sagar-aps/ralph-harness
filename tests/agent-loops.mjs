@@ -53,7 +53,7 @@ const integration = process.env.RALPH_INTEGRATION === "1";
 for (const agent of agents) {
   const projectRoot = setupTempProject();
   try {
-    const env = { ...process.env };
+    const env = { ...process.env, RALPH_NO_LOCAL_CONFIG: "1" };
     if (!integration) {
       env.RALPH_DRY_RUN = "1";
     } else if (agent === "codex" && !commandExists("codex")) {

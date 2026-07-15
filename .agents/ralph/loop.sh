@@ -48,8 +48,10 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 # Untracked local overrides (gitignored) — sourced last so they win. Copy
 # config.local.sh.example to config.local.sh to define/override backends & roles.
+# RALPH_NO_LOCAL_CONFIG=1 skips it — used by the test suite so a developer's machine
+# config (e.g. a repo-specific CHECK_CMD) can't leak into hermetic test runs.
 LOCAL_CONFIG_FILE="${SCRIPT_DIR}/config.local.sh"
-if [ -f "$LOCAL_CONFIG_FILE" ]; then
+if [ "${RALPH_NO_LOCAL_CONFIG:-}" != "1" ] && [ -f "$LOCAL_CONFIG_FILE" ]; then
   # shellcheck source=/dev/null
   . "$LOCAL_CONFIG_FILE"
 fi
