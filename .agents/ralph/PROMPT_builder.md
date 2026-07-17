@@ -93,6 +93,14 @@ Write/overwrite the handoff file with these sections:
 ## 4. Important repo facts discovered
 - ...
 
+## 4b. Observations for your dispatcher (UNRELATED problems — not part of this task)
+- ONLY for pre-existing problems *outside* this task that you did not touch — an unrelated
+  outdated doc, an unrelated dangling reference, dead code, a security smell (with file:line).
+  Do NOT fix them or open an issue; your dispatcher decides what to escalate.
+- **Anything this task needs, you still implement and fix completely** — including
+  regressions you introduce and dangling references from your own changes. Reporting is
+  never a substitute for doing the task.
+
 ## 5. Failed approaches / traps
 - ...
 

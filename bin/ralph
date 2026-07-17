@@ -1038,11 +1038,13 @@ async function main() {
       created.push("ralph.target.json");
     }
 
-    // Role skills (repo-agnostic; enable manager mode). Each is a self-contained
-    // charter installed into the target's Claude skills dir so an owner can boot it in a
-    // fresh session ("/manager" or "/builder") with no reading of the ralph harness. The
-    // canonical label protocol is co-installed next to each skill. A charter is NEVER
-    // overwritten once present (the role fills/edits it in place) unless --force is given.
+    // Manager role skill (repo-agnostic; enables manager mode). A self-contained charter
+    // installed into the target's Claude skills dir so an owner can boot it in a fresh
+    // session ("/manager") with no reading of the ralph harness. The canonical label
+    // protocol is co-installed next to it. The charter is NEVER overwritten once present
+    // (the Manager fills/edits its "Project facts" in place) unless --force is given.
+    // (The builder/reviewer are dispatched by the Orchestrator via `ralph review`/`batch`,
+    // not installed as skills; the Orchestrator charter lives in the harness itself.)
     const labelsSrc = path.join(templateDir, "references", "LABELS.md");
     const installRoleSkill = (role, tplName) => {
       const src = path.join(templateDir, "target-templates", tplName);
@@ -1067,7 +1069,6 @@ async function main() {
       }
     };
     installRoleSkill("manager", "manager-SKILL.md");
-    installRoleSkill("builder", "builder-SKILL.md");
 
     console.log(`Initialized target (${type}): ${repo}`);
     if (created.length) console.log(`Created: ${created.join(", ")}`);
@@ -1077,11 +1078,12 @@ async function main() {
       `\nNext: add a PRD JSON under .agents/tasks/, edit scripts/, then run:\n  ralph review 1 --repo ${repo}`,
     );
     console.log(
-      `\nManager mode (two interactive roles, booted in the target repo):\n` +
-        `  /manager  — verification gate; fills .claude/skills/manager/SKILL.md "Project facts" on first run\n` +
-        `  /builder  — managed builder; turns \`now\`+\`spec:ready\` issues into PRs under the Manager\n` +
-        `For automated builder runs instead of an interactive session, set MANAGED_MODE=1\n` +
-        `(see docs/agent-operator.md).`,
+      `\nManaged mode (see docs/architecture.md and docs/modes.md):\n` +
+        `  In the target repo, boot  /manager  — the verification gate; fills\n` +
+        `    .claude/skills/manager/SKILL.md "Project facts" on first run.\n` +
+        `  Above the repo, boot the Orchestrator (.agents/ralph/ORCHESTRATOR.md) — it drives\n` +
+        `    builders/reviewers via \`ralph review\`/\`ralph batch\` and routes to the Manager.\n` +
+        `  Unmanaged: just run \`ralph review\`/\`ralph batch\` yourself — no Manager needed.`,
     );
     process.exit(0);
   }

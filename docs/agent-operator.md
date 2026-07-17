@@ -6,8 +6,11 @@ intentionally generic; a Claude Code–specific section is at the end.
 
 ## Harness repo vs target repo
 
-- **Harness repo** (this repo): the orchestrator. It owns the loop, the prompts,
-  the backends, and the operator commands. It is *not* the project being built.
+- **Harness repo** (this repo): the loop tooling the **orchestrator role** operates —
+  it owns the loop, the prompts, the backends, and the operator commands. (The
+  orchestrator is a *role*, a mid-tier agent; this repo is what it drives. See the
+  [architecture](architecture.md) for the full five-role picture.) It is *not* the
+  project being built.
 - **Target repo**: a *separate* git repo that contains the actual application,
   its PRD/tasks (`.agents/tasks/*.json`), its `AGENTS.md`/`CLAUDE.md`, its
   `scripts/check.sh`, and (optionally) website preview/e2e scripts plus a
@@ -50,85 +53,59 @@ This creates `.agents/tasks/`, `ralph.target.json`, `scripts/check.sh` (and the
 preview scripts for `nextjs-postgres`), and adds `.ralph/` + `.agent-handoff.md`
 to `.gitignore`. It also installs the **Manager role skill** at
 `.claude/skills/manager/SKILL.md` (plus the canonical `LABELS.md`) — see
-[Manager mode](#manager-mode) below. Then add a PRD JSON under `.agents/tasks/` and
+[Managed mode](#managed-mode) below. Then add a PRD JSON under `.agents/tasks/` and
 fill in the scripts.
 
 `init-target` never overwrites an already-present manager charter (the Manager fills
 in its per-repo "Project facts" on first run and edits the file in place); pass
 `--force` only if you deliberately want to reset installed files to the templates.
 
-## Manager mode
+## Managed mode
 
-Manager mode is an optional three-party workflow layered on top of the builder loop:
+> **Read first:** [modes.md](modes.md) picks *which* setup you want (unmanaged vs.
+> managed); [architecture.md](architecture.md) is the full five-role picture (Owner /
+> Manager / Orchestrator / Builder / Reviewer across three model tiers, with diagrams).
+> This section is the operator's how-to for the managed setup.
 
-- **Owner** (human) — supplies intent and final authority, and the few actions agents
-  are denied (credential rotation, destructive DB ops, IAM-denied cloud calls).
-- **Manager** (an interactive Claude session on the strongest model) — the verification
-  gate: owns `## Acceptance` sections, reviews and merges every PR, deploys prod, runs a
-  periodic maintenance round, and turns owner intent into implementable issues.
-- **Builder** (this harness) — implements issues labeled `now` + `spec:ready`, one task
-  per branch/PR, and answers to the Manager instead of to a human.
+Managed mode is the autonomous setup: a frontier **Manager** inside the target repo and a
+mid-tier **Orchestrator** above it drive the builder/reviewer loop, so no human sits in the
+arbitration path. The two agents share one contract — the
+[label protocol](../.agents/ralph/references/LABELS.md) plus per-issue `## Acceptance`
+sections the Manager verifies against deployed reality.
 
-The two roles share one contract: the [label protocol](../.agents/ralph/references/LABELS.md)
-(the single canonical file both the Manager charter and the managed-builder addendum
-point at) and per-issue `## Acceptance` sections the Manager verifies against deployed
-reality.
+- **Manager** (frontier, *in* the repo) — owns `## Acceptance`, reviews the PRs the
+  Orchestrator files, gates merge + prod deploy, investigates and creates ready tickets.
+- **Orchestrator** (mid, *above* ralph + the target) — its hourly loop picks `now` +
+  `spec:ready` tickets, dispatches builders/reviewers through this harness, dev-verifies,
+  files PRs, and routes arbitration + emergent findings up to the Manager. It **never asks
+  the human** and **never deploys prod**.
+- **Builder / Reviewer** — the harness's dispatched workers; unchanged from the unmanaged
+  loop. The builder reports up to the Orchestrator (it never contacts the Manager).
 
-**Install both role skills.** `ralph init-target` (above) drops two self-contained
-charters into the target repo — the Manager at `.claude/skills/manager/SKILL.md` and the
-managed builder at `.claude/skills/builder/SKILL.md` — plus a co-located copy of the
-[label protocol](../.agents/ralph/references/LABELS.md) next to each. Both are bootable
-from a cold session with no reading of the ralph harness.
+**Install the Manager skill.** `ralph init-target` (above) drops the Manager charter into
+the target repo at `.claude/skills/manager/SKILL.md`, with a co-located copy of the
+[label protocol](../.agents/ralph/references/LABELS.md). It is bootable from a cold session
+with no reading of the ralph harness, and is never overwritten once filled in.
 
 **Boot the Manager.** Open a Claude session *in the target repo* and type `/manager`: on
-first run it fills the charter's "Project facts" section (deploy entrypoints,
-environments, required CI check, secret traps, denied operations) and creates the
-protocol labels; on later runs it reconstructs state from GitHub alone (`gh pr list`,
-`gh issue list --label now`, latest CI, `git log`).
+first run it fills the charter's "Project facts" section (deploy entrypoints, environments,
+required CI check, secret traps, denied operations) and creates the protocol labels; on
+later runs it reconstructs state from GitHub alone (`gh pr list`, `gh issue list --label
+now`, latest CI, `git log`).
 
-**Boot the managed builder (interactive — the usual path).** Open a *separate* session
-in the target repo and type `/builder` (or just: "you are the managed builder, target
-repo is `.`, go"). The `builder` skill boots it cold — it reconstructs state from GitHub
-(`gh issue list --label now --label spec:ready`, `gh pr list --author @me`), picks the
-top eligible issue, and works one issue → one PR under the Manager. The skill is the
-single source of the builder's behavior; you do not need the harness running for this.
-
-**Automated builder runs (alternative).** To drive the builder through the harness loop
-instead of an interactive session, set `MANAGED_MODE=1` (env var, or in
-`.agents/ralph/config.local.sh` / `review-config.sh`). It is **OFF by default** — with it
-off the builder prompts render byte-for-byte as they do today. When on, the harness
-appends the [managed-builder addendum](../.agents/ralph/PROMPT_managed_addendum.md) to the
-builder prompt (the same behaviors as the `/builder` skill, adapted to the harness's
-one-task-per-invocation loop):
-
-```bash
-MANAGED_MODE=1 ralph batch --repo /path/to/target --plan .agents/tasks/plan.md
-MANAGED_MODE=1 ralph review 1 --repo /path/to/target
-```
-
-**The six managed behaviors** (identical across the `/builder` skill and the harness
-addendum):
-
-1. Arbitration questions go to the Manager as a PR/issue comment + a `blocked:manager`
-   label; the builder then parks that task and takes another — it never asks a human and
-   never guesses through the question.
-2. Task selection is label-mechanical: only `now` + `spec:ready`; never `spec:draft`,
-   `blocked:owner`, `blocked:manager`, or `decision-needed`; no acceptance section →
-   not eligible.
-3. It re-reads issue/PR comments (newer than the body) before starting and before every
-   push, and addresses must-fix review items explicitly.
-4. Emergent findings (wrong docs, dead code, spec-vs-reality drift) are posted as
-   structured `**Emergent finding**` comments for the Manager to triage — never opened as
-   issues or fixed en passant.
-5. Identity floor: the builder never approves/merges a PR, never pushes the default
-   branch, never deploys prod.
-6. It does not restate the base loop — those behaviors are the only additions.
+**Boot the Orchestrator.** Open a *separate*, mid-tier session at a level that sees **both**
+this harness and the target repo, and point it at its charter
+([`.agents/ralph/ORCHESTRATOR.md`](../.agents/ralph/ORCHESTRATOR.md)) — e.g. "you are the
+orchestrator, initialize target `<path>`, tickets are at `<where>`, go." It runs
+`ralph init-target`, then loops: read the Manager's comments, select eligible tickets,
+dispatch them via `ralph review` / `ralph batch`, dev-verify, and file PRs. It does **not**
+read the target's internals — repo knowledge lives with the Manager and Builder.
 
 **Identity prerequisite.** The hard gate depends on two distinct GitHub identities — a
-Manager identity (GitHub App / machine account) and a builder identity — so the Manager
-can formally approve/merge what the builder cannot. Without them the Manager falls back
-to review-comment + squash-merge, which works and keeps the audit trail but gives no
-enforced approval gate. Set the identities up separately; nothing in manager mode
+Manager identity (GitHub App / machine account) and an Orchestrator/builder identity — so the
+Manager can formally approve/merge what the Orchestrator cannot. Without them the Manager
+falls back to review-comment + squash-merge, which works and keeps the audit trail but gives
+no enforced approval gate. Set the identities up separately; nothing in managed mode
 hard-requires them.
 
 ## Preflight (repo contract)

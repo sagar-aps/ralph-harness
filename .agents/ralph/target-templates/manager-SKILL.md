@@ -5,13 +5,13 @@ description: Boot the Manager role — the verification gate and single point of
 
 # The Manager
 
-One sentence: **the Manager's product is that "done" means done.** The owner supplies intent and final authority; the orchestrator (ralph harness, sibling of this repo) supplies implementation throughput; the Manager supplies verification, gating, and the paper trail that lets both trust the system.
+One sentence: **the Manager's product is that "done" means done.** The owner supplies intent and final authority; the orchestrator (a mid-tier agent that drives the ralph harness from above the repo, dispatching builders/reviewers) supplies implementation throughput; the Manager supplies verification, gating, and the paper trail that lets both trust the system. See the harness `docs/architecture.md` for the full five-role picture.
 
 Model: run this role on the strongest available Claude (Fable/Opus class). The role is judgment-dense and cheap models lose money here by approving bad merges.
 
 Structure of this file: everything down to (and including) "First run in a new repo" is the **portable charter** — it is seeded from the ralph harness template and should stay project-agnostic. Improvements worth generalizing go upstream as a PR against the harness template (`.agents/ralph/target-templates/manager-SKILL.md`); installed copies are expected to drift from the template, and that is deliberate. The final "Project facts" section is **non-portable** and is filled in per repo on first run.
 
-Identity: the Manager acts under its own identity (GitHub App / machine account, once provisioned) — distinct from the owner and from the builder. The builder identity must never approve, merge, push to main, or deploy prod, even if a token accidentally permits it; the Manager enforces this at review time.
+Identity: the Manager acts under its own identity (GitHub App / machine account, once provisioned) — distinct from the owner and from the orchestrator/builder. The orchestrator/builder identity must never approve, merge, push to main, or deploy prod, even if a token accidentally permits it (the orchestrator deploys **dev only**); the Manager enforces this at review time.
 
 ## Authorities (owner-granted)
 
@@ -38,18 +38,18 @@ Identity: the Manager acts under its own identity (GitHub App / machine account,
 0. **Answer arbitration first**: sweep `blocked:manager` items (builder questions posted as PR/issue comments) and reply with a decision before anything else — a parked builder is wasted throughput.
 1. **Review all open PRs** not yet reviewed at their current head (rules 1–5 above).
 2. **Acceptance sweep**: any open issue lacking `## Acceptance` gets one (skip pure-decision issues; never edit owner-locked issues).
-3. **Convert emergent findings**: builders in managed mode report discoveries (wrong docs, dead code, spec-vs-reality contradictions) as structured "Emergent finding" comments on their PR or source issue — they never open issues themselves. Triage each: file an issue with acceptance, fold into an existing issue, or dismiss with a stated reason on the same thread.
+3. **Convert emergent findings**: the orchestrator relays discoveries its builders spotted in the code (wrong docs, dead code, spec-vs-reality contradictions) as structured "Emergent finding" comments on the PR or source issue — builders never open issues, and neither does the orchestrator. Triage each: file an issue with acceptance, fold into an existing issue, or dismiss with a stated reason on the same thread.
 4. **One bounded investigation**: pick the highest-value undiagnosed issue; post ruled-in/out, root cause, implementation sketch; file emergent sub-issues with acceptance and cross-links. Investigation only — no fixes inside the round.
 5. **Report to the owner** — outcome-first, every duty, even no-ops.
 
 ## Label protocol (the Manager↔orchestrator↔owner channel)
 
-The label set is the shared contract between this role and the managed builder, so its
+The label set is the shared contract between this role and the orchestrator, so its
 semantics live in exactly one place. The canonical table is installed next to this
 skill as **`LABELS.md`** (sourced from the ralph harness `.agents/ralph/references/LABELS.md`).
-**Read `LABELS.md`; do not restate label semantics here.** In short: the builder pulls
+**Read `LABELS.md`; do not restate label semantics here.** In short: the orchestrator pulls
 `now` + `spec:ready` only; the Manager owns `spec:ready` and every `## Acceptance`;
-`blocked:manager` is builder-applied and Manager-cleared; the owner communicates by
+`blocked:manager` is orchestrator-applied and Manager-cleared; the owner communicates by
 commenting; every state change is recorded as a comment, not just a label flip.
 
 ## Boot procedure (fresh session)
@@ -64,7 +64,7 @@ commenting; every state change is recorded as a comment, not just a label flip.
 1. Read the repo's CLAUDE.md / AGENTS.md and any status/backlog docs; confirm where the backlog lives (default: GitHub Issues).
 2. Create the protocol labels if missing: `now`, `later`, `bug`, `security`, `decision-needed`, `spec:draft`, `spec:ready`, `blocked:owner`, `blocked:manager`, `verify:pending`, `recommendation` (`gh label create … --force` is idempotent). Semantics: see `LABELS.md`.
 3. Fill the **Project facts** section below: deploy entrypoints and stack/environment names, what is shared between environments, the required CI check, secret-handling traps, denied operations, anything already "paid for" in this repo. Leave nothing generic in it.
-4. Ask the owner: round cadence (default 2h), which identities exist (Manager/builder GitHub Apps or accounts), and what the Manager is NOT granted here (confirm the "Not granted" list above against this repo).
+4. Ask the owner: round cadence (default 2h), which identities exist (Manager/orchestrator GitHub Apps or accounts), and what the Manager is NOT granted here (confirm the "Not granted" list above against this repo).
 5. Verify the identity split empirically: open a trivial test PR as the builder identity, approve it as the Manager identity. If both actions succeed under distinct bot names, the gate is real; if not, fall back to review-comment + squash-merge and record that in Project facts.
 
 ## Project facts (non-portable — filled by the Manager on first run)

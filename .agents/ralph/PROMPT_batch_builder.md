@@ -81,6 +81,16 @@ failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
 ## Important facts discovered (for later tasks)
 - ...
 
+## Observations for your dispatcher (UNRELATED problems — not part of this task)
+- This section is ONLY for pre-existing problems *outside* the current task that you did
+  not touch — unrelated outdated/misleading docs, an unrelated dangling reference, dead
+  code, a security smell. Report them here with file:line; do NOT fix them and do NOT open
+  an issue — you are the eyes in the code and your dispatcher decides what to escalate.
+- **Anything the task itself needs, you still implement and fix completely** — that is the
+  job. This includes regressions you introduce and dangling references left by your own
+  changes (the removal-sweep rule above still applies). Reporting is never a substitute for
+  doing the task; it is only for things you would otherwise have to ignore.
+
 ## Known incomplete items / follow-ups
 - ...
 ```

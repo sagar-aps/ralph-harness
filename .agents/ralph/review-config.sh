@@ -28,16 +28,6 @@
 # USE_WORKTREE=true
 # ALLOW_DIRTY=false
 
-# --- Managed mode (a Manager role gates this repo) ---
-# Off by default. When on, the managed-builder addendum is appended to the builder
-# prompt: the builder arbitrates via the Manager (PR/issue comments + blocked:manager
-# label) instead of asking a human, takes only `now` + `spec:ready` issues, reports
-# emergent findings as comments, and never approves/merges/pushes-main/deploys-prod.
-# Install the Manager charter with `ralph init-target` and boot it with `/manager`.
-# See docs/agent-operator.md.
-# MANAGED_MODE=1
-# MANAGED_ADDENDUM_FILE=".agents/ralph/PROMPT_managed_addendum.md"
-#
 # --- Prompt templates ---
 # BUILDER_PROMPT=".agents/ralph/PROMPT_builder.md"
 # REVIEWER_PROMPT=".agents/ralph/PROMPT_reviewer.md"
