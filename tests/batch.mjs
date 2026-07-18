@@ -606,6 +606,151 @@ console.log("17) --primer injects orchestrator orientation into the builder prom
   }
 }
 
+console.log("18) --detach returns immediately and the batch survives the parent (fresh repo)");
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // makeTarget() never creates .ralph/ — so this alone is the regression test for
+  // --detach ENOENT-ing on the detach log before batch-loop has made the dir.
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev",
+       "--auto-approve-builder", "--detach"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB,
+        AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 0, "ralph batch --detach exits 0");
+    check(/Detached batch \(PID \d+\)/.test(out), "reports the detached PID");
+    check(existsSync(path.join(target, ".ralph")), ".ralph/ was created by the parent (no ENOENT)");
+    const logMatch = out.match(/Log: (\S+)/);
+    check(logMatch !== null && existsSync(logMatch[1]), "detach log file exists");
+    check(/^Run: batch-/m.test(out), "handshake published the NEW run id before returning");
+
+    // The parent returned while the batch was still going — that is what "detached" means.
+    const atReturn = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/STATUS=RUNNING/.test(atReturn), "parent returned while the batch was still RUNNING");
+
+    let lastRun = "";
+    for (let w = 0; w < 60000; w += 200) {
+      lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+      if (!/STATUS=RUNNING/.test(lastRun)) break;
+      await sleep(200);
+    }
+    check(/STATUS=READY_FOR_HUMAN_REVIEW/.test(lastRun), "detached batch ran to completion after the parent exited");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("19) status --watch terminates on a NON-happy terminal status");
+{
+  // Regression test: the terminal check used to be a denylist that omitted
+  // COMPLETED_WITH_FAILURES et al, so --watch looped forever on them.
+  const { target } = makeTarget({ checkFails: true });
+  const plan = twoTaskPlan();
+  try {
+    ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "failrev",
+       "--auto-approve-builder", "--max-iterations", "1"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB,
+        AGENT_FAILREV_CMD: 'bash -c "printf \\"VERDICT: FAIL\\n\\""' },
+    );
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/STATUS=COMPLETED_WITH_FAILURES/.test(lastRun), "run ended COMPLETED_WITH_FAILURES");
+
+    // Bounded by RALPH_WATCH_TIMEOUT_MS so the old infinite-loop bug fails this
+    // assertion in 10s rather than hanging the whole suite.
+    const w = ralph(["status", "--repo", target, "--watch"],
+      { RALPH_WATCH_INTERVAL_MS: "50", RALPH_WATCH_TIMEOUT_MS: "10000" });
+    const wout = `${w.stdout}${w.stderr}`;
+    check(w.status === 2, "--watch returns exit 2 on a non-READY terminal status");
+    check(/COMPLETED_WITH_FAILURES \(terminal\)/.test(wout), "--watch reports the terminal status");
+    check(w.status !== 124, "--watch did not time out (it recognised the status)");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("20) WIP snapshots capture mid-builder work and survive a kill");
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  let child = null;
+  try {
+    // Builder writes an uncommitted file, then hangs — emulating a long turn that
+    // gets SIGTERM'd before ralph's end-of-attempt commit.
+    const FB_WIP =
+      `bash -c 'printf "wip\\n" >> wip.txt; printf "# h\\n" > .agent-handoff.md; sleep 60'`;
+    const env = {
+      ...process.env,
+      RALPH_SKIP_UPDATE_CHECK: "1",
+      RALPH_NO_LOCAL_CONFIG: "1",
+      RALPH_AGENT_RETRY_DELAY: "0",
+      RALPH_DRY_RUN: "",
+      RALPH_SNAPSHOT_INTERVAL: "1",
+      RALPH_WORKTREE_DIR: wtBase(target),
+      AGENT_FBW_CMD: FB_WIP,
+      AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""',
+    };
+    child = spawn(
+      process.execPath,
+      [cliPath, "batch", "--repo", target, "--plan", plan, "--builder", "fbw", "--reviewer", "okrev",
+       "--auto-approve-builder", "--max-tasks", "1"],
+      { env, stdio: "ignore", detached: true },
+    );
+    const runsRoot = path.join(target, ".agent-run");
+    let runDir = null;
+    for (let waited = 0; waited < 40000 && runDir === null; waited += 200) {
+      if (existsSync(runsRoot)) {
+        const dirs = readdirSync(runsRoot).filter((x) => x.startsWith("batch-")).sort();
+        if (dirs.length && existsSync(path.join(runsRoot, dirs[dirs.length - 1], "task-001-iter-1-builder.log"))) {
+          runDir = path.join(runsRoot, dirs[dirs.length - 1]);
+        }
+      }
+      if (runDir === null) await sleep(200);
+    }
+    check(runDir !== null, "builder started (hanging mid-turn)");
+    await sleep(3000); // let >=2 snapshot ticks fire
+
+    // 21) the snapshotter must NOT stage into the builder's own index.
+    const lr = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    const wt = (lr.match(/^WORKTREE=(.+)$/m) || [])[1];
+    check(!!wt && existsSync(wt), "worktree recorded in last-run.env");
+    const staged = git(wt, ["diff", "--cached", "--name-only"]);
+    check(staged === "", "builder's real git index is untouched by the snapshotter");
+
+    try { process.kill(-child.pid, "SIGTERM"); } catch { child.kill("SIGTERM"); }
+    await new Promise((res) => child.on("exit", res));
+    child = null;
+
+    // Refs must be queryable from the TARGET repo, not just the worktree — proving
+    // they landed in the common ref store and outlive worktree cleanup.
+    const refs = git(target, ["for-each-ref", "--format=%(refname)", "refs/ralph/wip"])
+      .split("\n").filter(Boolean);
+    check(refs.length > 0, "WIP snapshot refs exist under refs/ralph/wip");
+    if (refs.length) {
+      check(git(target, ["cat-file", "-t", refs[0]]) === "commit", "snapshot ref points at a commit");
+      check(/wip\.txt/.test(git(target, ["show", "--stat", refs[0]])), "snapshot captured the UNCOMMITTED builder file");
+    }
+    check(existsSync(path.join(runDir, "task-001-iter-1-wip.sha")), "wip.sha pointer written to the run dir");
+    check(/^WIP_REF=refs\/ralph\/wip\//m.test(
+      readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8")),
+      "last-run.env records the recovery ref");
+
+    // No leaked snapshotter: the ref count must be stable once the batch is gone.
+    const before = git(target, ["for-each-ref", "--format=%(refname)", "refs/ralph/wip"]);
+    await sleep(3000);
+    const after = git(target, ["for-each-ref", "--format=%(refname)", "refs/ralph/wip"]);
+    check(before === after, "no snapshotter left running after the batch died");
+  } finally {
+    if (child) { try { process.kill(-child.pid, "SIGKILL"); } catch {} }
+    cleanup(target);
+  }
+}
+
 for (const d of [...planDirs, ...stateDirs]) {
   try {
     rmSync(d, { recursive: true, force: true });

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { spawnSync } = require("child_process");
+const { spawnSync, spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -31,6 +31,8 @@ const review = {
   branch: null,
   verdictRegex: null,
   allowDirty: false,
+  detach: false,
+  watch: false,
   noWorktree: false,
   // preview / website validation
   appPort: null,
@@ -405,6 +407,16 @@ Batch options (ralph batch):
   --stop-on-fail                      Stop at the first failing task
   --resume                            Resume the last batch run, skipping already-completed tasks
                                       (use after a *_UNAVAILABLE halt once you fix/re-login the backend)
+  --detach                            Run the batch in its own session so a host CLI that kills its
+                                      tracked background tasks can't take it down. Returns immediately;
+                                      logs to <repo>/.ralph/ralph-detach-*.log. Poll with: status --watch
+                                      Builder work is snapshotted to refs/ralph/wip/... every
+                                      RALPH_SNAPSHOT_INTERVAL seconds (default 60; 0 disables).
+
+Status options (ralph status):
+  --watch                             Poll until the run reaches a terminal status. Exit 0 if
+                                      READY_FOR_HUMAN_REVIEW, 2 otherwise, 124 on timeout.
+                                      Tunable: RALPH_WATCH_INTERVAL_MS (15000), RALPH_WATCH_TIMEOUT_MS (6h)
 
 Preflight options (build / review / batch / preflight):
   --no-preflight | --skip-preflight   Skip the repo-contract preflight phase
@@ -545,6 +557,14 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   if (matchedReviewFlag) continue;
   if (arg === "--allow-dirty") {
     review.allowDirty = true;
+    continue;
+  }
+  if (arg === "--detach") {
+    review.detach = true;
+    continue;
+  }
+  if (arg === "--watch") {
+    review.watch = true;
     continue;
   }
   if (arg === "--no-worktree") {
@@ -797,6 +817,41 @@ async function main() {
     if (review.appPort) env.RALPH_APP_PORT = review.appPort;
     if (review.dbPort) env.RALPH_DB_PORT = review.dbPort;
     if (review.previewHost) env.PREVIEW_HOST = review.previewHost;
+    if (review.detach) {
+      const ralphDir = path.join(env.TARGET_REPO, ".ralph");
+      // batch-loop creates .ralph itself, but only later and in the CHILD — so on a
+      // fresh target repo this openSync would ENOENT before the child ever runs.
+      fs.mkdirSync(ralphDir, { recursive: true });
+      const lastRunPath = path.join(ralphDir, "last-run.env");
+      const prevRunId = parseEnvFile(lastRunPath).RUN_ID || "";
+      const logPath = path.join(ralphDir, `ralph-detach-${Date.now()}.log`);
+      const out = fs.openSync(logPath, "a");
+      // detached:true puts the child in its OWN session/process group. That is
+      // precisely what makes it immune to a host CLI that group-kills its tracked
+      // background tasks — do not "tidy" it away.
+      const child = spawn(batchLoop, [], { env, detached: true, stdio: ["ignore", out, out] });
+      child.on("error", (err) => {
+        console.error(`Failed to spawn detached batch: ${err.message}`);
+        process.exit(1);
+      });
+      child.unref();
+      fs.closeSync(out);
+      console.log(`Detached batch (PID ${child.pid}). Log: ${logPath}`);
+      // Handshake: wait until the child has published ITS run id, so a following
+      // `ralph status --watch` can't read the previous run's terminal status and
+      // report a batch that just started as already finished.
+      const deadline = Date.now() + 30000;
+      let runId = "";
+      while (Date.now() < deadline) {
+        const m = parseEnvFile(lastRunPath);
+        if (m.RUN_ID && m.RUN_ID !== prevRunId) { runId = m.RUN_ID; break; }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (runId) console.log(`Run: ${runId}`);
+      else console.log("(run id not published yet — check the log if status looks stale)");
+      console.log(`Poll: ralph status --repo ${env.TARGET_REPO} --watch`);
+      process.exit(0);
+    }
     const result = spawnSync(batchLoop, [], { stdio: "inherit", env });
     process.exit(result.status ?? 1);
   }
@@ -1108,6 +1163,7 @@ async function main() {
     console.log(`- Worktree:  ${meta.WORKTREE || "?"}`);
     console.log(`- Base:      ${meta.BASE_COMMIT || meta.BASE_REF || "?"}`);
     if (meta.PREVIEW_URL) console.log(`- Preview:   ${meta.PREVIEW_URL}`);
+    if (meta.WIP_REF) console.log(`- WIP snap:  ${meta.WIP_REF}`);
     console.log(`- Artifacts: ${meta.ARTIFACTS_DIR || runDir}`);
     const base = meta.BASE_COMMIT || meta.BASE_REF;
     if (meta.BRANCH && base) {
@@ -1120,6 +1176,32 @@ async function main() {
     if ((meta.STATUS || "") === "READY_FOR_HUMAN_REVIEW") {
       console.log(`\nREADY_FOR_HUMAN_REVIEW — after you approve:`);
       console.log(`  ralph integrate --repo ${repo} --run ${meta.RUN_ID || runId}`);
+    }
+    if (review.watch) {
+      // RUNNING is the ONLY non-terminal status batch-loop writes, so test for it
+      // directly. An allowlist-of-one is the only future-proof shape here: a
+      // denylist of terminal statuses silently regresses to an infinite loop the
+      // moment a new outcome is added to batch-loop.sh.
+      const pollMs = Number(process.env.RALPH_WATCH_INTERVAL_MS || 15000);
+      const timeoutMs = Number(process.env.RALPH_WATCH_TIMEOUT_MS || 6 * 3600 * 1000);
+      const started = Date.now();
+      let cur = meta;
+      let last = cur.STATUS || "";
+      while ((cur.STATUS || "") === "RUNNING") {
+        if (Date.now() - started > timeoutMs) {
+          console.error(`--watch timed out after ${Math.round(timeoutMs / 1000)}s (last status: ${last || "unknown"})`);
+          process.exit(124);
+        }
+        await new Promise((r) => setTimeout(r, pollMs));
+        cur = loadRunMeta(repo, review.run).meta;
+        if ((cur.STATUS || "") !== last) {
+          last = cur.STATUS || "unknown";
+          console.log("- Status:    " + last);
+        }
+      }
+      console.log(`- Status:    ${cur.STATUS || "unknown"} (terminal)`);
+      if (cur.WIP_REF) console.log(`- WIP snap:  ${cur.WIP_REF}`);
+      process.exit((cur.STATUS || "") === "READY_FOR_HUMAN_REVIEW" ? 0 : 2);
     }
     process.exit(0);
   }

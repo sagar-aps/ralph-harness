@@ -21,6 +21,12 @@
 #   BRANCH               Override branch name (default ralph/batch-<timestamp>).
 #   RALPH_WORKTREE_DIR   Base dir for the worktree.
 #   RALPH_DRY_RUN=1      Skip ONLY the agent backends; check still runs.
+#   RALPH_SNAPSHOT_INTERVAL  Seconds between WIP snapshots while the builder runs
+#                        (default 60; <=0 disables). Snapshots are commits under
+#                        refs/ralph/wip/<run-ts>/task-N/iter-M, taken WITHOUT
+#                        touching the builder's git index. Recover after a kill:
+#                          git -C <repo> show --stat <ref>
+#                          git -C <worktree> restore --source=<ref> -- .
 
 set -euo pipefail
 
@@ -107,6 +113,16 @@ VERDICT_REGEX="${VERDICT_REGEX:-^VERDICT: (PASS|FAIL|BLOCKED)}"
 BUILDER_PROMPT="${BATCH_BUILDER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_builder.md}"
 REVIEWER_PROMPT="${BATCH_REVIEWER_PROMPT:-$SCRIPT_DIR/PROMPT_batch_reviewer.md}"
 DRY_RUN="${RALPH_DRY_RUN:-}"
+
+# WIP snapshots (SIGTERM resilience). The host CLI can SIGTERM a batch mid-builder;
+# ralph otherwise commits only at end-of-attempt, so that work is lost. A background
+# snapshotter commits the worktree to refs/ralph/wip/... every SNAPSHOT_INTERVAL
+# seconds WITHOUT touching the builder's git index (see wip_snapshot).
+SNAPSHOT_INTERVAL="${RALPH_SNAPSHOT_INTERVAL:-60}"   # seconds; <=0 disables
+WIP_REF_NS="refs/ralph/wip"
+SNAP_PID=""
+WIP_REF_LAST=""
+WIP_INDEX=""            # assigned once RUN_DIR is known (below)
 
 # Optional end-of-batch website preview (brought up ONCE after all tasks, so the
 # human can review the whole batch via a URL — same scripts as `ralph review`).
@@ -199,6 +215,9 @@ if [[ "$RESUMING" != "true" ]]; then
   TASKS_DIR="$RUN_DIR/tasks"
   mkdir -p "$TASKS_DIR"
 fi
+# Scratch index for WIP snapshots — lives in the run dir (outside the worktree, so it
+# survives cleanup and never shows up in `git status`).
+WIP_INDEX="$RUN_DIR/wip.index"
 
 # ---- Preflight (repo contract) — block before any worktree/agent ------------
 if ! bash "$SCRIPT_DIR/preflight.sh" "$TARGET_REPO" "$RUN_DIR/preflight.md"; then
@@ -382,6 +401,109 @@ run_backend() {
   return "$status"
 }
 
+# ---- WIP snapshots (SIGTERM resilience) -------------------------------------
+# Take ONE snapshot of the worktree into $WIP_REF_NS/$TS/task-N/iter-M.
+#
+# Critically, this must never touch the builder's git index: the builder is an
+# autonomous agent that runs its own `git add`/`git commit`, and a concurrent
+# `git add -A` would contend on index.lock and can hard-fail those commits. So we
+# stage into a private index via GIT_INDEX_FILE and build the commit with
+# write-tree/commit-tree — a path that only locks our own index and the one ref.
+#
+# EVERY failure path returns 0: under `set -euo pipefail` a failed snapshot must
+# never be able to abort the batch. Snapshots are a recovery aid, not a gate.
+wip_snapshot() {  # <label>
+  local label="${1:-snapshot}" ref tree sha parent stamp
+  [[ -n "${WORKDIR:-}" && -d "${WORKDIR:-}" ]] || return 0
+  [[ -n "${WIP_INDEX:-}" ]] || return 0
+  ref="$WIP_REF_NS/$TS/task-${IDX:-0}/iter-${ITER:-0}"
+  {
+    parent="$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)" || return 0
+    [[ -n "$parent" ]] || return 0
+    GIT_INDEX_FILE="$WIP_INDEX" git -C "$WORKDIR" add -A >/dev/null 2>&1 || return 0
+    tree="$(GIT_INDEX_FILE="$WIP_INDEX" git -C "$WORKDIR" write-tree 2>/dev/null)" || return 0
+    [[ -n "$tree" ]] || return 0
+    # Nothing changed since the last snapshot on this ref — skip the write (avoids
+    # ref churn and object bloat while the builder is thinking rather than writing).
+    # Still record the ref: it exists and is the valid recovery pointer, and the
+    # periodic snapshotter runs in a SUBSHELL whose WIP_REF_LAST cannot propagate
+    # here — so this is often the only place the parent learns the ref.
+    if [[ "$tree" == "$(git -C "$WORKDIR" rev-parse -q --verify "$ref^{tree}" 2>/dev/null)" ]]; then
+      WIP_REF_LAST="$ref"
+      return 0
+    fi
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    # Forced identity so commit-tree cannot fail on a repo with no user.name/email.
+    sha="$(printf 'ralph wip [%s] task %s iter %s @ %s\n' \
+             "$label" "${IDX:-?}" "${ITER:-?}" "$stamp" \
+           | GIT_AUTHOR_NAME=ralph GIT_AUTHOR_EMAIL=ralph@localhost \
+             GIT_COMMITTER_NAME=ralph GIT_COMMITTER_EMAIL=ralph@localhost \
+             git -C "$WORKDIR" commit-tree "$tree" -p "$parent" 2>/dev/null)" || return 0
+    [[ -n "$sha" ]] || return 0
+    # --create-reflog matters: core.logAllRefUpdates only auto-logs refs/heads,
+    # refs/remotes, refs/notes and HEAD. With a reflog, superseded snapshots stay
+    # reachable (gc.reflogExpire, 90d) instead of being pruned as unreachable.
+    git -C "$WORKDIR" update-ref --create-reflog "$ref" "$sha" 2>/dev/null || return 0
+    WIP_REF_LAST="$ref"
+    printf '%s\t%s\t%s\n' "$sha" "$ref" "$label" \
+      >> "$RUN_DIR/task-${IDX:-0}-iter-${ITER:-0}-wip.log" 2>/dev/null || true
+    printf '%s\n' "$sha" > "$RUN_DIR/task-${IDX:-0}-iter-${ITER:-0}-wip.sha" 2>/dev/null || true
+  } || true
+  return 0
+}
+
+# Start the background snapshotter. MUST be called with the builder NOT yet running:
+# the `cp` below is a plain read of the real index, which is only safe while nothing
+# else is mutating it. Do not hoist this call out of the per-attempt loop.
+start_snapshotter() {
+  SNAP_PID=""
+  [[ "${SNAPSHOT_INTERVAL:-0}" -gt 0 ]] 2>/dev/null || return 0
+  [[ -n "${WIP_INDEX:-}" && -n "${WORKDIR:-}" && -d "${WORKDIR:-}" ]] || return 0
+  # Seed the private index from the real one so it inherits the stat cache; each
+  # tick then only rehashes genuinely-changed files instead of the whole tree.
+  cp "$(git -C "$WORKDIR" rev-parse --git-path index 2>/dev/null)" "$WIP_INDEX" 2>/dev/null \
+    || rm -f "$WIP_INDEX" 2>/dev/null || true
+  local main_pid=$$
+  # stdio MUST be detached from the parent's. Otherwise this subshell and its
+  # `sleep` children inherit batch-loop's stdout/stderr; when the caller reads
+  # those through a pipe (as `spawnSync` and `$(...)` do), the pipe is not closed
+  # until every holder exits — so an orphaned `sleep` blocks the caller for a full
+  # interval after the batch has finished.
+  (
+    # Do NOT inherit on_interrupt — a child running it would exit 130 and write a
+    # bogus INTERRUPTED pointer on the parent's behalf.
+    trap - INT TERM EXIT
+    while :; do
+      # Sleep in 1s slices rather than one long sleep: a killed subshell leaves its
+      # in-flight `sleep` orphaned, so short slices bound that orphan to ~1s and
+      # make the parent-liveness check responsive.
+      _waited=0
+      while [[ "$_waited" -lt "$SNAPSHOT_INTERVAL" ]]; do
+        sleep 1
+        _waited=$((_waited + 1))
+        # If the parent was SIGKILLed every trap was skipped, so self-terminate
+        # rather than looping forever writing refs into the user's repo.
+        kill -0 "$main_pid" 2>/dev/null || exit 0
+      done
+      [[ -d "$WORKDIR" ]] || exit 0
+      wip_snapshot "periodic"
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  SNAP_PID=$!
+  return 0
+}
+
+stop_snapshotter() {
+  [[ -n "${SNAP_PID:-}" ]] || return 0
+  # Signal only our own child. NOT `kill -- -$$`: job control is off in a
+  # non-interactive shell, so the snapshotter shares the batch-loop's process
+  # group and a group kill would take the builder down with it.
+  kill "$SNAP_PID" 2>/dev/null || true
+  wait "$SNAP_PID" 2>/dev/null || true   # returns 143 when killed; must not trip set -e
+  SNAP_PID=""
+  return 0
+}
+
 # Run the BUILDER for one task attempt, retrying ONLY on infra ERROR (non-zero
 # exit of the backend tool — not a code/check failure, which surfaces via check).
 # Returns 0 if the builder ran; 1 if it errored after all retries (caller halts).
@@ -449,15 +571,29 @@ write_last_run() {
     echo "RALPH_APP_PORT=${RALPH_APP_PORT:-}"
     echo "RALPH_DB_PORT=${RALPH_DB_PORT:-}"
     echo "USE_WORKTREE=true"
+    echo "WIP_REF=${WIP_REF_LAST:-}"
+    echo "WIP_NS=${WIP_REF_NS:-}/${TS:-}"
   } > "$TARGET_REPO/.ralph/last-run.env"
 }
 
 # On Ctrl-C / kill, leave a valid resume pointer + hint (work so far is committed).
+# NOTE: bash defers traps until the running foreground command returns, so if the
+# builder is mid-turn this fires late or (after a SIGKILL) never. The periodic
+# snapshotter — not this handler — is what actually protects mid-builder work.
 on_interrupt() {
   trap - INT TERM
+  stop_snapshotter
+  wip_snapshot "interrupt"
   write_last_run "INTERRUPTED"
   echo ""
   echo "Batch INTERRUPTED (signal). Completed tasks are committed on $BRANCH."
+  if [[ -n "${WIP_REF_LAST:-}" ]]; then
+    echo ""
+    echo "Uncommitted builder work was snapshotted to: $WIP_REF_LAST"
+    echo "  inspect:  git -C \"$TARGET_REPO\" show --stat $WIP_REF_LAST"
+    echo "  recover:  git -C \"$WORKDIR\" restore --source=$WIP_REF_LAST -- ."
+    echo "  (a snapshot may catch a file mid-write — review before trusting it)"
+  fi
   echo "Resume (skips already-PASSed tasks):"
   echo "  ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
   exit 130
@@ -545,6 +681,8 @@ HALTED_TASK=""
 # INTERRUPTED (not stale) so `--resume` works even if you stop the run on purpose.
 write_last_run "RUNNING"
 trap on_interrupt INT TERM
+# Belt-and-braces: never leave a snapshotter behind on any exit path.
+trap 'stop_snapshotter' EXIT
 
 # ---- Sequential task loop ---------------------------------------------------
 # Read the manifest on a dedicated fd (3) so stdin-reading backends (e.g.
@@ -600,9 +738,24 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
            R_PREV_VERIFY_FILE="$PREV_VERIFY"
 
     # 1. Builder (retry on infra ERROR; halt the batch if unrecoverable)
+    #
+    # The builder runs FOREGROUND, and bash defers trap handlers until the current
+    # foreground command returns — so on_interrupt cannot fire while it is running.
+    # A concurrent snapshotter is therefore the only thing that can protect work in
+    # this window, which is exactly where observed SIGTERMs landed.
     render_prompt "$BUILDER_PROMPT" "$BUILDER_PROMPT_R"
     echo "    builder ($BUILDER)..."
-    if ! run_builder_attempt "$BUILDER_PROMPT_R" "$BUILDER_LOG"; then
+    start_snapshotter
+    # Keep the `if !` CONDITION form: run_builder_attempt re-enables `set -e`
+    # internally (its retry loop does `set +e; ...; set -e`), so wrapping the call
+    # in a plain `set +e` does NOT protect it — its final `return 1` would trip
+    # errexit and kill the batch instead of halting it as BUILDER_UNAVAILABLE.
+    # A condition context suspends errexit for the whole call, which does.
+    BUILDER_RC=0
+    if ! run_builder_attempt "$BUILDER_PROMPT_R" "$BUILDER_LOG"; then BUILDER_RC=1; fi
+    stop_snapshotter
+    wip_snapshot "post-builder"   # before the check, so a kill during it is covered
+    if [[ "$BUILDER_RC" -ne 0 ]]; then
       AGENT_ERROR_ROLE="builder"; HALTED_TASK="$IDX"
       break
     fi
@@ -897,6 +1050,21 @@ REPORT="$RUN_DIR/final-report.md"
 
 # Final resume/status pointer (also read by status / integrate / cleanup).
 trap - INT TERM
+stop_snapshotter
+
+# Sweep this run's WIP snapshots once the work is safely committed on the branch —
+# otherwise refs accumulate one-per-attempt forever and permanently pin objects.
+# Only on the clean outcome: on any other ending the snapshots are still the
+# user's recovery path.
+if [[ "$OUTCOME" == "READY_FOR_HUMAN_REVIEW" ]]; then
+  while read -r _wipref; do
+    [[ -n "$_wipref" ]] || continue
+    git -C "$TARGET_REPO" update-ref -d "$_wipref" 2>/dev/null || true
+  done < <(git -C "$TARGET_REPO" for-each-ref --format='%(refname)' "$WIP_REF_NS/$TS" 2>/dev/null || true)
+  rm -f "$WIP_INDEX" 2>/dev/null || true
+  WIP_REF_LAST=""
+fi
+
 write_last_run "$OUTCOME"
 
 echo ""
