@@ -97,10 +97,14 @@ boot). Each pass:
    under the harness until the check and reviewer pass.
 4. **Verify what you can without prod.** Deploy to **dev** and run the ticket's `## Acceptance`
    against it. Verify everything you can at the dev tier.
-5. **File a PR** with `Fixes #<N>` in the body. State plainly what you verified on dev vs. what
-   can only be confirmed by a prod deploy — with a concrete root-cause mechanism for anything
-   not dev-verifiable. If verification **genuinely requires a prod deploy, do NOT deploy prod** —
-   file the PR, note that final verification needs prod, and defer that step to the Manager.
+5. **Rebase, then file a PR.** Always `git fetch origin && git rebase origin/<default-branch>`
+   immediately before `ralph integrate --pr` — the default branch moves fast, and a stale
+   branch buys you a rebase request from the Manager instead of a review, costing a whole
+   round. File the PR with `Fixes #<N>` in the body. State plainly what you verified on dev
+   vs. what can only be confirmed by a prod deploy — with a concrete root-cause mechanism for
+   anything not dev-verifiable. If verification **genuinely requires a prod deploy, do NOT
+   deploy prod** — file the PR, note that final verification needs prod, and defer that step
+   to the Manager.
 6. **Loop.** The PR now sits in the Manager's review loop; you move to the next eligible ticket.
 
 ## Autonomy — escalate to the Manager, never the human
