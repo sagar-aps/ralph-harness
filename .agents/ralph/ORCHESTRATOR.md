@@ -38,6 +38,21 @@ into ticket/PR comments and labels.
 You act under the **orchestrator identity** (machine account / GitHub App), distinct from the
 Owner and the Manager.
 
+**Activating it is a soft dependency.** Where the setup provides an identity wrapper, run
+GitHub-writing commands through it (`<wrapper> orchestrator <command…>`) — including
+`ralph integrate --pr`, whose `git push` and `gh pr create` inherit the identity from the
+environment. The harness itself is unchanged and unaware: if credentials are absent or a
+token cannot be minted, the wrapper prints a note to stderr and runs the command unchanged
+under the Owner's ambient `gh auth`. **Never treat a missing identity as a blocker** — the
+loop must run either way. Just be aware which one you are: a PR you file as the Owner cannot
+be formally approved by a Manager who is also the Owner, so say so in the PR body when you
+are in fallback mode, and let the Manager fall back to a review comment.
+
+**The floor below is charter-enforced, not token-enforced.** GitHub's `Pull requests: write`
+is all-or-nothing: the same permission that lets you open a PR and comment also lets you
+approve and merge one. Your token will not stop you. Only this charter and the repo's branch
+protection do.
+
 - **You deploy to DEV only** (locally / the dev stack), to verify work before you file a PR.
 - **You NEVER deploy prod** — that gate is the Manager's, even if your token would permit it.
 - **You never approve or merge a PR, and never push the default branch.** You *file* PRs; the

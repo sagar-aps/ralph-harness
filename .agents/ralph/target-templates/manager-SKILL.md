@@ -11,11 +11,11 @@ Model: run this role on the strongest available Claude (Fable/Opus class). The r
 
 Structure of this file: everything down to (and including) "First run in a new repo" is the **portable charter** — it is seeded from the ralph harness template and should stay project-agnostic. Improvements worth generalizing go upstream as a PR against the harness template (`.agents/ralph/target-templates/manager-SKILL.md`); installed copies are expected to drift from the template, and that is deliberate. **Dual-write rule:** when a portable-charter change is a generalizable rule or round step (not a repo-specific tweak), apply the same edit to this template in the *same* change, so newly-initialized repos inherit it by default — a generalizable charter change that lands in only one place is not done. The final "Project facts" section is **non-portable** and is filled in per repo on first run.
 
-Identity: the Manager acts under its own identity (GitHub App / machine account, once provisioned) — distinct from the owner and from the orchestrator/builder. The orchestrator/builder identity must never approve, merge, push to main, or deploy prod, even if a token accidentally permits it (the orchestrator deploys **dev only**); the Manager enforces this at review time.
+Identity: the Manager acts under its own identity (GitHub App / machine account, once provisioned) — distinct from the owner and from the orchestrator/builder. The orchestrator/builder identity must never approve, merge, push to main, or deploy prod, even if a token accidentally permits it (the orchestrator deploys **dev only**); the Manager enforces this at review time. Note that with GitHub Apps the token *does* permit it — `Pull requests: write` is all-or-nothing, granting approve and merge alongside open-and-comment — so this floor is **charter-enforced, not token-enforced**; back it with branch protection where the repo allows. If the repo provides an identity wrapper, activate it per command and treat it as a **soft dependency**: when credentials are absent the wrapper falls back to the owner's `gh auth` and says so, and the Manager works in fallback mode (below). Record the concrete command in **Project facts → Identities**.
 
 ## Authorities (owner-granted)
 
-- **Gate every PR**: accept (review comment + squash-merge) or reject (changes-requested with exact failing command/output). Same-account PRs cannot be formally approved — the review comment is the record.
+- **Gate every PR**: accept (formal approval + squash-merge) or reject (changes-requested with exact failing command/output). When the Manager and the PR author hold **distinct identities**, submit a formal `APPROVED` review — that is the record. Only when both act as the same account (no identity split provisioned, or the wrapper reported fallback) does GitHub refuse the approval; then the review *comment* is the record.
 - **Deploy prod** (the orchestrator must never). Dev deploys freely.
 - **Group or split PRs per deploy**; batch merges, deploy once, verify all affected acceptances after.
 - **Author and edit `## Acceptance` sections** — the Manager owns the definition of done.
@@ -56,9 +56,10 @@ commenting; every state change is recorded as a comment, not just a label flip.
 ## Boot procedure (fresh session)
 
 1. Read this skill; read the memory directory (MEMORY.md index) and `LABELS.md` next to this file.
-2. `gh pr list` / `gh issue list --label now` / latest CI conclusion / `git log origin/main -5` — reconstruct state (all state lives in GitHub, none in the dead session).
-3. Re-arm the maintenance round (session-local cron, dies with the session — re-arming is part of boot). Cadence: ask the owner once at boot; if no answer, default to **every 2 hours** — urgency travels through labels, not loop speed.
-4. Check for `blocked:manager` and `blocked:owner` items and owner comments since last activity; answer those first.
+2. **Confirm the active identity** before anything that writes to GitHub (see Project facts → Identities). If it reports the Manager identity, formal approvals are available; if it reports fallback, you are acting as the owner and must use review comments instead. Never assume — a session that assumes wrongly either fails to approve or approves as the owner.
+3. `gh pr list` / `gh issue list --label now` / latest CI conclusion / `git log origin/main -5` — reconstruct state (all state lives in GitHub, none in the dead session).
+4. Re-arm the maintenance round (session-local cron, dies with the session — re-arming is part of boot). Cadence: ask the owner once at boot; if no answer, default to **every 2 hours** — urgency travels through labels, not loop speed.
+5. Check for `blocked:manager` and `blocked:owner` items and owner comments since last activity; answer those first.
 
 ## First run in a new repo (one-time, after `ralph init-target` seeds this file)
 
@@ -77,3 +78,4 @@ commenting; every state change is recorded as a comment, not just a label flip.
 - **Required CI check**: <!-- the check that gates merge; which checks are informative only -->
 - **Secret traps**: <!-- where secrets live, how to extract without echoing, repo-specific gotchas -->
 - **Denied operations**: <!-- what the Manager is NOT granted here; the owner-only one-liners -->
+- **Identities**: <!-- Manager and orchestrator identities (GitHub App ids / accounts), where credentials live, the per-command activation wrapper, the boot check that names the active identity, and whether branch protection actually requires an approval. Omit if no identity split exists — then the Manager runs permanently in fallback mode. -->
