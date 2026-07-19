@@ -19,14 +19,21 @@ forever. Urgency travels through labels, not through loop speed.
 | `spec:ready` | Manager | Acceptance section present and judged implementable. **The orchestrator takes only `now` + `spec:ready`.** Approval-requiring work never gets `spec:ready` until the approval has happened. |
 | `blocked:owner` | Manager | Needs an owner action (a one-liner, a credential, a decision). The Manager pings the owner with the exact command/question. |
 | `blocked:manager` | orchestrator | The orchestrator hit an arbitration question (often a blocker a builder surfaced that it cannot break): it posts the question + evidence as a comment, applies this label, parks the task, and moves on. **The orchestrator never removes this label** — only the Manager unblocks, by answering on the thread and removing it. |
+| `blocked:orchestrator` | Manager | The Manager has handed work back to the orchestrator: an arbitration question answered on the thread, or a PR rejected with changes requested. The Manager posts the decision as a comment and applies this label in the same action. **The Manager never removes it** — the orchestrator clears it once it has acted (fixes pushed, ticket resumed). |
 | `verify:pending` | Manager | Merged, awaiting deploy-time acceptance. The Manager clears it after verifying deployed reality. |
 | `recommendation` | Manager | A suggested change/improvement awaiting owner or Manager triage (not yet `now`/`later`). |
 
 ## Invariants both roles must honor
 
-- The orchestrator's eligible set is exactly `now` AND `spec:ready`. It never touches
-  `spec:draft`, `blocked:owner`, `blocked:manager`, or `decision-needed`.
+- The orchestrator's eligible set for *new* work is exactly `now` AND `spec:ready`. It never
+  touches `spec:draft`, `blocked:owner`, `blocked:manager`, `blocked:orchestrator`, or
+  `decision-needed` when selecting new work — `blocked:orchestrator` is excluded there only
+  because it is the orchestrator's inbox, handled ahead of new work, not alongside it.
 - `blocked:manager` is orchestrator-applied, Manager-cleared. Never the reverse.
+- `blocked:orchestrator` is Manager-applied, orchestrator-cleared. Never the reverse. The two
+  `blocked:` labels are mirrors: whoever must act next is the one the label names.
 - The Manager owns `spec:ready` and every `## Acceptance` section — the orchestrator
   neither writes acceptance nor promotes `spec:draft` → `spec:ready`.
-- Every state change is recorded as a comment on the issue/PR, not just a label flip.
+- Every state change is recorded as a comment on the issue/PR, not just a label flip — and
+  every handoff carries a label, not just a comment. A handoff that exists only as a comment is
+  invisible to the other role's loop and does not count as delivered.

@@ -85,13 +85,21 @@ items you are waiting on. Then re-arm the loop (below).
 Re-arm this as a session-local cadence at boot (it dies with the session; re-arming is part of
 boot). Each pass:
 
-1. **Read the Manager first.** Sweep your open PRs for Manager review comments and any
-   `blocked:manager` items the Manager has answered — act on them before taking new work
-   (address must-fix review items; pick up unblocked tickets).
+1. **Read the Manager first.** `blocked:orchestrator` is your inbox — the Manager applies it
+   when it answers a `blocked:manager` question or rejects one of your PRs. Sweep it
+   (`gh issue list --label blocked:orchestrator`, `gh pr list --label blocked:orchestrator`),
+   and sweep your open PRs for Manager review comments. Act on all of it before taking new work
+   (address must-fix review items; pick up unblocked tickets), then **remove the label** — only
+   you clear it. Taking new work while `blocked:orchestrator` sits means the Manager's decision
+   was never received and the round it spent deciding is lost; leaving the label on an item you
+   have already handled tells the Manager you are still stalled, and it will re-answer instead
+   of reviewing.
 2. **Select treatable tickets — label-mechanical, not judgment.** Eligible = `now` AND
    `spec:ready` AND has a `## Acceptance` section. Never touch `spec:draft`, `blocked:owner`,
-   `blocked:manager`, or `decision-needed`. No acceptance section → not eligible (adding it is
-   the Manager's job, not yours).
+   `blocked:manager`, `blocked:orchestrator`, or `decision-needed`. `blocked:orchestrator` is
+   excluded HERE only because step 1 already owns it — skip it in step 1 as well and you are
+   skipping your own inbox, which is how an answered arbitration sits untouched for a day. No
+   acceptance section → not eligible (adding it is the Manager's job, not yours).
 3. **Assign to a builder.** Dispatch the ticket through the harness (`ralph review <task>` /
    `ralph batch`). The builder implements; the in-loop **reviewer** returns PASS/FAIL; iterate
    under the harness until the check and reviewer pass.
@@ -117,7 +125,10 @@ go to the human. Instead:
    **evidence** (files, errors, the contradiction), and the **options** you see.
 2. Apply **`blocked:manager`** to that issue/PR.
 3. **Park it and take another eligible ticket.** You never remove `blocked:manager` yourself —
-   only the Manager clears it, by answering on the thread and removing the label.
+   only the Manager clears it, by answering on the thread, removing it, and applying
+   `blocked:orchestrator` to hand the item back. That label arriving is your signal to resume.
+   If an answer ever reaches you as a bare comment with no label, say so on the thread — an
+   unlabelled answer is one you were never going to see.
 
 Silent parking is a failure: a parked ticket with no `blocked:manager` label and no comment is
 invisible work. Always leave the label + comment trail.
@@ -137,8 +148,9 @@ dismissal. One spec authority, no backlog spam, durable trail.
 The label set is the shared contract between you and the Manager; its semantics live in exactly
 one place — `.agents/ralph/references/LABELS.md`. Read it; do not restate label semantics here.
 In short: you pull `now` + `spec:ready` only; the Manager owns `spec:ready` and every
-`## Acceptance`; `blocked:manager` is yours to apply and the Manager's to clear; every state
-change is a comment, not just a label flip.
+`## Acceptance`; `blocked:manager` is yours to apply and the Manager's to clear;
+`blocked:orchestrator` is the Manager's to apply and yours to clear; every state change is a
+comment, not just a label flip — and every handoff carries a label, not just a comment.
 
 ## The floor, repeated (the rules that must never bend)
 
