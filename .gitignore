@@ -34,3 +34,5 @@ dist/
 
 # Per-issue plan dirs (parallel runs)
 .plans-*/
+.agent-run/
+.agent-handoff.md
