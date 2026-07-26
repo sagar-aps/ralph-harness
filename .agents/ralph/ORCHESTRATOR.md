@@ -48,10 +48,15 @@ loop must run either way. Just be aware which one you are: a PR you file as the 
 be formally approved by a Manager who is also the Owner, so say so in the PR body when you
 are in fallback mode, and let the Manager fall back to a review comment.
 
-**The floor below is charter-enforced, not token-enforced.** GitHub's `Pull requests: write`
-is all-or-nothing: the same permission that lets you open a PR and comment also lets you
-approve and merge one. Your token will not stop you. Only this charter and the repo's branch
-protection do.
+**The floor below is charter-enforced, and mechanically backstopped.** GitHub's
+`Pull requests: write` is all-or-nothing: the same permission that lets you open a PR and
+comment also lets you approve and merge one. Your token will not stop you. What *does* stop
+the obvious slips is the **floor guard** — arm it at boot with
+`source .agents/ralph/floor-guard.sh`. It shadows `gh`/`git` on your PATH and refuses
+`gh pr merge`, `gh pr review --approve`, and any push to the default branch, exiting 93 — with
+**no GitHub App required** (it works under plain `gh auth`; Apps + branch protection are a bonus
+layer, not a precondition). The guard is a backstop for drift, **not** a substitute for the
+charter: it cannot catch a prod deploy or a bad judgement call, so the rules below still bind you.
 
 - **You deploy to DEV only** (locally / the dev stack), to verify work before you file a PR.
 - **You NEVER deploy prod** — that gate is the Manager's, even if your token would permit it.
@@ -68,6 +73,8 @@ at <where>, go"):
 1. Read this charter and the harness label protocol at
    `.agents/ralph/references/LABELS.md`. (You do **not** read the target's CLAUDE.md /
    AGENTS.md — repo knowledge is the Builder's and the Manager's, not yours.)
+   Then **arm the floor guard**: `source .agents/ralph/floor-guard.sh` (see "Identity and
+   the hard floor" — it mechanically refuses merge/approve/default-push, no App required).
 2. Run `ralph init-target --repo <target>` (installs the Manager + builder skills, task
    scaffolding, and the label protocol into the target). Never overwrite a filled-in charter.
 3. Locate the backlog the Owner named (GitHub Issues by default, or the PRD/task dir).
