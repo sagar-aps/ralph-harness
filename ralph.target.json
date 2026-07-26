@@ -1,0 +1,10 @@
+{
+  "check": "./scripts/check.sh",
+  "preflight": {
+    "enabled": true,
+    "check": "./scripts/check.sh"
+  },
+  "preview": {
+    "enabled": false
+  }
+}
