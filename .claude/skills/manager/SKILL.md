@@ -72,11 +72,11 @@ commenting; every state change is recorded as a comment, not just a label flip.
 
 ## Project facts (non-portable — filled by the Manager on first run)
 
-<!-- filled by the Manager on first run — see "First run in a new repo" -->
+<!-- Filled by the Manager on first run of the dogfood self-host (2026-07-26). -->
 
-- **Deploy entrypoints**: <!-- how prod/dev deploys happen; the single sanctioned command -->
-- **Environments and what they share**: <!-- stacks/hosts per env; what is isolated vs shared (DB, buckets, auth pools) -->
-- **Required CI check**: <!-- the check that gates merge; which checks are informative only -->
-- **Secret traps**: <!-- where secrets live, how to extract without echoing, repo-specific gotchas -->
-- **Denied operations**: <!-- what the Manager is NOT granted here; the owner-only one-liners -->
-- **Identities**: <!-- Manager and orchestrator identities (GitHub App ids / accounts), where credentials live, the per-command activation wrapper, the boot check that names the active identity, and whether branch protection actually requires an approval. Omit if no identity split exists — then the Manager runs permanently in fallback mode. -->
+- **Deploy entrypoints**: NONE. This is a CLI tool (`bin/ralph`), distributed via npm/git — there is no prod service to deploy. "Gate prod" is a no-op altitude in this repo; the Manager's actual gate is merge-to-main quality (npm test green + review), since a merge to `main` **is** the release surface (npm consumers and other target repos pull the harness from there).
+- **Environments and what they share**: None. No dev/staging/prod stacks, no shared DB/buckets/auth pools. `RALPH_DRY_RUN=1` stands in for "dev" — it exercises the loop scripts end-to-end against fake agent output with no real backend/quota spend, and is the acceptable substitute for a dev-tier verification anywhere this charter calls for one.
+- **Required CI check**: `npm test` (`package.json` → `tests/cli-smoke.mjs`, `agent-loops.mjs`, `review-loop.mjs`, `batch.mjs`, `preflight.mjs`, `floor-guard.mjs`). No GitHub Actions workflow is wired up (`.github/workflows/` is empty) — this is a **locally-run** gate, not automated CI; the Manager runs it by hand against the PR branch before accepting. `npm run test:real` / `test:ping` spend real agent quota and are informative-only, never required.
+- **Secret traps**: `.agents/ralph/config.local.sh` is git-ignored and machine-specific (backend command overrides); as of this writing it holds no credentials, only CLI wiring. Actual model-provider credentials live in each CLI tool's own auth store (`claude` / `codex` / `opencode` login) entirely outside this repo — never in tracked files or echoed to logs.
+- **Denied operations**: destructive DB ops and IAM-denied cloud ops are not applicable (no DB, no cloud infra in this repo). Force-push, rotating credentials, and editing owner-locked items remain denied. Secrets access is moot per above (none are repo-resident).
+- **Identities**: **No identity split provisioned.** Owner, Manager, orchestrator, and builder all currently authenticate as the same `gh auth` account (`sagar-aps`) — confirmed via `gh auth status`. The Manager runs permanently in **fallback mode**: PR review is recorded as a review **comment**, not a formal `APPROVED` review (GitHub refuses self-approval), and merges are squash-merges done by the same account. The floor-guard (`.agents/ralph/floor-guard.sh`) is the mechanical backstop for the orchestrator identity regardless — arm it every orchestrator boot.
