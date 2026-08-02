@@ -82,7 +82,9 @@ emit("cfg_url", p.get("url"))
 emit("cfg_e2e", p.get("e2e"))
 emit("cfg_host", p.get("host"))
 # Normalized agent selection (#4): an optional "agents" block declares per-role
-# {provider, model, effort} and/or a profile — the repo's suggested default.
+# provider/model/effort and/or a profile as a repo-level default.
+# NOTE: keep this heredoc body free of apostrophes and unbalanced ()/{} — Bash 3.2
+# (macOS default) scans $(...) heredoc bodies and desyncs on a lone quote/paren.
 a = d.get("agents", {}) if isinstance(d, dict) else {}
 b = a.get("builder", {}) if isinstance(a, dict) else {}
 r = a.get("reviewer", {}) if isinstance(a, dict) else {}

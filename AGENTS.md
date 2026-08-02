@@ -44,3 +44,16 @@ Keep this file short. It is always loaded into context.
 
 ## Quirks / Guardrails
 **Add any common quirks guiderails here as needed**
+
+- **Shell scripts must parse under Bash 3.2** (macOS `/bin/bash`; the loop runs via
+  `#!/usr/bin/env bash`, which on a stock Mac is 3.2). `bash -n` on a dev box (bash 5.x)
+  will NOT catch 3.2-only failures. Two rules that bite:
+  1. **Bash 3.2 scans `$(...)` command-substitution heredoc bodies** and tracks quote/paren
+     state through them. So inside `eval "$(python3 - … <<'PY' … PY)"` blocks, keep the body
+     free of **apostrophes** (`repo's`, `can't`) and **unbalanced** `()`/`{}`/quotes — a lone
+     `'` desyncs the parser and throws `syntax error near unexpected token '('` at a *later*
+     line. (This was #21.)
+  2. Avoid Bash 4+ features: `${v,,}`/`${v^^}`, `declare -A`, `mapfile`/`readarray`, `&>>`, `;;&`.
+- **Verify 3.2 compatibility**: `npm test` includes `tests/shell-syntax.mjs` (runs `bash -n`
+  on every shell script). Run it under a real 3.2 to be sure:
+  `docker run --rm -v "$PWD:/w:ro" bash:3.2 sh -c 'for f in $(find /w -name "*.sh"); do bash -n "$f"; done'`
