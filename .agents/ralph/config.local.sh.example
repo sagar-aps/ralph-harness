@@ -58,3 +58,24 @@
 # untouched; the JSON is always extracted back to plain text before the verdict
 # parse, so enabling this never causes spurious reviewer ERRORs.)
 # : "${RALPH_USAGE:=1}"
+
+# ---------------------------------------------------------------------------
+# 6) Normalized agent selection — {provider, model, effort} per role (#4)
+# ---------------------------------------------------------------------------
+# Instead of hand-writing AGENT_*_CMD strings, pick a provider/model/effort per
+# role and let the harness compose the command. Precedence (high->low):
+#   CLI flag  >  config.local.sh (here)  >  ralph.target.json "agents"  >  default
+# A preset fills any knob you leave unset:
+#   cheap    = builder codex/low     reviewer codex/low
+#   balanced = builder codex/medium  reviewer codex/low
+#   max      = builder codex/high    reviewer codex/medium
+# : "${RALPH_PROFILE:=balanced}"
+# Or set knobs directly (these win over a preset):
+# : "${BUILDER_PROVIDER:=codex}"   ; : "${BUILDER_EFFORT:=high}"   # low|medium|high
+# : "${REVIEWER_PROVIDER:=codex}"  ; : "${REVIEWER_EFFORT:=low}"
+# : "${BUILDER_MODEL:=}"           ; : "${REVIEWER_MODEL:=}"       # empty = provider default
+# Providers: codex (effort -> -c model_reasoning_effort), claude (model only; effort
+# deferred), opencode (model only), droid. Reviewer stays read-only automatically.
+# Per-run override without editing this file:
+#   RALPH_PROFILE=cheap ralph batch ...        BUILDER_EFFORT=high ralph batch ...
+#   ralph batch --profile max --reviewer-effort low ...

@@ -419,6 +419,13 @@ Batch options (ralph batch):
                                       (heavier than --check; a non-zero verify sends the task back to iterate)
   --primer <file>                     Repo-orientation text injected into every builder prompt ({{PRIMER}})
   --auto-approve-builder              Builder runs unattended (permission-skipping); reviewer stays read-only
+
+Agent selection (ralph batch / review) — compose a backend from {provider,model,effort}:
+  --profile cheap|balanced|max        Preset per-role provider/effort (fills unset knobs)
+  --builder-provider <p>              codex | claude | opencode | droid  (reviewer: --reviewer-provider)
+  --builder-effort low|medium|high    codex maps to model_reasoning_effort (reviewer: --reviewer-effort)
+  --builder-model <m>                 Model id; empty = provider default (reviewer: --reviewer-model)
+                                      Precedence: flag > config.local.sh > ralph.target.json "agents" > default
   --stop-on-fail                      Stop at the first failing task
   --resume                            Resume the last batch run, skipping already-completed tasks
                                       (use after a *_UNAVAILABLE halt once you fix/re-login the backend)
@@ -554,6 +561,13 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     "--run": "run",
     "--plan": "plan",
     "--max-tasks": "maxTasks",
+    "--profile": "profile",
+    "--builder-provider": "builderProvider",
+    "--builder-model": "builderModel",
+    "--builder-effort": "builderEffort",
+    "--reviewer-provider": "reviewerProvider",
+    "--reviewer-model": "reviewerModel",
+    "--reviewer-effort": "reviewerEffort",
   };
   let matchedReviewFlag = false;
   for (const [flag, key] of Object.entries(reviewFlags)) {
@@ -770,6 +784,15 @@ async function main() {
     env.TARGET_REPO = path.resolve(cwd, targetRepo);
     if (review.builder || process.env.BUILDER) env.BUILDER = review.builder || process.env.BUILDER;
     if (review.reviewer || process.env.REVIEWER) env.REVIEWER = review.reviewer || process.env.REVIEWER;
+    // Normalized agent selection (#4): CLI flags override env; env already passes
+    // through via {...process.env}. The loop composes ralph-build/ralph-review.
+    if (review.profile) env.RALPH_PROFILE = review.profile;
+    if (review.builderProvider) env.BUILDER_PROVIDER = review.builderProvider;
+    if (review.builderModel) env.BUILDER_MODEL = review.builderModel;
+    if (review.builderEffort) env.BUILDER_EFFORT = review.builderEffort;
+    if (review.reviewerProvider) env.REVIEWER_PROVIDER = review.reviewerProvider;
+    if (review.reviewerModel) env.REVIEWER_MODEL = review.reviewerModel;
+    if (review.reviewerEffort) env.REVIEWER_EFFORT = review.reviewerEffort;
     if (review.maxIterations) env.MAX_ITERATIONS = review.maxIterations;
     if (review.check) env.CHECK_CMD = review.check;
     if (review.task) env.TASK_ID = review.task;
@@ -814,6 +837,15 @@ async function main() {
     env.PLAN = path.resolve(cwd, plan);
     if (review.builder || process.env.BUILDER) env.BUILDER = review.builder || process.env.BUILDER;
     if (review.reviewer || process.env.REVIEWER) env.REVIEWER = review.reviewer || process.env.REVIEWER;
+    // Normalized agent selection (#4): CLI flags override env; env already passes
+    // through via {...process.env}. The loop composes ralph-build/ralph-review.
+    if (review.profile) env.RALPH_PROFILE = review.profile;
+    if (review.builderProvider) env.BUILDER_PROVIDER = review.builderProvider;
+    if (review.builderModel) env.BUILDER_MODEL = review.builderModel;
+    if (review.builderEffort) env.BUILDER_EFFORT = review.builderEffort;
+    if (review.reviewerProvider) env.REVIEWER_PROVIDER = review.reviewerProvider;
+    if (review.reviewerModel) env.REVIEWER_MODEL = review.reviewerModel;
+    if (review.reviewerEffort) env.REVIEWER_EFFORT = review.reviewerEffort;
     if (review.check) env.CHECK_CMD = review.check;
     if (review.verify) env.VERIFY_CMD = review.verify;
     if (review.primer) env.RALPH_PRIMER_FILE = path.resolve(cwd, review.primer);
