@@ -37,3 +37,8 @@ forever. Urgency travels through labels, not through loop speed.
 - Every state change is recorded as a comment on the issue/PR, not just a label flip — and
   every handoff carries a label, not just a comment. A handoff that exists only as a comment is
   invisible to the other role's loop and does not count as delivered.
+- **`blocked:orchestrator` × `verify:pending` precedence.** The two are normally mutually
+  exclusive. If an item ever carries **both**, `blocked:orchestrator` wins: the orchestrator
+  resolves the requested changes (a new commit/PR) first, and only once it clears
+  `blocked:orchestrator` does `verify:pending` (deploy-time acceptance) apply. The Manager never
+  runs verify on an item the orchestrator still owes changes to.
