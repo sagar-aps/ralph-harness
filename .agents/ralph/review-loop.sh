@@ -90,6 +90,11 @@ PY
 )"
 fi
 
+# Normalized agent selection (#4): env/CLI flags > config.local.sh > shipped default.
+# (The ralph.target.json "agents" block is honored by `ralph batch`; here env/CLI and
+# config.local drive it.) No-op unless a spec/profile is set.
+if declare -F ralph_resolve_role_agents >/dev/null 2>&1; then ralph_resolve_role_agents; fi
+
 BUILDER="${BUILDER:-opencode}"
 REVIEWER="${REVIEWER:-claude}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5}"

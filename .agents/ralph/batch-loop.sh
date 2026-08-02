@@ -81,9 +81,35 @@ emit("cfg_down", p.get("down"))
 emit("cfg_url", p.get("url"))
 emit("cfg_e2e", p.get("e2e"))
 emit("cfg_host", p.get("host"))
+# Normalized agent selection (#4): an optional "agents" block declares per-role
+# {provider, model, effort} and/or a profile — the repo's suggested default.
+a = d.get("agents", {}) if isinstance(d, dict) else {}
+b = a.get("builder", {}) if isinstance(a, dict) else {}
+r = a.get("reviewer", {}) if isinstance(a, dict) else {}
+emit("cfg_agent_profile", a.get("profile"))
+emit("cfg_agent_builder_provider", b.get("provider"))
+emit("cfg_agent_builder_model", b.get("model"))
+emit("cfg_agent_builder_effort", b.get("effort"))
+emit("cfg_agent_reviewer_provider", r.get("provider"))
+emit("cfg_agent_reviewer_model", r.get("model"))
+emit("cfg_agent_reviewer_effort", r.get("effort"))
 PY
 )"
 fi
+
+# Normalized agent selection (#4). Precedence (high->low): env/CLI flags >
+# config.local.sh (sourced above) > ralph.target.json "agents" block > shipped
+# default. The target block is applied here with := so it fills only knobs still
+# unset after env and config.local; ralph_resolve_role_agents then composes the
+# synthetic ralph-build/ralph-review backends (no-op when no spec/profile is set).
+: "${RALPH_PROFILE:=${cfg_agent_profile:-}}"
+: "${BUILDER_PROVIDER:=${cfg_agent_builder_provider:-}}"
+: "${BUILDER_MODEL:=${cfg_agent_builder_model:-}}"
+: "${BUILDER_EFFORT:=${cfg_agent_builder_effort:-}}"
+: "${REVIEWER_PROVIDER:=${cfg_agent_reviewer_provider:-}}"
+: "${REVIEWER_MODEL:=${cfg_agent_reviewer_model:-}}"
+: "${REVIEWER_EFFORT:=${cfg_agent_reviewer_effort:-}}"
+if declare -F ralph_resolve_role_agents >/dev/null 2>&1; then ralph_resolve_role_agents; fi
 
 BUILDER="${BUILDER:-opencode}"
 REVIEWER="${REVIEWER:-claude}"
