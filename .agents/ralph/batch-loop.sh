@@ -187,17 +187,23 @@ REVIEWER_CMD="$(reviewer_cmd_for "$REVIEWER")"
 [[ -n "$BUILDER_CMD" ]] || die "Unknown builder backend: $BUILDER"
 [[ -n "$REVIEWER_CMD" ]] || die "Unknown reviewer backend: $REVIEWER"
 
-# RALPH_USAGE=1 makes claude-family agents emit `--output-format json` so run_backend
-# can capture per-attempt token/cost usage. Only `claude` supports the flag; other
-# backends are left untouched. run_backend's extraction (always on) turns the JSON back
-# into the plain-text log the verdict grep reads, so this stays safe. Off by default.
+# RALPH_USAGE=1 makes claude-CLI agents emit `--output-format json` so run_backend
+# can capture per-attempt token/cost usage. Applies to the bare `claude` binary AND to
+# claude-CLI wrappers (rlaude/zlaude and anything in RALPH_CLAUDE_LIKE) — they take the
+# same flag. Other backends (codex/opencode/...) are left untouched. run_backend's
+# extraction (always on) turns the JSON back into the plain-text log the verdict grep
+# reads, so this stays safe. Off by default.
+RALPH_CLAUDE_LIKE="${RALPH_CLAUDE_LIKE:-claude rlaude zlaude}"
 if [[ "${RALPH_USAGE:-0}" == "1" ]]; then
   add_json_flag() {
-    local c="$1"
-    case "$c" in
-      *--output-format*)     printf '%s' "$c" ;;              # already set; leave it
-      claude\ *|*/claude\ *) printf '%s' "${c/claude /claude --output-format json }" ;;
-      *)                     printf '%s' "$c" ;;              # non-claude: unsupported
+    local c="$1" first name rest
+    first="${c%% *}"; name="$(basename "$first")"
+    [[ "$c" == *--output-format* ]] && { printf '%s' "$c"; return; }   # already set
+    case " $RALPH_CLAUDE_LIKE " in
+      *" $name "*)                                    # claude CLI (or a known wrapper)
+        if [[ "$c" == *" "* ]]; then rest="${c#* }"; printf '%s --output-format json %s' "$first" "$rest";
+        else printf '%s --output-format json' "$c"; fi ;;
+      *) printf '%s' "$c" ;;                          # not a claude CLI: unsupported flag
     esac
   }
   BUILDER_CMD="$(add_json_flag "$BUILDER_CMD")"

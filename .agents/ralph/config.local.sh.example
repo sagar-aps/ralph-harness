@@ -68,6 +68,10 @@
 # untouched; the JSON is always extracted back to plain text before the verdict
 # parse, so enabling this never causes spurious reviewer ERRORs.)
 # : "${RALPH_USAGE:=1}"
+# Covers the bare `claude` binary and claude-CLI wrappers (rlaude/zlaude). Add other
+# wrapper names if you use them:  RALPH_CLAUDE_LIKE="claude rlaude zlaude mylaude"
+# (Self-hosted GPUs bill by GPU-second, not tokens, so the sidecars are for
+# throughput/turns visibility there, not billing.)
 
 # ---------------------------------------------------------------------------
 # 6) Normalized agent selection — {provider, model, effort} per role (#4)
