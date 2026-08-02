@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Floor-guard shim for `gh`. Refuses the orchestrator's forbidden GitHub ops
+# (merge / approve) regardless of identity, then execs the real gh. See
+# ../floor-guard.sh for how this is armed. Identity-agnostic by design (issue #6).
+set -euo pipefail
+
+real="${RALPH_REAL_GH:-}"
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "floor-guard(gh): cannot locate the real gh (RALPH_REAL_GH unset) — refusing to run blind." >&2
+  exit 127
+fi
+
+deny() {
+  echo "floor-guard: REFUSED '$*'." >&2
+  echo "  The orchestrator floor forbids merging or approving PRs. That is the Manager's gate." >&2
+  echo "  File the PR and hand off via label; do not merge/approve it yourself." >&2
+  exit 93   # distinctive non-zero so callers/tests can recognise a floor refusal
+}
+
+sub1="${1:-}"; sub2="${2:-}"
+
+# gh pr merge ...
+if [ "$sub1" = "pr" ] && [ "$sub2" = "merge" ]; then deny "gh pr merge"; fi
+
+# gh pr review --approve / -a   (reject/comment reviews are allowed)
+if [ "$sub1" = "pr" ] && [ "$sub2" = "review" ]; then
+  for a in "$@"; do
+    case "$a" in
+      --approve|-a) deny "gh pr review --approve" ;;
+    esac
+  done
+fi
+
+exec "$real" "$@"

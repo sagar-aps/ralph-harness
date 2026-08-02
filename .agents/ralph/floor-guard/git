@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Floor-guard shim for `git`. Refuses pushing the protected default branch
+# (the orchestrator files PRs from run branches; only the Manager lands to
+# default). All other git operations — including pushing run branches — pass
+# through untouched. Identity-agnostic (issue #6); PATH-scoped to the
+# orchestrator shell, so builders in their own processes are unaffected.
+set -euo pipefail
+
+real="${RALPH_REAL_GIT:-}"
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "floor-guard(git): cannot locate the real git (RALPH_REAL_GIT unset) — refusing to run blind." >&2
+  exit 127
+fi
+
+def="${RALPH_DEFAULT_BRANCH:-main}"
+
+deny() {
+  echo "floor-guard: REFUSED push to protected branch '$def'." >&2
+  echo "  The orchestrator never pushes the default branch. Push a run branch and open a PR;" >&2
+  echo "  the Manager lands it. ($*)" >&2
+  exit 93   # distinctive non-zero: a floor refusal
+}
+
+# Only 'push' is guarded.
+if [ "${1:-}" = "push" ]; then
+  shift
+  # Does any argument target the default branch as a refspec?
+  for a in "$@"; do
+    case "$a" in
+      "$def"|"HEAD:$def"|":$def"|"refs/heads/$def"|"*:$def"|"*:refs/heads/$def")
+        deny "git push … $a" ;;
+      "$def":*|"refs/heads/$def":*)
+        deny "git push … $a" ;;
+    esac
+  done
+  # No refspec given → git pushes the CURRENT branch. Refuse if that is default.
+  has_refspec=0
+  for a in "$@"; do
+    case "$a" in
+      -*) : ;;                         # a flag, not a refspec
+      *:*) has_refspec=1 ;;            # explicit src:dst
+    esac
+  done
+  # Heuristic: a bare `git push` or `git push origin` with no refspec token.
+  refspec_tokens=0
+  seen_remote=0
+  for a in "$@"; do
+    case "$a" in
+      -*) : ;;
+      *) if [ "$seen_remote" -eq 0 ]; then seen_remote=1; else refspec_tokens=$((refspec_tokens+1)); fi ;;
+    esac
+  done
+  if [ "$has_refspec" -eq 0 ] && [ "$refspec_tokens" -eq 0 ]; then
+    cur="$("$real" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    [ "$cur" = "$def" ] && deny "git push (current branch is '$def')"
+  fi
+  exec "$real" push "$@"
+fi
+
+exec "$real" "$@"
