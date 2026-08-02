@@ -57,3 +57,14 @@ Keep this file short. It is always loaded into context.
 - **Verify 3.2 compatibility**: `npm test` includes `tests/shell-syntax.mjs` (runs `bash -n`
   on every shell script). Run it under a real 3.2 to be sure:
   `docker run --rm -v "$PWD:/w:ro" bash:3.2 sh -c 'for f in $(find /w -name "*.sh"); do bash -n "$f"; done'`
+- **Builder no-op = never success (#22).** A builder that exits 0 with a confident "done"
+  report but an EMPTY diff (vs the task's starting commit) is a no-op, not success — classic
+  when a weak model narrates edits instead of making them. `batch-loop.sh` gates on this after
+  each builder attempt: empty diff → skip check/reviewer, feed pointed feedback, retry; if no
+  attempt ever produces a diff the task ends `NO_CHANGES` (a failure). Exit code alone never
+  classifies a builder attempt as done.
+- **Self-hosted builders (rlaude): always go through the wrapper.** `rlaude` neutralizes a
+  stray `ANTHROPIC_API_KEY` (which takes precedence over `ANTHROPIC_AUTH_TOKEN` and would send
+  `x-api-key` to the pod → 401, or misroute to real Anthropic) and pins every `ANTHROPIC_*_MODEL`
+  to the one served model. Verify tools actually EXECUTE (not narrate) after any endpoint change:
+  a raw `/v1/messages` call with a `tools` array must return `stop_reason":"tool_use"`.

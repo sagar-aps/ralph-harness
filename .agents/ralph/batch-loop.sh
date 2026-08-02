@@ -865,6 +865,26 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
       break
     fi
 
+    # Builder no-op guard (#22): exit 0 + a confident "done" report is NOT evidence of
+    # work. If the attempt changed nothing vs the task's starting commit, it is a no-op —
+    # never success. Skip the check + reviewer (an empty diff has nothing to judge, and a
+    # weak reviewer might rubber-stamp it), feed pointed feedback, and retry. If no attempt
+    # ever produces a diff, the task ends NO_CHANGES (a failure), not PASS.
+    git -C "$WORKDIR" add -A >/dev/null 2>&1 || true
+    if git -C "$WORKDIR" diff --cached --quiet "$HEAD_BEFORE" 2>/dev/null; then
+      echo "    builder produced NO changes (empty diff vs $HEAD_BEFORE) — not success (#22)"
+      TASK_STATUS="NO_CHANGES"
+      NOOP_FB="$RUN_DIR/task-$IDX-iter-$ITER-noop.txt"
+      printf '%s\n' \
+        "STOP. Your previous attempt exited WITHOUT changing any files — an empty diff against the task starting commit." \
+        "Whatever your summary claimed, the task is NOT done. Do not describe existing code as new work." \
+        "Make the concrete file edits the task requires and save them. If you genuinely believe no edit is warranted," \
+        "do not restate the task as complete — explain in the handoff exactly why, with evidence." > "$NOOP_FB"
+      PREV_REVIEW="$NOOP_FB"; PREV_CHECK=""
+      continue
+    fi
+    TASK_STATUS="FAIL"   # a real diff exists; back to FAIL until the reviewer PASSes
+
     # 2. Check
     echo "    check ($CHECK_CMD)..."
     set +e; ( cd "$WORKDIR" && eval "$CHECK_CMD" ) > "$ITER_CHECK_LOG" 2>&1; CHECK_STATUS=$?; set -e
