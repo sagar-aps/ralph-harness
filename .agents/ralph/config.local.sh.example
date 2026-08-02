@@ -23,6 +23,16 @@
 # Example: a "zlaude" backend (Claude Code wired to the Z.AI plan):
 # AGENT_ZLAUDE_CMD='zlaude -p --dangerously-skip-permissions "$(cat {prompt})"'
 #   ...then:  ralph batch --builder zlaude --reviewer codex-readonly ...
+#
+# Self-hosted model on a rented GPU (vLLM/RunPod, etc.): write a wrapper script
+# `rlaude` on your PATH that sets ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN and pins
+# every ANTHROPIC_*_MODEL to the single served model (and `unset ANTHROPIC_API_KEY`),
+# then `exec claude "$@"`. Keep the endpoint + key in the wrapper or an untracked env
+# file — never here. If the server's Anthropic /v1/messages route doesn't work, point
+# the wrapper at a local Anthropic->OpenAI proxy (LiteLLM / claude-code-router) instead;
+# ralph is unaffected either way — it only sees the wrapper name.
+# AGENT_RLAUDE_CMD='rlaude -p --dangerously-skip-permissions "$(cat {prompt})"'
+#   ...then:  ralph batch --builder rlaude --reviewer rlaude ...
 
 # ---------------------------------------------------------------------------
 # 2) Override an existing backend's command
