@@ -136,6 +136,20 @@ console.log("2) RALPH_USAGE=1 injects --output-format json into a claude backend
     check(!/reviewer:.*codex --output-format json/.test(out), "codex reviewer is NOT given the claude-only flag");
   } finally { cleanup(target); }
 }
+{
+  // Wrapper backends (rlaude/zlaude) are claude CLIs under the hood -> also get the flag.
+  const target = makeTarget();
+  const plan = planOneTask();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "rlaude", "--reviewer", "codex", "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(target),
+        AGENT_RLAUDE_CMD: 'rlaude -p --dangerously-skip-permissions "$(cat {prompt})"' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(/builder:.*rlaude --output-format json/.test(out), "rlaude wrapper builder also gains --output-format json (RALPH_CLAUDE_LIKE)");
+  } finally { cleanup(target); }
+}
 
 console.log("3) Mutation: a raw JSON blob does NOT match ^VERDICT:, but the extracted .result does");
 {
