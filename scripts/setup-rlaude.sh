@@ -27,7 +27,13 @@ set -euo pipefail
 : "${RLAUDE_KEY:?set RLAUDE_KEY in ~/.config/rlaude.env}"
 : "${RLAUDE_MODEL:?set RLAUDE_MODEL in ~/.config/rlaude.env}"
 export ANTHROPIC_BASE_URL="$RLAUDE_BASE_URL" ANTHROPIC_AUTH_TOKEN="$RLAUDE_KEY"
-unset ANTHROPIC_API_KEY   # precedence over AUTH_TOKEN; leaving it set breaks bearer auth
+# A stray ANTHROPIC_API_KEY takes PRECEDENCE over ANTHROPIC_AUTH_TOKEN: it would send the
+# wrong auth header to the pod (x-api-key -> 401) or route to real Anthropic. Neutralize it
+# loudly, so it shows up in logs instead of causing a silent misroute.
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "rlaude: ignoring a pre-existing ANTHROPIC_API_KEY (it would override the pod token)" >&2
+  unset ANTHROPIC_API_KEY
+fi
 export ANTHROPIC_MODEL="$RLAUDE_MODEL" ANTHROPIC_SMALL_FAST_MODEL="$RLAUDE_MODEL" \
        ANTHROPIC_DEFAULT_HAIKU_MODEL="$RLAUDE_MODEL" ANTHROPIC_DEFAULT_SONNET_MODEL="$RLAUDE_MODEL" \
        ANTHROPIC_DEFAULT_OPUS_MODEL="$RLAUDE_MODEL"
