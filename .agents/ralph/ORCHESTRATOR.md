@@ -123,7 +123,9 @@ boot). Each pass:
 5. **Rebase, then file a PR.** Always `git fetch origin && git rebase origin/<default-branch>`
    immediately before `ralph integrate --pr` — the default branch moves fast, and a stale
    branch buys you a rebase request from the Manager instead of a review, costing a whole
-   round. File the PR with `Fixes #<N>` in the body. State plainly what you verified on dev
+   round. File the PR with `Fixes #<N>` in the body — `ralph integrate --pr` derives that from
+   the branch name for a single ticket; for a **bundled batch** run that closes several tickets
+   on one branch, set `RALPH_FIXES="1 3 4"` so every issue is closed on merge. State plainly what you verified on dev
    vs. what can only be confirmed by a prod deploy — with a concrete root-cause mechanism for
    anything not dev-verifiable. If verification **genuinely requires a prod deploy, do NOT
    deploy prod** — file the PR, note that final verification needs prod, and defer that step
