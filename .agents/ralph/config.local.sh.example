@@ -23,6 +23,11 @@
 # Example: a "zlaude" backend (Claude Code wired to the Z.AI plan):
 # AGENT_ZLAUDE_CMD='zlaude -p --dangerously-skip-permissions "$(cat {prompt})"'
 #   ...then:  ralph batch --builder zlaude --reviewer codex-readonly ...
+# IMPORTANT for ANY claude-CLI-to-alternate-endpoint wrapper (zlaude/rlaude/...): the
+# wrapper MUST `unset ANTHROPIC_API_KEY`. A stray key takes precedence over
+# ANTHROPIC_AUTH_TOKEN, so the CLI silently authenticates to real Anthropic instead of
+# your endpoint — the builder then runs detached from the worktree and reports "done"
+# while changing nothing (this was the true root cause of #22).
 #
 # Self-hosted model on a rented GPU (vLLM/RunPod, etc.): write a wrapper script
 # `rlaude` on your PATH that sets ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN and pins
