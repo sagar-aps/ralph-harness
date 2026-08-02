@@ -160,6 +160,23 @@ BUILDER_CMD="$(builder_cmd_for "$BUILDER")"
 REVIEWER_CMD="$(reviewer_cmd_for "$REVIEWER")"
 [[ -n "$BUILDER_CMD" ]] || die "Unknown builder backend: $BUILDER"
 [[ -n "$REVIEWER_CMD" ]] || die "Unknown reviewer backend: $REVIEWER"
+
+# RALPH_USAGE=1 makes claude-family agents emit `--output-format json` so run_backend
+# can capture per-attempt token/cost usage. Only `claude` supports the flag; other
+# backends are left untouched. run_backend's extraction (always on) turns the JSON back
+# into the plain-text log the verdict grep reads, so this stays safe. Off by default.
+if [[ "${RALPH_USAGE:-0}" == "1" ]]; then
+  add_json_flag() {
+    local c="$1"
+    case "$c" in
+      *--output-format*)     printf '%s' "$c" ;;              # already set; leave it
+      claude\ *|*/claude\ *) printf '%s' "${c/claude /claude --output-format json }" ;;
+      *)                     printf '%s' "$c" ;;              # non-claude: unsupported
+    esac
+  }
+  BUILDER_CMD="$(add_json_flag "$BUILDER_CMD")"
+  REVIEWER_CMD="$(add_json_flag "$REVIEWER_CMD")"
+fi
 [[ -f "$BUILDER_PROMPT" ]] || die "Batch builder prompt not found: $BUILDER_PROMPT"
 [[ -f "$REVIEWER_PROMPT" ]] || die "Batch reviewer prompt not found: $REVIEWER_PROMPT"
 
@@ -386,6 +403,57 @@ Path(dst).write_text(src)
 PY
 }
 
+# Per-attempt usage instrumentation. If a backend emitted Claude JSON
+# (`--output-format json`), rewrite the log to the human-readable `.result` and tee
+# token/cost usage to a sidecar next to the log. This is not optional polish: a raw
+# one-line JSON blob would never match the `^VERDICT:` anchor the reviewer parse
+# depends on, forcing spurious ERROR retries until MAX_ITERATIONS — a token-burn
+# regression. Extracting `.result` back into the log the grep reads prevents that.
+# Safe no-op for plain-text backends (codex/opencode/etc.): the log is left untouched
+# and no sidecar is written. python3 is already a hard dependency of this loop.
+extract_usage() {  # <logfile> <sidecar>
+  local log="$1" side="$2"
+  [[ -s "$log" ]] || return 0
+  python3 - "$log" "$side" <<'PY' 2>/dev/null || true
+import json, sys
+log, side = sys.argv[1], sys.argv[2]
+try:
+    raw = open(log, encoding="utf-8", errors="replace").read()
+except Exception:
+    sys.exit(0)
+# Find the Claude result object: try the whole file, then each line from the end
+# (the JSON result is one line on stdout; stderr noise may precede it under 2>&1).
+obj = None
+for cand in [raw, *reversed(raw.splitlines())]:
+    cand = cand.strip()
+    if not cand or cand[0] != "{":
+        continue
+    try:
+        o = json.loads(cand)
+    except Exception:
+        continue
+    if isinstance(o, dict) and "result" in o:
+        obj = o
+        break
+if obj is None:
+    sys.exit(0)  # not Claude JSON -> leave the log as-is, write no sidecar
+res = obj.get("result")
+open(log, "w", encoding="utf-8").write((res if isinstance(res, str) else json.dumps(res)) + "\n")
+u = obj.get("usage") or {}
+num = lambda x: x if isinstance(x, (int, float)) else None
+json.dump({
+    "input": num(u.get("input_tokens")),
+    "output": num(u.get("output_tokens")),
+    "cache_read": num(u.get("cache_read_input_tokens")),
+    "cache_creation": num(u.get("cache_creation_input_tokens")),
+    "num_turns": num(obj.get("num_turns")),
+    "duration_ms": num(obj.get("duration_ms")),
+    "total_cost_usd": obj.get("total_cost_usd"),
+}, open(side, "w", encoding="utf-8"), indent=2)
+open(side, "a", encoding="utf-8").write("\n")
+PY
+}
+
 run_backend() {
   local cmd_tmpl="$1" prompt_file="$2" logfile="$3" status
   (
@@ -398,6 +466,9 @@ run_backend() {
     fi
   ) 2>&1 | tee "$logfile"
   status=${PIPESTATUS[0]}
+  # Always attempt extraction (safe no-op for non-JSON): if json output ever reaches
+  # the verdict grep un-extracted, it silently never matches -> ERROR-retry storm.
+  extract_usage "$logfile" "${logfile%.*}.usage.json"
   return "$status"
 }
 
