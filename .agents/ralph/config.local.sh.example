@@ -46,3 +46,15 @@
 # : "${MAX_ITERATIONS:=15}"       # per-task builder/reviewer attempts in batch
 # : "${CHECK_CMD:=./scripts/check.sh}"
 # : "${VERDICT_REGEX:=^VERDICT: (PASS|FAIL)}"
+
+# ---------------------------------------------------------------------------
+# 5) Per-attempt token/cost usage (cost visibility on capped plans)
+# ---------------------------------------------------------------------------
+# RALPH_USAGE=1 makes claude-family builders/reviewers emit `--output-format json`
+# in `ralph batch`, and writes a per-attempt sidecar next to each attempt log:
+#   .agent-run/<run>/task-<NNN>-iter-<N>-<role>.usage.json
+# with numeric input/output/cache_read/cache_creation tokens, num_turns,
+# duration_ms, and total_cost_usd. Off by default. (Non-claude backends are left
+# untouched; the JSON is always extracted back to plain text before the verdict
+# parse, so enabling this never causes spurious reviewer ERRORs.)
+# : "${RALPH_USAGE:=1}"
