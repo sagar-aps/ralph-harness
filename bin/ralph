@@ -274,10 +274,23 @@ function defaultBranch(repo) {
   return "main";
 }
 
-// Issue numbers to auto-close, inferred from a `fix/<N>-slug` branch name.
+// Issue numbers to auto-close via `Fixes #N`. Two sources, unioned:
+//  1. RALPH_FIXES — an explicit, caller-declared list (space/comma/`#`-separated).
+//     This is how a BATCH run — many tasks bundled on one branch — declares every
+//     issue it closes; the orchestrator sets it per run (branch names carry only one).
+//  2. The branch name — `fix/<N>-slug`, `feat/<N>_slug`, `issue-<N>-slug`, `<N>-slug`.
+//     Covers the common 1-ticket-1-PR flow with no extra wiring.
+function issueRefsFromEnv() {
+  return String(process.env.RALPH_FIXES || "")
+    .split(/[^0-9]+/)
+    .filter(Boolean);
+}
 function issueRefsFromBranch(branch) {
-  const m = String(branch).match(/\/(\d{1,6})[-_]/);
+  const m = String(branch).match(/(?:^|\/)(?:issue[-_]?)?(\d{1,6})[-_]/i);
   return m ? [m[1]] : [];
+}
+function issueRefs(branch) {
+  return [...new Set([...issueRefsFromEnv(), ...issueRefsFromBranch(branch)])];
 }
 
 // A readable PR title derived from the run's story title or the branch name.
@@ -392,6 +405,8 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
   --delete-branch                     also delete the run branch (cleanup/integrate/--merged)
   --keep-worktree | --skip-cleanup    integrate: don't auto-clean up afterwards
   --pr                                integrate via pull request: push branch + gh pr create
+                                      (Fixes #N from branch name; set RALPH_FIXES="1 3 4"
+                                       to close multiple issues, e.g. a bundled batch run)
                                       (keeps the branch, removes the worktree; needs gh)
   --merged                            cleanup: remove every worktree whose PR is already merged (needs gh)
   --type generic|nextjs-postgres      init-target scaffold type
@@ -1264,7 +1279,7 @@ async function main() {
           console.error("git push failed; nothing was opened.");
           process.exit(push.status ?? 1);
         }
-        const issues = issueRefsFromBranch(branch);
+        const issues = issueRefs(branch);
         const bodyLines = [`Automated ralph run \`${runId}\` on branch \`${branch}\`.`, ""];
         if (issues.length) bodyLines.push(...issues.map((n) => `Fixes #${n}`), "");
         bodyLines.push(
