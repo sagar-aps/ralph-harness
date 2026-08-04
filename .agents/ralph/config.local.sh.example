@@ -43,8 +43,8 @@
 # 2) Override an existing backend's command
 # ---------------------------------------------------------------------------
 # Don't have codex? Point the name at whatever you use, or change its flags.
-# AGENT_OPENCODE_Z_CMD='opencode run --model glm-4.6 "$(cat {prompt})"'
-# AGENT_CLAUDE_CMD='claude -p --dangerously-skip-permissions "$(cat {prompt})"'
+# AGENT_OPENCODE_Z_CMD='opencode run --model glm-4.6'
+# AGENT_CLAUDE_CMD='claude -p --dangerously-skip-permissions'
 
 # ---------------------------------------------------------------------------
 # 3) Set your default roles so you don't pass flags every time

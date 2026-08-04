@@ -3,14 +3,14 @@
 
 AGENT_CODEX_CMD="codex exec --yolo --skip-git-repo-check -"
 AGENT_CODEX_INTERACTIVE_CMD="codex --yolo {prompt}"
-AGENT_CLAUDE_CMD="env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude -p --dangerously-skip-permissions \"\$(cat {prompt})\""
+AGENT_CLAUDE_CMD="env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude -p --dangerously-skip-permissions"
 AGENT_CLAUDE_INTERACTIVE_CMD="claude --dangerously-skip-permissions {prompt}"
 AGENT_DROID_CMD="droid exec --skip-permissions-unsafe -f {prompt}"
 AGENT_DROID_INTERACTIVE_CMD="droid --skip-permissions-unsafe {prompt}"
-AGENT_OPENCODE_CMD="opencode run \"\$(cat {prompt})\""
+AGENT_OPENCODE_CMD="opencode run"
 AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt}"
 # Uncomment to use server mode (faster, avoids cold boot):
-# AGENT_OPENCODE_CMD="opencode run --attach http://localhost:4096 \"\$(cat {prompt})\""
+# AGENT_OPENCODE_CMD="opencode run --attach http://localhost:4096"
 # AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt} --attach http://localhost:4096"
 
 # --- Extra backends for the builder/reviewer review loop ---
@@ -18,7 +18,7 @@ AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt}"
 # templates containing `{prompt}` don't trip bash brace-matching in `${VAR:-...}`.
 # "opencode-z" is OpenCode authenticated with the Z.AI Coding Plan. Same binary
 # as opencode; named separately so a role can pin it explicitly.
-[[ -n "${AGENT_OPENCODE_Z_CMD:-}" ]] || AGENT_OPENCODE_Z_CMD='opencode run "$(cat {prompt})"'
+[[ -n "${AGENT_OPENCODE_Z_CMD:-}" ]] || AGENT_OPENCODE_Z_CMD='opencode run'
 # Role selection is operator guidance, not harness enforcement: prefer different
 # agents for builder and reviewer, and give the reviewer a read-only/sandbox flag
 # whenever its CLI supports one. For other agents, define a backend using that
@@ -94,10 +94,10 @@ ralph_provider_cmd() {  # <mode: build|review> <provider> <model> <effort>
       fi ;;
     claude)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
-      printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude%s -p --dangerously-skip-permissions "$(cat {prompt})"' "$mflag" ;;
+      printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude%s -p --dangerously-skip-permissions' "$mflag" ;;
     opencode)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
-      printf 'opencode run%s "$(cat {prompt})"' "$mflag" ;;
+      printf 'opencode run%s' "$mflag" ;;
     droid)
       printf 'droid exec --skip-permissions-unsafe -f {prompt}' ;;
     *)

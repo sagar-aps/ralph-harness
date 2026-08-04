@@ -30,11 +30,12 @@ function resolve(env) {
     echo "REVIEW=\${AGENT_RALPH_REVIEW_CMD:-<unset>}"
     echo "REVIEW_STRIPPED=$(printf '%s' "\${AGENT_RALPH_REVIEW_CMD:-}" | strip_autoapprove)"
     echo "CLAUDE=\${AGENT_CLAUDE_CMD}"
+    echo "OPENCODE=\${AGENT_OPENCODE_CMD}"
   `;
   const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", env: { ...process.env, ...env } });
   const out = `${r.stdout}${r.stderr}`;
   const get = (k) => (out.match(new RegExp(`^${k}=(.*)$`, "m")) || [])[1] ?? "";
-  return { BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), CLAUDE: get("CLAUDE"), raw: out };
+  return { BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), CLAUDE: get("CLAUDE"), OPENCODE: get("OPENCODE"), raw: out };
 }
 
 const claudeEnvUnsetPrefix = "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude";
@@ -50,7 +51,11 @@ console.log("1) resolution (no quota): presets and explicit knobs compose the ri
   check(hi.BUILD === "codex exec --yolo --skip-git-repo-check -c model_reasoning_effort=high -", "explicit codex/high builder");
 
   const cl = resolve({ BUILDER_PROVIDER: "claude", BUILDER_MODEL: "sonnet", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
-  check(cl.BUILD === `${claudeEnvUnsetPrefix} --model sonnet -p --dangerously-skip-permissions "$(cat {prompt})"`, "claude builder clears inherited provider env and uses --model + {prompt} template");
+  check(cl.BUILD === `${claudeEnvUnsetPrefix} --model sonnet -p --dangerously-skip-permissions`, "claude builder clears inherited provider env and uses --model + stdin");
+
+  const oc = resolve({ BUILDER_PROVIDER: "opencode", BUILDER_MODEL: "openai/gpt-5", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
+  check(oc.OPENCODE === "opencode run" && oc.BUILD === "opencode run --model openai/gpt-5", "shipped and normalized opencode commands use stdin");
+  check(!cl.CLAUDE.includes("{prompt}") && !cl.BUILD.includes("{prompt}") && !oc.OPENCODE.includes("{prompt}") && !oc.BUILD.includes("{prompt}"), "stdin backends contain no {prompt} argv interpolation");
 }
 
 console.log("2) invariants: reviewer read-only after strip_autoapprove; require_backend sees a real binary first");
@@ -98,9 +103,9 @@ done
   const expected = Object.keys(inherited).map((name) => `UNSET:${name}`).join("\n");
   const commands = resolve({ BUILDER_PROVIDER: "claude", BUILDER_MODEL: "sonnet", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
   for (const [label, command] of [["shipped", commands.CLAUDE], ["normalized", commands.BUILD]]) {
-    const rendered = command.replace("{prompt}", JSON.stringify(prompt));
-    const r = spawnSync("bash", ["-c", rendered], {
+    const r = spawnSync("bash", ["-c", command], {
       encoding: "utf-8",
+      input: readFileSync(prompt),
       env: { ...process.env, ...inherited, PATH: `${fixture}${path.delimiter}${process.env.PATH ?? ""}` },
     });
     check(r.status === 0 && r.stdout.trim() === expected, `${label} claude command hides all inherited provider variables from the executable`);

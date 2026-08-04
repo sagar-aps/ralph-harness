@@ -12,8 +12,8 @@
 # --- Backend command templates (override agents.sh defaults) ---
 # A backend command either contains {prompt} (a file path is substituted, quoted)
 # or reads the prompt from stdin.
-# AGENT_OPENCODE_Z_CMD='opencode run "$(cat {prompt})"'
-# AGENT_CLAUDE_CMD='claude -p --dangerously-skip-permissions "$(cat {prompt})"'
+# AGENT_OPENCODE_Z_CMD='opencode run'
+# AGENT_CLAUDE_CMD='claude -p --dangerously-skip-permissions'
 # AGENT_CODEX_WRITE_CMD='codex exec --sandbox workspace-write -'
 # AGENT_CODEX_READONLY_CMD='codex exec --sandbox read-only -'
 #

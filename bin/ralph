@@ -1557,9 +1557,9 @@ async function main() {
   const loadAgentMap = () => {
     const defaults = {
       codex: "codex exec --yolo --skip-git-repo-check -",
-      claude: "claude -p --dangerously-skip-permissions \"$(cat {prompt})\"",
+      claude: "claude -p --dangerously-skip-permissions",
       droid: "droid exec --skip-permissions-unsafe -f {prompt}",
-      opencode: "opencode run \"$(cat {prompt})\"",
+      opencode: "opencode run",
     };
     const interactiveDefaults = {
       codex: "codex --yolo {prompt}",

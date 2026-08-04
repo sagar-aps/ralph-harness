@@ -61,7 +61,7 @@ resolve_agent_cmd() {
   local name="$1"
   case "$name" in
     claude)
-      echo "${AGENT_CLAUDE_CMD:-claude -p --dangerously-skip-permissions \"\$(cat {prompt})\"}"
+      echo "${AGENT_CLAUDE_CMD:-claude -p --dangerously-skip-permissions}"
       ;;
     droid)
       echo "${AGENT_DROID_CMD:-droid exec --skip-permissions-unsafe -f {prompt}}"

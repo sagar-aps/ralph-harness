@@ -139,9 +139,9 @@ Set `AGENT_CMD` in `.agents/ralph/config.sh` to switch agents:
 
 ```
 AGENT_CMD="codex exec --yolo -"
-AGENT_CMD="claude -p --dangerously-skip-permissions \"\$(cat {prompt})\""
+AGENT_CMD="claude -p --dangerously-skip-permissions"
 AGENT_CMD="droid exec --skip-permissions-unsafe -f {prompt}"
-AGENT_CMD="opencode run \"$(cat {prompt})\""
+AGENT_CMD="opencode run"
 ```
 
 Or override per run:
