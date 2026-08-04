@@ -19,9 +19,15 @@ AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt}"
 # "opencode-z" is OpenCode authenticated with the Z.AI Coding Plan. Same binary
 # as opencode; named separately so a role can pin it explicitly.
 [[ -n "${AGENT_OPENCODE_Z_CMD:-}" ]] || AGENT_OPENCODE_Z_CMD='opencode run "$(cat {prompt})"'
-# Codex with a writable sandbox (good default for a builder role).
+# Role selection is operator guidance, not harness enforcement: prefer different
+# agents for builder and reviewer, and give the reviewer a read-only/sandbox flag
+# whenever its CLI supports one. For other agents, define a backend using that
+# agent's equivalent read-only flag; agents without one remain valid reviewers.
+# Codex writable form (good default for a builder role):
+#   codex exec --sandbox workspace-write -
 [[ -n "${AGENT_CODEX_WRITE_CMD:-}" ]] || AGENT_CODEX_WRITE_CMD='codex exec --sandbox workspace-write -'
-# Codex with a read-only sandbox (good default for a reviewer role).
+# Codex read-only form (the codex-readonly backend, preferred for a reviewer):
+#   codex exec --sandbox read-only -
 [[ -n "${AGENT_CODEX_READONLY_CMD:-}" ]] || AGENT_CODEX_READONLY_CMD='codex exec --sandbox read-only -'
 
 DEFAULT_AGENT="codex"
