@@ -6,7 +6,8 @@
     "ralph": "bin/ralph"
   },
   "scripts": {
-    "test": "node tests/cli-smoke.mjs && node tests/agent-loops.mjs && node tests/review-loop.mjs && node tests/batch.mjs && node tests/preflight.mjs && node tests/floor-guard.mjs && node tests/usage.mjs && node tests/agent-selection.mjs && node tests/builder-noop.mjs && node tests/shell-syntax.mjs",
+    "test": "node tests/cli-smoke.mjs && node tests/agent-loops.mjs && node tests/review-loop.mjs && node tests/batch.mjs && node tests/preflight.mjs && node tests/floor-guard.mjs && node tests/usage.mjs && node tests/agent-selection.mjs && node tests/builder-noop.mjs && node tests/shell-syntax.mjs && node tests/dogfood.mjs",
+    "test:dogfood": "node tests/cli-smoke.mjs && node tests/shell-syntax.mjs",
     "test:real": "node tests/real-agents.mjs",
     "test:ping": "node tests/agent-ping.mjs"
   },
