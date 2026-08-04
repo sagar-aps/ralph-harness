@@ -15,13 +15,13 @@ update this file.
 
 ## 1. The one thing to know
 
-**Prompt caching works on the claude family and does not work on codex.**
+**Prompt caching works on the claude family and on Z.AI, and does not work on codex.**
 
 | backend | caches the prompt *we* send? | evidence |
 |---|---|---|
 | `claude` / `rlaude` / `zlaude` | **yes — the whole prompt** | run 1 `cache_creation_input_tokens: 10246`; run 2 `cache_read_input_tokens: 18089` on the identical prompt |
 | `codex` / `codex-readonly` | **no** | identical prompt ×3 → `cached_input_tokens` pinned at 11,008 every time (that's codex's *own* system prefix, not ours) |
-| `opencode` / `opencode-z` | **unverified** | opencode hung non-interactively in testing (exit 124, no output) |
+| `opencode` / `opencode-z` (Z.AI) | **yes — implicit, provider-side** | identical prompt → `cache_read_input_tokens` 0 → **3,200** of 3,259 input tokens, measured against the Z.AI endpoint directly (the `opencode` CLI itself is unverified — it hangs, #44) |
 
 Why codex doesn't: it appears to derive its internal `prompt_cache_key` from
 `thread_id`, and every `codex exec` is a new thread. Caching *does* accumulate
@@ -33,7 +33,10 @@ It is not a usable optimisation. See #39.
 
 - Do not promise cache savings on a codex-backed run. There are none.
 - If a workload is retry-heavy and caching is the lever you want, that argues for a
-  claude-family builder. See the role-selection guidance in the Manager charter.
+  claude-family builder (Anthropic **or** Z.AI-backed). See the role-selection guidance
+  in the Manager charter.
+- Z.AI's caching is **implicit** — no `cache_control`, nothing to configure. Byte-stable
+  prefixes are the whole mechanism, which is why prompt ordering matters there.
 - `prompt_cache_key` is **not settable** from ralph. `codex exec -c prompt_cache_key=…`
   is rejected as an unknown config field.
 
@@ -78,6 +81,16 @@ Traps in that table:
 
 ---
 
+### Z.AI endpoint routing (a trap)
+
+The GLM **Coding Plan** credential is scoped to the Anthropic-compatible endpoint
+(`https://api.z.ai/api/anthropic/v1/messages`). Sending it at the pay-per-token
+OpenAI-shaped route (`/api/paas/v4/chat/completions`) returns
+`1113: Insufficient balance or no resource package` — which reads like a billing
+problem and is actually a wrong-endpoint problem. `GET /api/paas/v4/models` *does*
+answer with the Coding Plan key, so a successful model list is not evidence that
+inference will work.
+
 ## 4. Reading usage from each CLI
 
 All three have a JSON mode. Field names differ from the underlying APIs — use these,
@@ -87,7 +100,7 @@ not the provider docs' names.
 |---|---|---|---|
 | claude family | `--output-format json` | `usage.cache_read_input_tokens` | `usage.cache_creation_input_tokens` |
 | codex | `--json` (JSONL; usage on the final `turn.completed` event) | `cached_input_tokens` | `cache_write_input_tokens` |
-| opencode | `--format json` | unverified | unverified |
+| opencode | *(not instrumented — see below)* | — | — |
 
 Two cautions:
 
@@ -102,9 +115,22 @@ Two cautions:
    **no information**. Do not conclude "nothing was cached" from it. (I made this
    mistake; `cached_input_tokens` is the load-bearing field.)
 
-Key off `RALPH_CLAUDE_LIKE` rather than hardcoding binary names — `rlaude` and
-`zlaude` are claude-CLI wrappers. Note `zlaude` is claude-CLI pointed at Z.AI, so
-whether it populates the Anthropic cache fields is **untested**.
+**opencode is deliberately left uninstrumented.** It accepts `--format json`, but its
+usage field names are unverified while #44 blocks testing, and injecting a flag whose
+output shape we cannot parse would leave the verdict grep staring at JSON — silently
+burning every attempt. Unknown beats broken. Revisit when #44 lands.
+
+**Z.AI reports reads but not creations.** On the Z.AI Anthropic-compatible endpoint
+`usage` carries `cache_read_input_tokens` but **omits `cache_creation_input_tokens`
+entirely** (keys observed: `cache_read_input_tokens`, `input_tokens`, `output_tokens`,
+`server_tool_use`, `service_tier`). Code that assumes the creation field exists will
+read `None`. That also confirms `zlaude` — claude-CLI pointed at this endpoint — does
+report cache reads, which was previously an open question.
+
+Key off `RALPH_CLAUDE_LIKE` / `RALPH_CODEX_LIKE` rather than hardcoding binary names — `rlaude` and
+`zlaude` are claude-CLI wrappers. `zlaude` is claude-CLI pointed at Z.AI; it **does**
+report `cache_read_input_tokens` (measured against that endpoint), but **not**
+`cache_creation_input_tokens`.
 
 ---
 
@@ -194,7 +220,10 @@ asserting one, measure first.
 | "codex/opencode can't report usage" | both have JSON modes; codex's cache fields are readable today |
 | "`cache_write: 0` means nothing was cached" | that field is unpopulated on codex; meaningless |
 | "Byte-identical prefix ⇒ cache hit" | not below the provider minimum — it fails silently |
-| "Z.AI cached tokens cost 50 %" | ~18.6 % pay-per-token, 0.1 % on the Coding Plan; the guide page is stale |
+| "Z.AI cached tokens cost 50 %" | ~18.6 % pay-per-token, 0.1× on the Coding Plan; the guide page is stale |
+| "Z.AI needs `cache_control` like Anthropic" | no — it caches implicitly; ordering is the whole lever |
+| "A Coding Plan key works on any Z.AI endpoint" | it is scoped to the Anthropic-compatible route; the pay-per-token route answers `1113 Insufficient balance` |
+| "`/models` answered, so inference will work" | `/models` succeeds on the Coding Plan key even where inference is refused |
 | "Reordering the Context block is enough" | dynamic tokens hide in intro *prose* too |
 | "Newer model ⇒ smaller cache minimum" | Anthropic's minimums are non-monotonic |
 | "The reviewer log is the reviewer's findings" | it may be mostly our own echoed prompt |
