@@ -44,6 +44,15 @@ if [[ "${PREFLIGHT_SKIP:-false}" == "true" ]]; then
   skip_report "bypassed with --no-preflight / PREFLIGHT_SKIP"
 fi
 
+# Re-entrancy guard (self-host fork-bomb fix, #35). Ralph exports RALPH_IN_PREFLIGHT=1
+# around every check command it runs. If a ralph subprocess spawned by that check
+# (e.g. the harness test suite exercises `ralph build/review/batch`) reaches preflight,
+# it MUST NOT run it again — otherwise preflight -> npm test -> ralph -> preflight
+# recurses into an unbounded fork bomb (once measured at 377 procs / 8.5 GB).
+if [[ "${RALPH_IN_PREFLIGHT:-}" == "1" ]]; then
+  skip_report "re-entrancy guard: nested inside a ralph-invoked check (RALPH_IN_PREFLIGHT=1)"
+fi
+
 CONFIG="$REPO/ralph.target.json"
 [[ -f "$CONFIG" ]] || skip_report "no ralph.target.json (nothing configured)"
 
@@ -100,7 +109,8 @@ while IFS=$'\t' read -r NAME CMD; do
   fi
   LOG="$LOG_BASE.$NAME.log"
   echo "preflight: $NAME -> $CMD"
-  ( cd "$REPO" && eval "$CMD" ) > "$LOG" 2>&1
+  # Mark descendants so a ralph spawned by this check skips its own preflight (#35).
+  ( cd "$REPO" && RALPH_IN_PREFLIGHT=1 eval "$CMD" ) > "$LOG" 2>&1
   STATUS=$?
   if [[ "$STATUS" -eq 0 ]]; then
     ROWS+=("| $NAME | \`$CMD\` | PASS | 0 |")

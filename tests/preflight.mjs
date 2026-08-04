@@ -24,9 +24,17 @@ function git(cwd, args) {
   return r.stdout.trim();
 }
 function ralph(args, env = {}) {
+  // This suite ASSERTS preflight runs/blocks, so it must control preflight itself.
+  // Scrub the re-entrancy marker (and any inherited PREFLIGHT_SKIP) so an ambient
+  // RALPH_IN_PREFLIGHT (present when the whole suite runs AS the self-host preflight,
+  // #35) does not make these spawned ralph skip the preflight under test. Safe: these
+  // targets use a trivial `exit 0` check, never `npm test`, so no recursion.
+  const base = { ...process.env };
+  delete base.RALPH_IN_PREFLIGHT;
+  delete base.PREFLIGHT_SKIP;
   return spawnSync(process.execPath, [cliPath, ...args], {
     encoding: "utf-8",
-    env: { ...process.env, RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", ...env },
+    env: { ...base, RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", ...env },
   });
 }
 // preflightTest: shell command used as the preflight "test" step ("true"|"false").

@@ -887,7 +887,9 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
 
     # 2. Check
     echo "    check ($CHECK_CMD)..."
-    set +e; ( cd "$WORKDIR" && eval "$CHECK_CMD" ) > "$ITER_CHECK_LOG" 2>&1; CHECK_STATUS=$?; set -e
+    # RALPH_IN_PREFLIGHT marks descendants so a ralph spawned by the check skips its
+    # own preflight — prevents the self-host check -> npm test -> ralph recursion (#35).
+    set +e; ( cd "$WORKDIR" && RALPH_IN_PREFLIGHT=1 eval "$CHECK_CMD" ) > "$ITER_CHECK_LOG" 2>&1; CHECK_STATUS=$?; set -e
     echo "    check exit: $CHECK_STATUS"
 
     # 3. Diff for this task so far (vs the task's starting commit)
