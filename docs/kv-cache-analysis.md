@@ -432,6 +432,92 @@ worktree path embeds `RUN_ID`. Pushing those references out (e.g. Rules pointing
 further, but it is rewording rather than reordering and was left out of this
 slice.
 
+## Finding 6 — MEASURED: the premise holds for claude and does **not** hold for codex
+
+Everything above reasons from rendered bytes and provider docs. This section is the
+first end-to-end measurement through the actual CLIs, and it splits the fleet.
+
+Method: one ~12 KB prompt (`B.txt`, ~3,000 tokens of stable rules + a short dynamic
+tail), sent repeatedly to each CLI in its JSON mode, reading the cache fields off the
+response. No harness involved.
+
+### codex — user content is never cached
+
+`codex exec --json` reports usage on `turn.completed`:
+
+```
+{"type":"turn.completed","usage":{"input_tokens":16781,"cached_input_tokens":11008,
+ "cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+```
+
+Sending the **identical** prompt three consecutive times:
+
+| run | input | cached | write | uncached |
+|---|---|---|---|---|
+| 1 | 16,781 | 11,008 | 0 | 5,773 |
+| 2 | 16,781 | 11,008 | 0 | 5,773 |
+| 3 | 16,781 | 11,008 | 0 | 5,773 |
+
+Not a single token of movement. The 11,008 cached tokens are codex's own
+system/tools prefix; **my 3,000-token prompt was never cached and never written**
+(`cache_write_input_tokens: 0` on every call). A separate A/B/C probe — same prefix
+with a different tail, and a prefix perturbed at the very top — produced identically
+flat numbers.
+
+**Consequence: the reorder buys nothing on the codex backend.** The ticket's premise
+("each attempt sends the whole prompt fresh, so a byte-stable static prefix is what
+an implicit prefix cache rewards") does not hold through this CLI.
+
+### claude — user content is fully cached
+
+`claude -p --output-format json`, same prompt twice:
+
+| run | input | `cache_read_input_tokens` | `cache_creation_input_tokens` |
+|---|---|---|---|
+| 1 | 2 | 7,843 | **10,246** |
+| 2 | 2 | **18,089** | 0 |
+
+Run 1 wrote 10,246 tokens (the prompt) to cache; run 2 read 18,089 = 7,843 + 10,246
+back — exactly the sum. The claude CLI places `cache_control` such that the whole
+rendered prompt is cached, so a stable prefix across attempts and runs is directly
+rewarded. **This is where the reorder pays.**
+
+### Measured matrix
+
+| backend | caches user content? | cache field | usage JSON available? |
+|---|---|---|---|
+| `claude` / `rlaude` / `zlaude` | **yes — whole prompt** | `cache_read_input_tokens`, `cache_creation_input_tokens` | `--output-format json` (already used by `RALPH_USAGE`) |
+| `codex` / `codex-readonly` | **no** | `cached_input_tokens`, `cache_write_input_tokens` | **`--json`** (JSONL; usage on `turn.completed`) |
+| `opencode` / `opencode-z` | untested | — | `--format json` exists; fields unverified |
+
+Two corrections to earlier assumptions this forces:
+
+1. **codex and opencode are not "unknown" for measurement.** Both expose a JSON
+   mode; codex's `cached_input_tokens` / `cache_write_input_tokens` are readable
+   today. The measurement slice is far less blocked than #26/#27 assume.
+2. **`prompt_cache_key` is not plumbable.** `codex exec -c prompt_cache_key=…`,
+   `-c cache_key=…`, and `-c prompt_cache.key=…` are all rejected with
+   `unknown configuration field` under `--strict-config` (validated against a
+   known-bad control and a known-good `-c model=`). The string *does* appear in the
+   codex binary, so codex sets it internally — plausibly per thread, which would
+   explain the flat numbers above — but there is no CLI surface for it.
+
+### Caveats
+
+Six paid calls, one account, one model per CLI, `--sandbox read-only`,
+non-interactive. It does not distinguish *why* codex behaves this way (per-thread
+`prompt_cache_key`, request shape, or plan-level behaviour), and opencode/Z.AI is
+untested. Treat the claude and codex rows as solid and the mechanism as open.
+
+### What this means for the shipped reorder
+
+It stays worth having, with a narrower claim: it is the enabling condition on the
+claude family (measurably), it is inert on codex (measurably), it is unverified on
+opencode, and the gate prevents regression on all three. It costs +7.9 % prompt
+size. Given the current role guidance favours codex for building, **the headline
+token win from this slice is smaller than the ticket assumed** until the codex
+behaviour is understood.
+
 ## Sequencing
 
 Per the owner's decision, #32 lands after everything up to and including it. The
