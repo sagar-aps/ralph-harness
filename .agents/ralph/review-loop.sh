@@ -372,7 +372,8 @@ run_backend() {
 run_stage() {
   # run_stage <command> <logfile>  -> returns command exit status. cwd = WORKDIR.
   local cmd="$1" logfile="$2" status
-  ( cd "$WORKDIR" && eval "$cmd" ) >"$logfile" 2>&1
+  # Mark descendants so a ralph spawned by the check skips its own preflight (#35).
+  ( cd "$WORKDIR" && RALPH_IN_PREFLIGHT=1 eval "$cmd" ) >"$logfile" 2>&1
   status=$?
   return "$status"
 }
