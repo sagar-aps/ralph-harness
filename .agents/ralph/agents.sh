@@ -58,6 +58,43 @@ resolve_backend_cmd() {
   esac
 }
 
+# Detect an exhausted provider usage window in a captured backend log. This is
+# deliberately narrower than a generic HTTP 429: the default requires both an
+# explicit usage-limit exhaustion and a reset time. Operators may replace the
+# ERE with RALPH_QUOTA_REGEX for providers that use different terminal wording.
+# On a match, machine-friendly RALPH_QUOTA_* globals are set and persisted when
+# RALPH_QUOTA_ARTIFACT names a run artifact. Returns 0 only on a match.
+ralph_detect_quota_exhaustion() {  # <logfile> [provider_or_pool]
+  local logfile="$1" provider="${2:-unknown}" regex line reset scope observed
+  regex="${RALPH_QUOTA_REGEX:-}"
+  [[ -n "$regex" ]] || regex='usage[[:space:]]+limit[[:space:]]+reached.*reset[[:space:]]+at[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}'
+  [[ -f "$logfile" ]] || return 1
+  line="$(grep -Eim1 "$regex" "$logfile" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 1
+
+  reset="$(printf '%s\n' "$line" | sed -E 's/.*[Rr]eset[[:space:]]+at[[:space:]]+([^]]+).*/\1/' | sed -E 's/[[:space:]]+$//')"
+  [[ "$reset" != "$line" ]] || reset=""
+  scope="$(printf '%s\n' "$line" | sed -E 's/.*[Uu]sage[[:space:]]+limit[[:space:]]+reached([[:space:]]+for)?[[:space:]]*([^.]*)\..*/\2/' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  [[ "$scope" != "$line" ]] || scope=""
+  observed="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  RALPH_QUOTA_PROVIDER="$provider"
+  RALPH_QUOTA_SCOPE="$scope"
+  RALPH_QUOTA_OBSERVED_AT="$observed"
+  RALPH_QUOTA_RESET_AT="$reset"
+  export RALPH_QUOTA_PROVIDER RALPH_QUOTA_SCOPE RALPH_QUOTA_OBSERVED_AT RALPH_QUOTA_RESET_AT
+  if [[ -n "${RALPH_QUOTA_ARTIFACT:-}" ]]; then
+    {
+      echo "STATUS=PROVIDER_QUOTA_EXHAUSTED"
+      echo "PROVIDER=$RALPH_QUOTA_PROVIDER"
+      echo "SCOPE=$RALPH_QUOTA_SCOPE"
+      echo "OBSERVED_AT=$RALPH_QUOTA_OBSERVED_AT"
+      echo "RESET_AT=$RALPH_QUOTA_RESET_AT"
+    } > "$RALPH_QUOTA_ARTIFACT"
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Normalized role agent selection (issue #4): {provider, model, effort} per role.
 #

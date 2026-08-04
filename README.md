@@ -552,6 +552,11 @@ ralph batch \
   errors the **whole batch halts** with `REVIEWER_UNAVAILABLE` / `BUILDER_UNAVAILABLE`
   (exit 4, distinct from `COMPLETED_WITH_FAILURES`), a re-login hint, and a resume
   command. No builder attempt is consumed and the error output is never fed back.
+  A terminal provider window instead halts immediately as
+  `PROVIDER_QUOTA_EXHAUSTED`, recording its provider and reset time. The configurable
+  `RALPH_QUOTA_REGEX` ERE defaults to explicit
+  `usage limit reached ... reset at YYYY-MM-DD HH:MM:SS` responses, so an ordinary
+  transient 429 does not open the circuit breaker.
 - **Task BLOCKED (needs a human).** Beyond PASS/FAIL, the reviewer may vote
   `VERDICT: BLOCKED` when a task is well-defined but not completable *in scope* —
   contradictory/impossible acceptance, needs access or a product decision, or an

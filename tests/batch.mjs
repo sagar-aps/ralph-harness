@@ -397,6 +397,32 @@ console.log("11) builder ERROR (non-zero exit) -> BUILDER_UNAVAILABLE");
   }
 }
 
+console.log("11b) terminal provider quota halts after exactly one invocation");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  const st = stateDir();
+  const calls = path.join(st, "quota-calls");
+  try {
+    const quota = `bash -c 'echo call >> ${calls}; echo "API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-08-03 07:27:58]"; exit 1'`;
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "quota", "--reviewer", "okrev", "--auto-approve-builder", "--max-iterations", "5"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_QUOTA_CMD: quota, AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 4, "quota pause uses infrastructure halt exit 4");
+    check(/PROVIDER_QUOTA_EXHAUSTED/.test(out) && !/BUILDER_UNAVAILABLE/.test(out), "quota has its distinct terminal banner");
+    check(readFileSync(calls, "utf-8").trim().split("\n").length === 1, "exactly ONE provider invocation despite configured retries");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/STATUS=PROVIDER_QUOTA_EXHAUSTED/.test(lastRun), "last-run.env records quota terminal status");
+    check(/PROVIDER_QUOTA_PROVIDER=quota/.test(lastRun), "last-run.env records exhausted provider");
+    check(/PROVIDER_QUOTA_RESET_AT=2026-08-03 07:27:58/.test(lastRun), "last-run.env records reset timestamp");
+    check(!existsSync(path.join(batchRunDir(target), "task-001-iter-1-reviewer.md")), "reviewer is not dispatched after builder quota");
+  } finally {
+    cleanup(target);
+  }
+}
+
 console.log("12) resume skips already-PASSed tasks after a halt");
 {
   const { target } = makeTarget();

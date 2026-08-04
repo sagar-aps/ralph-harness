@@ -373,6 +373,41 @@ console.log("N) builder backend failure halts fast as BUILDER_UNAVAILABLE, not M
   }
 }
 
+console.log("O) quota matcher is configurable and ordinary 429 remains non-terminal");
+{
+  const { target } = makeTarget();
+  try {
+    const custom = ralph(
+      ["review", "1", "--repo", target, "--builder", "customq", "--reviewer", "okrev", "--max-iterations", "5", "--allow-dirty"],
+      {
+        RALPH_WORKTREE_DIR: wtDirFor(target),
+        RALPH_QUOTA_REGEX: "CREDITS GONE UNTIL",
+        AGENT_CUSTOMQ_CMD: 'bash -c "echo CREDITS GONE UNTIL tomorrow; exit 1"',
+        AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""',
+      },
+    );
+    check(/PROVIDER_QUOTA_EXHAUSTED/.test(`${custom.stdout}${custom.stderr}`), "RALPH_QUOTA_REGEX override detects provider-specific wording");
+  } finally {
+    cleanupTarget(target);
+  }
+
+  const { target: transientTarget } = makeTarget();
+  try {
+    const transient = ralph(
+      ["review", "1", "--repo", transientTarget, "--builder", "rate", "--reviewer", "okrev", "--max-iterations", "5", "--allow-dirty"],
+      {
+        RALPH_WORKTREE_DIR: wtDirFor(transientTarget),
+        AGENT_RATE_CMD: 'bash -c "echo HTTP 429 too many requests; exit 1"',
+        AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""',
+      },
+    );
+    const out = `${transient.stdout}${transient.stderr}`;
+    check(/BUILDER_UNAVAILABLE/.test(out) && !/PROVIDER_QUOTA_EXHAUSTED/.test(out), "ordinary 429 follows bounded backend-error handling");
+  } finally {
+    cleanupTarget(transientTarget);
+  }
+}
+
 if (failures) {
   console.error(`\nReview-loop smoke tests FAILED (${failures} assertion failure(s)).`);
   process.exit(1);

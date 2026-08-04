@@ -272,6 +272,8 @@ if [[ "$RESUMING" != "true" ]]; then
   TASKS_DIR="$RUN_DIR/tasks"
   mkdir -p "$TASKS_DIR"
 fi
+RALPH_QUOTA_ARTIFACT="$RUN_DIR/provider-quota.env"
+export RALPH_QUOTA_ARTIFACT
 # Scratch index for WIP snapshots — lives in the run dir (outside the worktree, so it
 # survives cleanup and never shows up in `git status`).
 WIP_INDEX="$RUN_DIR/wip.index"
@@ -628,6 +630,10 @@ run_builder_attempt() {  # <prompt_file> <log_file>
   fi
   for (( i=1; i<=AGENT_ERROR_ATTEMPTS; i++ )); do
     set +e; run_backend "$BUILDER_CMD" "$prompt" "$log"; rc=$?; set -e
+    if ralph_detect_quota_exhaustion "$log" "${BUILDER_PROVIDER:-$BUILDER}"; then
+      QUOTA_ROLE="builder"
+      return 1
+    fi
     [[ "$rc" -eq 0 ]] && return 0
     AGENT_ERROR_EXIT="$rc"
     echo "    builder ERROR (exit=$rc) — invocation $i/$AGENT_ERROR_ATTEMPTS"
@@ -646,6 +652,10 @@ run_reviewer_attempt() {  # <prompt_file> <out_file>
       { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$out"; rc=0
     else
       set +e; run_backend "$REVIEWER_CMD" "$prompt" "$out"; rc=$?; set -e
+      if ralph_detect_quota_exhaustion "$out" "${REVIEWER_PROVIDER:-$REVIEWER}"; then
+        QUOTA_ROLE="reviewer"; REVIEWER_OUTCOME="QUOTA"; VERDICT=""
+        return 1
+      fi
     fi
     v="$(grep -E "$VERDICT_REGEX" "$out" 2>/dev/null | tail -n1 | grep -oE 'PASS|FAIL|BLOCKED' | tail -n1 || true)"
     if [[ "$rc" -eq 0 && -n "$v" ]]; then
@@ -684,6 +694,10 @@ write_last_run() {
     echo "USE_WORKTREE=true"
     echo "WIP_REF=${WIP_REF_LAST:-}"
     echo "WIP_NS=${WIP_REF_NS:-}/${TS:-}"
+    echo "PROVIDER_QUOTA_PROVIDER=${RALPH_QUOTA_PROVIDER:-}"
+    echo "PROVIDER_QUOTA_SCOPE=${RALPH_QUOTA_SCOPE:-}"
+    echo "PROVIDER_QUOTA_OBSERVED_AT=${RALPH_QUOTA_OBSERVED_AT:-}"
+    echo "PROVIDER_QUOTA_RESET_AT=${RALPH_QUOTA_RESET_AT:-}"
   } > "$TARGET_REPO/.ralph/last-run.env"
 }
 
@@ -785,6 +799,7 @@ CONTEXT_FILE="$RUN_DIR/batch-context.md"
 ATTEMPTED=0; COMPLETED=0; FAILED=0; SKIPPED=0; BLOCKED_COUNT=0
 STOPPED_EARLY="false"
 AGENT_ERROR_ROLE=""        # "builder" | "reviewer" when an unrecoverable ERROR halts the batch
+QUOTA_ROLE=""
 AGENT_ERROR_EXIT=""
 HALTED_TASK=""
 
@@ -921,7 +936,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     cp "$ITER_HANDOFF" "$HANDOFF_SNAP" 2>/dev/null || true
     cp "$ITER_REVIEWER_OUT" "$REVIEWER_OUT" 2>/dev/null || true
 
-    if [[ "$REVIEWER_OUTCOME" == "ERROR" ]]; then
+    if [[ "$REVIEWER_OUTCOME" == "ERROR" || "$REVIEWER_OUTCOME" == "QUOTA" ]]; then
       # Harness-detected reviewer failure (bad exit / no VERDICT). Do NOT consume a
       # builder attempt and do NOT feed the error output back — halt the batch.
       AGENT_ERROR_ROLE="reviewer"; HALTED_TASK="$IDX"
@@ -1055,7 +1070,8 @@ fi
 # An unrecoverable agent ERROR is its OWN terminal state, distinct from
 # COMPLETED_WITH_FAILURES (which means tasks ran and some failed review).
 if [[ -n "$AGENT_ERROR_ROLE" ]]; then
-  if [[ "$AGENT_ERROR_ROLE" == "reviewer" ]]; then OUTCOME="REVIEWER_UNAVAILABLE"
+  if [[ -n "$QUOTA_ROLE" ]]; then OUTCOME="PROVIDER_QUOTA_EXHAUSTED"
+  elif [[ "$AGENT_ERROR_ROLE" == "reviewer" ]]; then OUTCOME="REVIEWER_UNAVAILABLE"
   else OUTCOME="BUILDER_UNAVAILABLE"; fi
 elif [[ "$STOPPED_EARLY" == "true" ]]; then
   OUTCOME="STOPPED_ON_FAIL"
@@ -1210,8 +1226,13 @@ echo "  Worktree:  $WORKDIR"
 echo "  Report:    $REPORT"
 if [[ -n "$AGENT_ERROR_ROLE" ]]; then
   agent_name="$([[ "$AGENT_ERROR_ROLE" == reviewer ]] && echo "$REVIEWER" || echo "$BUILDER")"
-  echo "  ⚠ Halted: $AGENT_ERROR_ROLE backend ($agent_name) unavailable after $AGENT_ERROR_ATTEMPTS attempts (last exit ${AGENT_ERROR_EXIT:-?})."
-  echo "  Re-authenticate that CLI, then resume (completed tasks are skipped):"
+  if [[ -n "$QUOTA_ROLE" ]]; then
+    echo "  ⏸ PROVIDER_QUOTA_EXHAUSTED — $QUOTA_ROLE provider '$RALPH_QUOTA_PROVIDER' paused${RALPH_QUOTA_RESET_AT:+ until $RALPH_QUOTA_RESET_AT}."
+    echo "  After the provider recovers, resume (completed tasks are skipped):"
+  else
+    echo "  ⚠ Halted: $AGENT_ERROR_ROLE backend ($agent_name) unavailable after $AGENT_ERROR_ATTEMPTS attempts (last exit ${AGENT_ERROR_EXIT:-?})."
+    echo "  Re-authenticate that CLI, then resume (completed tasks are skipped):"
+  fi
   echo "    ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
   echo "═══════════════════════════════════════════════════════"
   exit 4

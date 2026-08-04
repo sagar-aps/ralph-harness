@@ -155,6 +155,8 @@ fi
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 RUN_DIR="$TARGET_REPO/.ralph/runs/$RUN_ID"
 mkdir -p "$RUN_DIR"
+RALPH_QUOTA_ARTIFACT="$RUN_DIR/provider-quota.env"
+export RALPH_QUOTA_ARTIFACT
 
 # ---- Preflight (repo contract) — block before any worktree/agent ------------
 if ! bash "$SCRIPT_DIR/preflight.sh" "$TARGET_REPO" "$RUN_DIR/preflight.md"; then
@@ -390,6 +392,10 @@ write_last_run() {
     echo "ARTIFACTS_DIR=$RUN_DIR"
     echo "TARGET_REPO=$TARGET_REPO"
     echo "USE_WORKTREE=$USE_WORKTREE"
+    echo "PROVIDER_QUOTA_PROVIDER=${RALPH_QUOTA_PROVIDER:-}"
+    echo "PROVIDER_QUOTA_SCOPE=${RALPH_QUOTA_SCOPE:-}"
+    echo "PROVIDER_QUOTA_OBSERVED_AT=${RALPH_QUOTA_OBSERVED_AT:-}"
+    echo "PROVIDER_QUOTA_RESET_AT=${RALPH_QUOTA_RESET_AT:-}"
   } > "$TARGET_REPO/.ralph/last-run.env"
 }
 
@@ -475,6 +481,7 @@ ITERS_RUN=0
 BUILDER_ERROR=0
 PREVIEW_STARTED="false"
 PREVIEW_KEPT="false"
+QUOTA_ROLE=""
 LAST_PREVIEW_UP_LOG=""; LAST_E2E_LOG=""
 
 for i in $(seq 1 "$MAX_ITERATIONS"); do
@@ -511,6 +518,11 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     git -C "$WORKDIR" commit -qm "ralph dry-run iter $i" >/dev/null 2>&1 || true
   else
     set +e; run_backend "$BUILDER_CMD" "$BUILDER_PROMPT_R" "$BUILDER_LOG"; BUILDER_RC=$?; set -e
+    if ralph_detect_quota_exhaustion "$BUILDER_LOG" "${BUILDER_PROVIDER:-$BUILDER}"; then
+      QUOTA_ROLE="builder"; OUTCOME="PROVIDER_QUOTA_EXHAUSTED"
+      echo "Provider quota exhausted for '$RALPH_QUOTA_PROVIDER'${RALPH_QUOTA_RESET_AT:+; reset at $RALPH_QUOTA_RESET_AT} — halting immediately." >&2
+      break
+    fi
     if [[ "$BUILDER_RC" -ne 0 ]]; then
       # #37: a non-zero builder exit is a BACKEND error (crash, quota, argv-too-long) —
       # not work for the reviewer to judge. Fail fast with the reason instead of running
@@ -584,7 +596,12 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
   if [[ "$DRY_RUN" == "1" ]]; then
     { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$REVIEWER_OUT"
   else
-    set +e; run_backend "$REVIEWER_CMD" "$REVIEWER_PROMPT_R" "$REVIEWER_OUT"; set -e
+    set +e; run_backend "$REVIEWER_CMD" "$REVIEWER_PROMPT_R" "$REVIEWER_OUT"; REVIEWER_RC=$?; set -e
+    if ralph_detect_quota_exhaustion "$REVIEWER_OUT" "${REVIEWER_PROVIDER:-$REVIEWER}"; then
+      QUOTA_ROLE="reviewer"; OUTCOME="PROVIDER_QUOTA_EXHAUSTED"
+      echo "Provider quota exhausted for '$RALPH_QUOTA_PROVIDER'${RALPH_QUOTA_RESET_AT:+; reset at $RALPH_QUOTA_RESET_AT} — halting immediately." >&2
+      break
+    fi
   fi
 
   # 7. Parse verdict (last matching line wins)
@@ -628,6 +645,8 @@ if [[ "$OUTCOME" == "READY_FOR_HUMAN_REVIEW" ]]; then
   echo "  ✅ READY_FOR_HUMAN_REVIEW (after $ITERS_RUN iteration(s))"
 elif [[ "$OUTCOME" == "BUILDER_UNAVAILABLE" ]]; then
   echo "  ❌ BUILDER_UNAVAILABLE — builder backend '$BUILDER' failed (exit ${BUILDER_RC:-?}); halted after $ITERS_RUN iteration(s)."
+elif [[ "$OUTCOME" == "PROVIDER_QUOTA_EXHAUSTED" ]]; then
+  echo "  ⏸ PROVIDER_QUOTA_EXHAUSTED — $QUOTA_ROLE provider '$RALPH_QUOTA_PROVIDER' paused${RALPH_QUOTA_RESET_AT:+ until $RALPH_QUOTA_RESET_AT}."
 else
   echo "  ❌ $OUTCOME (after $ITERS_RUN iteration(s))"
 fi
