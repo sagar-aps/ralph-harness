@@ -419,6 +419,15 @@ console.log("11b) terminal provider quota halts after exactly one invocation");
     const sourced = spawnSync("bash", ["-c", '. "$1"; printf "%s|%s|%s" "$PROVIDER_QUOTA_PROVIDER" "$PROVIDER_QUOTA_SCOPE" "$PROVIDER_QUOTA_RESET_AT"', "bash", path.join(target, ".ralph", "last-run.env")], { encoding: "utf-8" });
     check(sourced.status === 0 && sourced.stdout === "quota|5 hour|2026-08-03 07:27:58", "last-run.env is safely sourceable and preserves spaced metadata");
     check(!existsSync(path.join(batchRunDir(target), "task-001-iter-1-reviewer.md")), "reviewer is not dispatched after builder quota");
+    const usageLines = out.split("\n").filter((line) => line.startsWith("USAGE "));
+    check(usageLines.length === 1, "quota-blocked round emits exactly one USAGE line");
+    check(/builder_attempts=0 reviewer_attempts=0 quota_rejected=1/.test(usageLines[0] || ""),
+      "quota rejection is counted separately and not as a productive builder attempt");
+    check(/input=unknown output=unknown cached=unknown total=unknown/.test(usageLines[0] || ""),
+      "quota-only round reports unavailable token totals as unknown");
+    const usageRecord = JSON.parse(readFileSync(path.join(batchRunDir(target), "round-usage.jsonl"), "utf-8").trim());
+    check(usageRecord.invocations.quota_rejected === 1 && usageRecord.invocations.builder_attempts === 0,
+      "machine-readable quota counts preserve the same separation");
   } finally {
     cleanup(target);
   }

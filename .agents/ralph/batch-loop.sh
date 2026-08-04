@@ -37,6 +37,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/config.sh"; }
 [[ -f "$SCRIPT_DIR/review-config.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/review-config.sh"; }
+[[ -f "$SCRIPT_DIR/round-usage.sh" ]] && { # shellcheck source=/dev/null
+  . "$SCRIPT_DIR/round-usage.sh"; }
 # Untracked local overrides (gitignored) — sourced LAST so they win. Copy
 # config.local.sh.example to config.local.sh to define/override backends & roles.
 # RALPH_NO_LOCAL_CONFIG=1 skips it — used by the test suite so a developer's machine
@@ -204,6 +206,10 @@ BUILDER_CMD="$(builder_cmd_for "$BUILDER")"
 REVIEWER_CMD="$(reviewer_cmd_for "$REVIEWER")"
 [[ -n "$BUILDER_CMD" ]] || die "Unknown builder backend: $BUILDER"
 [[ -n "$REVIEWER_CMD" ]] || die "Unknown reviewer backend: $REVIEWER"
+BUILDER_REQUESTED_MODEL="${BUILDER_MODEL:-$(ralph_command_model_values "$BUILDER_CMD" | head -n1)}"
+REVIEWER_REQUESTED_MODEL="${REVIEWER_MODEL:-$(ralph_command_model_values "$REVIEWER_CMD" | head -n1)}"
+BUILDER_REQUESTED_MODEL="${BUILDER_REQUESTED_MODEL:-default}"
+REVIEWER_REQUESTED_MODEL="${REVIEWER_REQUESTED_MODEL:-default}"
 
 # RALPH_USAGE=1 makes agents emit machine-readable usage so run_backend can capture
 # per-attempt tokens/cost. Two families are supported, each with its own flag and its
@@ -758,8 +764,11 @@ run_builder_attempt() {  # <prompt_file> <log_file>
     return 0
   fi
   for (( i=1; i<=AGENT_ERROR_ATTEMPTS; i++ )); do
+    ROUND_BUILDER_ATTEMPTS=$((ROUND_BUILDER_ATTEMPTS + 1))
     set +e; run_backend "$BUILDER_CMD" "$prompt" "$log"; rc=$?; set -e
     if ralph_detect_quota_exhaustion "$log" "$provider" "$pool"; then
+      ROUND_BUILDER_ATTEMPTS=$((ROUND_BUILDER_ATTEMPTS - 1))
+      ROUND_QUOTA_REJECTED=$((ROUND_QUOTA_REJECTED + 1))
       QUOTA_ROLE="builder"
       return 1
     fi
@@ -785,8 +794,11 @@ run_reviewer_attempt() {  # <prompt_file> <out_file>
     if [[ "$DRY_RUN" == "1" ]]; then
       { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$out"; rc=0
     else
+      ROUND_REVIEWER_ATTEMPTS=$((ROUND_REVIEWER_ATTEMPTS + 1))
       set +e; run_backend "$REVIEWER_CMD" "$prompt" "$out"; rc=$?; set -e
       if ralph_detect_quota_exhaustion "$out" "$provider" "$pool"; then
+        ROUND_REVIEWER_ATTEMPTS=$((ROUND_REVIEWER_ATTEMPTS - 1))
+        ROUND_QUOTA_REJECTED=$((ROUND_QUOTA_REJECTED + 1))
         QUOTA_ROLE="reviewer"; REVIEWER_OUTCOME="QUOTA"; VERDICT=""
         return 1
       fi
@@ -828,6 +840,7 @@ write_last_run() {
     echo "USE_WORKTREE=true"
     echo "WIP_REF=${WIP_REF_LAST:-}"
     echo "WIP_NS=${WIP_REF_NS:-}/${TS:-}"
+    echo "ROUND_USAGE_FILE=$RUN_DIR/round-usage.jsonl"
     ralph_env_assignment PROVIDER_QUOTA_PROVIDER "${RALPH_QUOTA_PROVIDER:-}"
     ralph_env_assignment PROVIDER_QUOTA_CREDENTIAL_POOL "${RALPH_QUOTA_CREDENTIAL_POOL:-}"
     ralph_env_assignment PROVIDER_QUOTA_SCOPE "${RALPH_QUOTA_SCOPE:-}"
@@ -981,6 +994,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   # to the builder, until check passes AND the reviewer says PASS, or we run out
   # of attempts. Mirrors `ralph review`, but the task is committed once at the end.
   TASK_STATUS="FAIL"; ITERS_USED=0; VERIFY_STATUS=""
+  ROUND_BUILDER_ATTEMPTS=0; ROUND_REVIEWER_ATTEMPTS=0; ROUND_QUOTA_REJECTED=0
   PREV_REVIEW=""; PREV_CHECK=""; PREV_VERIFY=""
   # Final-iteration artifacts (the result file points at these).
   DIFF_PATCH="$RUN_DIR/task-$IDX-diff.patch"
@@ -1127,6 +1141,9 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     PREV_REVIEW="$ITER_REVIEWER_FB"; PREV_CHECK="$ITER_CHECK_LOG"
     [[ "$ITER" -lt "$MAX_ITERATIONS" ]] && echo "    not passing — retrying with feedback"
   done
+
+  ralph_round_usage_line "$RUN_DIR" "$IDX" "$ROUND_BUILDER_ATTEMPTS" \
+    "$ROUND_REVIEWER_ATTEMPTS" "$ROUND_QUOTA_REJECTED"
 
   # Unrecoverable agent (builder/reviewer) ERROR → halt: do not commit, do not
   # count this task as PASS/FAIL.

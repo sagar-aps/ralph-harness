@@ -94,8 +94,8 @@ console.log("1) JSON agent output → .result extracted, verdict parsed (no ERRO
       {
         RALPH_AGENT_RETRY_DELAY: "0",
         RALPH_WORKTREE_DIR: wtBase(target),
-        AGENT_BJSON_CMD: bJson,
-        AGENT_RJSON_CMD: rJson,
+        AGENT_BJSON_CMD: `${bJson} --model fixture-builder-model`,
+        AGENT_RJSON_CMD: `${rJson} --model fixture-reviewer-model`,
       },
     );
     const out = `${r.stdout}${r.stderr}`;
@@ -109,6 +109,26 @@ console.log("1) JSON agent output → .result extracted, verdict parsed (no ERRO
     const bldSide = path.join(rd, "task-001-iter-1-builder.usage.json");
     check(existsSync(revSide), "reviewer usage sidecar written (task-001-iter-1-reviewer.usage.json)");
     check(existsSync(bldSide), "builder usage sidecar written (task-001-iter-1-builder.usage.json)");
+    const usageLines = out.split("\n").filter((line) => line.startsWith("USAGE "));
+    check(usageLines.length === 1, "round emits exactly one always-on USAGE line");
+    check(/^USAGE timestamp=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z /.test(usageLines[0] || ""),
+      "USAGE line begins with an ISO-8601 timestamp");
+    check(/builder_provider=bjson builder_model=fixture-builder-model reviewer_provider=rjson reviewer_model=fixture-reviewer-model roles=builder,reviewer/.test(usageLines[0] || ""),
+      "USAGE line identifies both providers, requested models, and roles");
+    check(/builder_attempts=1 reviewer_attempts=1 quota_rejected=0/.test(usageLines[0] || ""),
+      "USAGE line records productive invocation counts separately from quota rejection");
+    check(/input=223 output=65 cached=15 total=303/.test(usageLines[0] || ""),
+      "USAGE line aggregates token totals from both sidecars");
+    const roundUsage = path.join(rd, "round-usage.jsonl");
+    check(existsSync(roundUsage), "machine-readable round usage artifact is persisted");
+    if (existsSync(roundUsage)) {
+      const records = readFileSync(roundUsage, "utf-8").trim().split("\n").map(JSON.parse);
+      check(records.length === 1 && records[0].round === "task-001", "artifact contains exactly one record for the round");
+      check(records[0].tokens.total === 303 && records[0].invocations.builder_attempts === 1,
+        "artifact preserves numeric token and invocation totals");
+    }
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/ROUND_USAGE_FILE=.*round-usage\.jsonl/.test(lastRun), "last-run.env points to the usage artifact");
     if (existsSync(revSide)) {
       const u = JSON.parse(readFileSync(revSide, "utf-8"));
       check(u.input === 123 && u.output === 45 && u.cache_read === 10 && u.cache_creation === 5,
