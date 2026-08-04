@@ -651,7 +651,51 @@ console.log("16) --verify acceptance gate runs at PASS-time and can force anothe
   }
 }
 
-console.log("17) --primer injects orchestrator orientation into the builder prompt");
+console.log("17) no-primer warning distinguishes misconfiguration, opt-out, and a real primer");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const commonEnv = {
+      RALPH_DRY_RUN: "1",
+      RALPH_WORKTREE_DIR: wtBase(target),
+      AGENT_FB_CMD: FB,
+      AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""',
+    };
+    const args = ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev", "--auto-approve-builder"];
+    const warned = ralph(args, commonEnv);
+    const warnedOut = `${warned.stdout}${warned.stderr}`;
+    const warnedRun = batchRunDir(target);
+    check(warned.status === 0, "no-primer warning is a soft guard (batch still exits 0)");
+    check(/WARNING: Builder is running WITHOUT a repo primer/.test(warnedOut), "unset primer is visibly warned about in batch output");
+    check(/Resolution chain checked: RALPH_PRIMER_FILE, then ralph\.target\.json \.primer/.test(warnedOut), "warning names the primer resolution chain");
+    check(/WITHOUT a repo primer/.test(readFileSync(path.join(warnedRun, "preflight.md"), "utf-8")), "preflight artifact records the warning");
+    check(/WITHOUT a repo primer/.test(readFileSync(path.join(warnedRun, "final-report.md"), "utf-8")), "final report records the warning");
+
+    cleanup(target);
+  } finally {
+    if (existsSync(target)) cleanup(target);
+  }
+}
+
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const optedOut = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev", "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target), RALPH_PRIMER_OPTOUT: "1", AGENT_FB_CMD: FB, AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const optedOutText = `${optedOut.stdout}${optedOut.stderr}${readFileSync(path.join(batchRunDir(target), "preflight.md"), "utf-8")}${readFileSync(path.join(batchRunDir(target), "final-report.md"), "utf-8")}`;
+    check(optedOut.status === 0, "explicit no-primer opt-out batch exits 0");
+    check(!/WARNING: Builder is running WITHOUT a repo primer/.test(optedOutText), "RALPH_PRIMER_OPTOUT=1 silences the warning everywhere");
+    check(/deliberate opt-out|deliberately disabled/.test(optedOutText), "output records that no-primer mode was deliberate");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("17b) --primer injects orchestrator orientation into the builder prompt");
 {
   const { target } = makeTarget();
   const plan = twoTaskPlan();
@@ -671,6 +715,8 @@ console.log("17) --primer injects orchestrator orientation into the builder prom
     const rd = path.join(runsRoot, dirs[dirs.length - 1]);
     const prompt = readFileSync(path.join(rd, "task-001-iter-1-builder-prompt.md"), "utf-8");
     check(prompt.includes(SENTINEL), "primer text is rendered into the builder prompt ({{PRIMER}})");
+    const allOutput = `${out}${readFileSync(path.join(rd, "preflight.md"), "utf-8")}${readFileSync(path.join(rd, "final-report.md"), "utf-8")}`;
+    check(!/WARNING: Builder is running WITHOUT a repo primer/.test(allOutput), "real non-empty primer emits no warning");
   } finally {
     cleanup(target);
     rmSync(primerDir, { recursive: true, force: true });

@@ -548,7 +548,10 @@ ralph batch \
   `{{PRIMER}}` slot at the top of every builder prompt (run-scoped; no need to edit
   the target's `AGENTS.md`). Use it to inject a repo map / conventions / "where to
   look" so the builder doesn't re-derive structure each attempt. Also settable as
-  `ralph.target.json` `.primer` (path relative to the target repo).
+  `ralph.target.json` `.primer` (path relative to the target repo). An unset,
+  missing, or empty primer emits a soft warning in the banner, preflight artifact,
+  and final report but does not stop the batch. For an intentional no-primer run,
+  set `RALPH_PRIMER_OPTOUT=1` to silence the warning and record the deliberate opt-out.
 - **Agent ERROR vs task FAIL.** A *task* FAIL means the reviewer voted FAIL / checks
   failed. An *agent* ERROR is a tooling outage the harness detects — the backend
   exits non-zero, or the reviewer emits no `VERDICT:` line (a missing verdict is

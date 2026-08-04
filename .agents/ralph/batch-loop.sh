@@ -120,9 +120,25 @@ CHECK_CMD="${CHECK_CMD:-${cfg_check:-./scripts/check.sh}}"
 # fast check passed AND the reviewer approved). Empty = disabled (today's behavior).
 VERIFY_CMD="${VERIFY_CMD:-${cfg_verify:-}}"
 # Orchestrator-supplied repo primer injected into every builder prompt as {{PRIMER}}.
-# A file path; relative paths resolve against the target repo. Empty = no primer.
+# A file path; relative paths resolve against the target repo. Deliberate no-primer
+# runs must set RALPH_PRIMER_OPTOUT=1; otherwise an unusable primer is warned about.
 PRIMER_FILE="${RALPH_PRIMER_FILE:-${cfg_primer:-}}"
 if [[ -n "$PRIMER_FILE" && "$PRIMER_FILE" != /* ]]; then PRIMER_FILE="$TARGET_REPO/$PRIMER_FILE"; fi
+PRIMER_STATUS="loaded"
+PRIMER_WARNING=""
+if [[ "${RALPH_PRIMER_OPTOUT:-}" == "1" ]]; then
+  PRIMER_STATUS="deliberate-opt-out"
+  PRIMER_FILE=""
+elif [[ -z "$PRIMER_FILE" ]]; then
+  PRIMER_STATUS="unset"
+  PRIMER_WARNING="WARNING: Builder is running WITHOUT a repo primer (probable misconfiguration). Resolution chain checked: RALPH_PRIMER_FILE, then ralph.target.json .primer. Set RALPH_PRIMER_OPTOUT=1 to deliberately run without one."
+elif [[ ! -f "$PRIMER_FILE" ]]; then
+  PRIMER_STATUS="missing"
+  PRIMER_WARNING="WARNING: Builder is running WITHOUT a repo primer because the resolved file is missing: $PRIMER_FILE. Resolution chain checked: RALPH_PRIMER_FILE, then ralph.target.json .primer. Set RALPH_PRIMER_OPTOUT=1 to deliberately run without one."
+elif ! grep -q '[^[:space:]]' "$PRIMER_FILE"; then
+  PRIMER_STATUS="empty"
+  PRIMER_WARNING="WARNING: Builder is running WITHOUT a repo primer because the resolved file is empty: $PRIMER_FILE. Resolution chain checked: RALPH_PRIMER_FILE, then ralph.target.json .primer. Set RALPH_PRIMER_OPTOUT=1 to deliberately run without one."
+fi
 export R_PRIMER_FILE="$PRIMER_FILE"
 MAX_TASKS="${MAX_TASKS:-0}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5}"   # per-task builder/reviewer attempts (verdict loop)
@@ -296,7 +312,20 @@ export RALPH_QUOTA_ARTIFACT
 WIP_INDEX="$RUN_DIR/wip.index"
 
 # ---- Preflight (repo contract) — block before any worktree/agent ------------
+PREFLIGHT_OK="true"
 if ! bash "$SCRIPT_DIR/preflight.sh" "$TARGET_REPO" "$RUN_DIR/preflight.md"; then
+  PREFLIGHT_OK="false"
+fi
+if [[ -n "$PRIMER_WARNING" ]]; then
+  {
+    echo ""
+    echo "## ⚠ Repo primer warning"
+    echo ""
+    echo "$PRIMER_WARNING"
+  } >> "$RUN_DIR/preflight.md"
+  echo "⚠⚠ $PRIMER_WARNING"
+fi
+if [[ "$PREFLIGHT_OK" != "true" ]]; then
   mkdir -p "$TARGET_REPO/.ralph"
   {
     echo "RUN_ID=batch-$TS"; echo "STATUS=PREFLIGHT_FAILED"; echo "BRANCH="
@@ -845,6 +874,7 @@ on_interrupt() {
   echo "CHECK_CMD=$CHECK_CMD"
   echo "VERIFY_CMD=$VERIFY_CMD"
   echo "PRIMER_FILE=$PRIMER_FILE"
+  echo "PRIMER_STATUS=$PRIMER_STATUS"
   echo "AUTO_APPROVE_BUILDER=$AUTO_APPROVE_BUILDER"
   echo "STOP_ON_FAIL=$STOP_ON_FAIL"
   echo "ALLOW_DIRTY=$ALLOW_DIRTY"
@@ -878,12 +908,19 @@ echo "  builder:       $BUILDER   -> $BUILDER_CMD"
 echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
 echo "  check:         $CHECK_CMD"
 echo "  verify:        ${VERIFY_CMD:-(none)}"
-echo "  primer:        ${PRIMER_FILE:-(none)}"
+if [[ "$PRIMER_STATUS" == "deliberate-opt-out" ]]; then
+  echo "  primer:        (none; deliberate opt-out via RALPH_PRIMER_OPTOUT=1)"
+else
+  echo "  primer:        ${PRIMER_FILE:-(none)}"
+fi
 echo "  max attempts/task: $MAX_ITERATIONS   agent-error retries: $AGENT_RETRIES   resume: $RESUMING"
 echo "  auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
 echo "  preview:       $PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  (url after batch: $RALPH_PREVIEW_URL)}"
 echo "  artifacts:     $RUN_DIR"
 echo "═══════════════════════════════════════════════════════"
+if [[ -n "$PRIMER_WARNING" ]]; then
+  echo "  ⚠⚠ $PRIMER_WARNING"
+fi
 if [[ "$AUTO_APPROVE_BUILDER" == "true" ]]; then
   echo "  NOTE: --auto-approve-builder is ON — the BUILDER runs with permission-skipping"
   echo "        flags so it can edit unattended. The REVIEWER stays read-only."
@@ -1214,6 +1251,13 @@ REPORT="$RUN_DIR/final-report.md"
   echo "- Builder: $BUILDER  |  Reviewer: $REVIEWER (read-only)"
   echo "- Auto-approve builder: $AUTO_APPROVE_BUILDER  |  Stop-on-fail: $STOP_ON_FAIL"
   echo "- Check command: $CHECK_CMD"
+  if [[ "$PRIMER_STATUS" == "deliberate-opt-out" ]]; then
+    echo "- Repo primer: deliberately disabled (RALPH_PRIMER_OPTOUT=1)"
+  elif [[ -n "$PRIMER_WARNING" ]]; then
+    echo "- Repo primer: unavailable ($PRIMER_STATUS)"
+  else
+    echo "- Repo primer: $PRIMER_FILE"
+  fi
   echo "- Tasks attempted: $ATTEMPTED of $TASK_TOTAL (completed: $COMPLETED, failed: $FAILED, blocked: $BLOCKED_COUNT, skipped-on-resume: $SKIPPED)"
   if [[ "$PREVIEW_RAN" == "true" ]]; then
     echo "- Preview: ${PREVIEW_UP_OK:+up=$PREVIEW_UP_OK }${E2E_OK:+e2e=$E2E_OK }URL=$RALPH_PREVIEW_URL"
@@ -1221,6 +1265,12 @@ REPORT="$RUN_DIR/final-report.md"
     echo "- Preview: skipped (batch halted on $AGENT_ERROR_ROLE error)"
   else
     echo "- Preview: disabled"
+  fi
+  if [[ -n "$PRIMER_WARNING" ]]; then
+    echo ""
+    echo "## ⚠ Repo primer warning"
+    echo ""
+    echo "$PRIMER_WARNING"
   fi
   if [[ -n "$AGENT_ERROR_ROLE" ]]; then
     echo ""
