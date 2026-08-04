@@ -13,15 +13,22 @@ Two corpora, used for different things.
 aug02   19 run dirs, BUILDER=codex / REVIEWER=codex-readonly, TASK_TOTAL=1
         32 builder prompts, of which 2 usable consecutive iter-1→iter-2 pairs
 aug0304  9 run dirs, BUILDER=zlaude|claude-sonnet / REVIEWER=zlaude-haiku|claude-haiku
-        9 builder prompts, all iter-1 only — every run died at
-        `API Error: Request rejected (429) · Usage limit reached for 5 hour`
-        (issue #28). Paths are /Users/…/Memorix/worktrees/… — the mac install.
+        9 builder prompts, all iter-1 only. 7 of 9 outcome READY_FOR_HUMAN_REVIEW
+        with per-task PASS / "1 of 3" / verdict PASS — i.e. the builder succeeded
+        on the first attempt, so no second attempt was ever rendered.
+        2 of 9 outcome BUILDER_UNAVAILABLE (batch-20260804-031528-34422,
+        claude-sonnet; batch-20260804-034444-45159, zlaude — the latter's log
+        carries `429 · Usage limit reached for 5 hour`).
+        Paths are /Users/…/Memorix/worktrees/… — the mac install.
 ```
 
 These confirm the diagnosis directly and supply the cross-run measurement. They
-cannot supply a deep multi-task iteration ceiling: all aug02 runs are
-`TASK_TOTAL=1`, so `ACCUMULATED_CONTEXT` is always `(this is the first task)`,
-and the zlaude runs produced no second iteration to compare.
+cannot supply a cross-attempt ceiling — but for a benign reason: **these runs
+passed first try.** That is a workload characteristic, not a failure, and it
+changes where the caching prize actually is (Finding 4).
+
+All aug02 runs are `TASK_TOTAL=1` too, so `ACCUMULATED_CONTEXT` never accumulates
+anywhere in the August corpus.
 
 **Secondary — for the multi-task ceiling only:**
 
@@ -217,6 +224,46 @@ Multi-install naming is already handled — `batch-loop.sh:198` defines
 (mac) and `rlaude` (here) are both recognized. Any cache-metric work must key
 off that variable, never a hardcoded `claude`.
 
+## Finding 4 — the reorder helps batching; it cannot help the small mac runs
+
+Because 7 of 9 aug0304 runs passed on attempt 1, cross-*attempt* reuse is not
+where their tokens go. The reuse opportunity for that workload shape is
+cross-*run*: 9 runs against the same repo, same rules, same plan directory, each
+starting cold.
+
+Simulating the fix on those 9 prompts — hoisting the whole `## Context` block to
+the end and recomputing the common prefix across runs:
+
+| | common prefix across the 9 runs |
+|---|---|
+| today | 817 B (~204 tok) |
+| after reorder | 1205 B (~301 tok) |
+
+Still nowhere near the 1024-token minimum. The reason is a hard budget ceiling:
+these prompts are only **6.8–7.5 KB total**, and the genuinely stable sections
+add up to about 3.4 KB ≈ 860 tokens (`Rules` 1229 B, `Observations` 705 B,
+`BLOCKED` 575 B, `Steps` 387 B, `If blocked` 334 B, `Verification` 169 B). Even a
+perfect reorder that hoisted every dynamic byte would land under 1024 tokens —
+clearing only Opus 5's 512-token minimum, and nothing else in the fleet.
+
+**So the reorder's value is confined to the batching workload**, where prompts
+run 4.5–205 KB and `ACCUMULATED_CONTEXT` alone reaches ~15 KB. For the small
+single-task runs, caching is structurally unavailable at any ordering.
+
+Two things fall out of this that are worth acting on independently:
+
+1. **`{{PRIMER}}` is empty.** In these runs `## Repo primer (orientation — read
+   first)` is **23 bytes** — the `(no primer provided)` fallback. That is the one
+   lever that could add stable bulk to the front of every prompt on every
+   backend. Populating it would improve builder grounding *and* is the cheapest
+   path to pushing small-run prompts over the cacheable threshold. It needs no
+   template change at all — just `R_PRIMER_FILE`.
+2. **`RUN_ID` leaks in a second place.** After hoisting `## Context`, the next
+   divergence is at byte 1205, inside the accumulated-context header:
+   `Branch: ralph/batch-<RUN_ID>  |  Plan: /Users/…/.plans-<TIMESTAMP>-managed/…`.
+   Fixing only the `## Context` block leaves this one, so the reorder must cover
+   both or cross-run reuse stays broken.
+
 ## Measurement: what is actually reportable
 
 | provider / CLI | cache field | how to get it | verdict |
@@ -264,17 +311,23 @@ no provider spend. Two adjustments:
 Per the owner's decision, #32 lands after everything up to and including it. The
 evidence supports that ordering, and the archives sharpen why:
 
-- **#28 (provider quota circuit-break) is the binding constraint on measurement.**
-  All 9 aug0304 runs died at `429 · Usage limit reached for 5 hour` after
-  producing exactly one builder prompt and no output. You cannot observe a cache
-  hit across attempts when the run never reaches attempt 2.
-- **#35 / #33** (preflight fork-bomb, no-backoff hot loop) are what killed the
-  local runs — 418 dirs at exit 137.
 - **#26 / #27** own the reporting surface where cache metrics would display.
+- **#35 / #33** (preflight fork-bomb, no-backoff hot loop) are what killed the
+  local Linux runs — 418 dirs at exit 137 — so a local end-to-end measurement
+  needs them first. The mac runs were unaffected.
+- **#28 is _not_ a blocker here.** 7 of 9 aug0304 runs completed
+  READY_FOR_HUMAN_REVIEW; only 2 hit BUILDER_UNAVAILABLE, one of them on a 429.
+  Quota is a real cost concern but it is not what stands between us and a cache
+  measurement.
 
-The reorder itself is independent of all of them and is testable offline with no
-provider spend, so it can land whenever its slot comes up; only the measurement
-leg waits.
+What actually gates the measurement leg is workload shape, not any of the above:
+a cache hit needs a ≥1024-token stable prefix, and per Finding 4 the small
+single-task runs cannot produce one. **Measure on a multi-task batch run with
+`RALPH_USAGE=1` and a non-empty primer**, on `claude`/`rlaude` against real
+Anthropic. Anything smaller will report zero and prove nothing.
+
+The reorder itself is independent of all of it and testable offline with no
+provider spend, so it can land whenever its slot comes up.
 
 The PREVIOUS_REVIEW capture defect (Finding 2) is worth splitting into its own
 ticket. It is a larger token win than the caching reorder, it is independent of
