@@ -569,6 +569,13 @@ ralph batch \
   `RALPH_REVIEWER_CREDENTIAL_POOL` when backend names share credentials. Open pools
   are skipped for the rest of the run; unrelated pools remain dispatchable, and a
   parsed elapsed reset time closes the circuit automatically.
+- **Proactive token ceiling.** Set `RALPH_ORCHESTRATOR_BUDGET_TOKENS` to stop the
+  batch cleanly once cumulative builder+reviewer usage reaches that value. An
+  optional `RALPH_ORCHESTRATOR_STOP_PCT` (default `100`) applies a percentage to
+  the ceiling. The completed round's usage is flushed first, then the batch ends as
+  `ORCHESTRATOR_BUDGET_REACHED` with the configured budget, percentage, observed
+  total, and unknown-round count in `last-run.env` and the terminal banner. Unknown
+  totals count as zero without being replaced; with no budget the feature is off.
 - **Task BLOCKED (needs a human).** Beyond PASS/FAIL, the reviewer may vote
   `VERDICT: BLOCKED` when a task is well-defined but not completable *in scope* —
   contradictory/impossible acceptance, needs access or a product decision, or an

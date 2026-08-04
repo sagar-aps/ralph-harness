@@ -334,6 +334,25 @@ function twoTaskPlan() {
 const FB = 'bash -c "echo x >> progress.txt; printf \\"# handoff\\n\\" > .agent-handoff.md"';
 const noDelay = { RALPH_AGENT_RETRY_DELAY: "0", RALPH_DRY_RUN: "" };
 
+// Deterministic Claude-shaped usage fixtures: each completed task consumes 60
+// observable tokens (30 builder + 30 reviewer), with no provider calls.
+const budgetFixtures = stateDir();
+const budgetBuilder = path.join(budgetFixtures, "budget-builder.sh");
+const budgetReviewer = path.join(budgetFixtures, "budget-reviewer.sh");
+writeScript(budgetBuilder, `#!/usr/bin/env bash
+echo "change $R_TASK_NUM" >> budget-progress.txt
+printf '# handoff\n- fixture change\n' > .agent-handoff.md
+printf '%s\n' '{"result":"built","usage":{"input_tokens":20,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+`);
+writeScript(budgetReviewer, `#!/usr/bin/env bash
+printf '%s\n' '{"result":"VERDICT: PASS","usage":{"input_tokens":20,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+`);
+const budgetAgents = {
+  ...noDelay,
+  AGENT_BUDGETB_CMD: budgetBuilder,
+  AGENT_BUDGETR_CMD: budgetReviewer,
+};
+
 console.log("9) reviewer ERROR (non-zero exit) -> REVIEWER_UNAVAILABLE, no builder attempt consumed");
 {
   const { target, mainHead } = makeTarget();
@@ -496,6 +515,83 @@ console.log("11d) reviewer quota does not consume another builder iteration");
     check(readFileSync(reviewerCalls, "utf-8").trim().split("\n").length === 1, "reviewer quota is not retried");
     const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
     check(/PROVIDER_QUOTA_CREDENTIAL_POOL=review-account/.test(lastRun), "exhausted reviewer credential pool is persisted");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("11e) proactive token ceiling stops after the crossing round with a distinct terminal state");
+{
+  const { target } = makeTarget();
+  const plan = makePlanDir();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "budgetb", "--reviewer", "budgetr", "--auto-approve-builder"],
+      { ...budgetAgents, RALPH_WORKTREE_DIR: wtBase(target), RALPH_ORCHESTRATOR_BUDGET_TOKENS: "100" },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    const runDir = batchRunDir(target);
+    const usage = readFileSync(path.join(runDir, "round-usage.jsonl"), "utf-8").trim().split("\n");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(r.status === 2, "budget stop uses a clean non-ready exit");
+    check(/Batch ORCHESTRATOR_BUDGET_REACHED/.test(out), "budget stop has a terminal state distinct from provider quota");
+    check(/budget=100 tokens pct=100 observed=120 tokens/.test(out), "terminal banner publishes budget, percentage, and observed total");
+    check(/STATUS=ORCHESTRATOR_BUDGET_REACHED/.test(lastRun), "last-run.env records the proactive terminal state");
+    check(/ORCHESTRATOR_BUDGET_OBSERVED_TOKENS=120/.test(lastRun), "last-run.env publishes the observed aggregate");
+    check(usage.length === 2 && !existsSync(path.join(runDir, "task-003-iter-1-builder.log")),
+      "crossing round usage is flushed and task 3 is never dispatched");
+    check(existsSync((lastRun.match(/^WORKTREE=(.+)$/m) || [])[1] || ""), "budget stop preserves the worktree");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("11f) an under-budget aggregate continues through the plan");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "budgetb", "--reviewer", "budgetr", "--auto-approve-builder"],
+      { ...budgetAgents, RALPH_WORKTREE_DIR: wtBase(target), RALPH_ORCHESTRATOR_BUDGET_TOKENS: "200", RALPH_ORCHESTRATOR_STOP_PCT: "75" },
+    );
+    check(r.status === 0 && /READY_FOR_HUMAN_REVIEW/.test(`${r.stdout}${r.stderr}`),
+      "120 tokens remains under the 150-token threshold and both tasks complete");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("11g) no configured budget leaves existing behavior unchanged");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "budgetb", "--reviewer", "budgetr", "--auto-approve-builder"],
+      { ...budgetAgents, RALPH_WORKTREE_DIR: wtBase(target) },
+    );
+    check(r.status === 0 && !/ORCHESTRATOR_BUDGET_REACHED/.test(`${r.stdout}${r.stderr}`),
+      "absent budget is off and the full plan completes");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("11h) unknown usage counts as zero without fabricating a total");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "okrev", "--auto-approve-builder"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_FB_CMD: FB,
+        AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""', RALPH_ORCHESTRATOR_BUDGET_TOKENS: "1" },
+    );
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(r.status === 0, "unknown-only rounds do not falsely trip a one-token ceiling");
+    check(/ORCHESTRATOR_BUDGET_OBSERVED_TOKENS=0/.test(lastRun) && /ORCHESTRATOR_BUDGET_UNKNOWN_ROUNDS=2/.test(lastRun),
+      "unknown rounds are noted while the observed total remains zero");
   } finally {
     cleanup(target);
   }
