@@ -166,5 +166,65 @@ console.log("3) a non-JSON backend is still left completely alone");
   } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
 }
 
+console.log("4) usage capture is ON by default, and OFF only when asked");
+{
+  const t = makeTarget();
+  const plan = onePlan();
+  try {
+    ralph(["batch", "--repo", t, "--plan", plan, "--builder", "codex", "--reviewer", "codex-readonly",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(t) });          // no RALPH_USAGE set
+    check(/\bexec --json\b/.test((cfg(t).match(/^BUILDER_CMD=(.*)$/m) || [])[1] || ""),
+      "default (unset) instruments codex — cost visibility is opt-OUT");
+  } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
+}
+{
+  const t = makeTarget();
+  const plan = onePlan();
+  try {
+    ralph(["batch", "--repo", t, "--plan", plan, "--builder", "codex", "--reviewer", "codex-readonly",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_DRY_RUN: "1", RALPH_USAGE: "0", RALPH_WORKTREE_DIR: wtBase(t) });
+    check(!/--json/.test((cfg(t).match(/^BUILDER_CMD=(.*)$/m) || [])[1] || ""),
+      "RALPH_USAGE=0 disables instrumentation");
+  } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
+}
+
+console.log("5) GUARD: an unrecognised JSON shape must not break the verdict parse");
+{
+  // This is what makes default-on safe. Simulate a CLI that renamed its events: the
+  // JSON is well-formed but nothing matches the shapes we know. Without the salvage,
+  // the log stays JSON, `^VERDICT:` never matches, and EVERY attempt becomes
+  // REVIEWER_UNAVAILABLE until MAX_ITERATIONS — fleet-wide, with a misleading symptom.
+  const t = makeTarget();
+  const plan = onePlan();
+  const fixDir = mkdtempSync(path.join(tmpdir(), "ralph-usage40-drift-"));
+  const fix = path.join(fixDir, "drift.jsonl");
+  writeFileSync(fix, [
+    JSON.stringify({ kind: "conversation.begin", id: "abc" }),
+    JSON.stringify({ kind: "assistant.said", payload: { body: { text: "### Must-fix issues\n- none\n\nVERDICT: PASS" } } }),
+    JSON.stringify({ kind: "conversation.end", tokens: { in: 100, out: 5 } }),
+  ].join("\n") + "\n");
+  const FB = 'bash -c "echo x >> progress.txt; printf \\"# handoff\\n\\" > .agent-handoff.md"';
+  try {
+    const r = ralph(["batch", "--repo", t, "--plan", plan, "--builder", "fb", "--reviewer", "driftrev",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_AGENT_RETRY_DELAY: "0", RALPH_DRY_RUN: "", RALPH_WORKTREE_DIR: wtBase(t),
+        AGENT_FB_CMD: FB, AGENT_DRIFTREV_CMD: `cat ${fix}` });
+    const out = `${r.stdout}${r.stderr}`;
+    const rd = runDirOf(t);
+    const log = readFileSync(path.join(rd, "task-001-iter-1-reviewer.md"), "utf-8");
+
+    check(/verdict: PASS/.test(out), "verdict STILL parses despite an unknown JSON shape (run survives)");
+    check(/^VERDICT: PASS$/m.test(log), "text was salvaged from the unknown shape into the log");
+    check(!log.includes('"kind"'), "raw unknown-shape JSON no longer in the log");
+    check(/unrecognised shape/i.test(out), "harness warns loudly that metrics were not captured");
+    check(!existsSync(path.join(rd, "task-001-iter-1-reviewer.usage.json")),
+      "no sidecar invented from an unparsed shape (metrics absent, not fabricated)");
+  } finally {
+    cleanup(t); rmSync(plan, { recursive: true, force: true }); rmSync(fixDir, { recursive: true, force: true });
+  }
+}
+
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log("\nAll usage-per-backend checks passed");
