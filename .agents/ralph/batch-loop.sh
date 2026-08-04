@@ -41,6 +41,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/round-usage.sh"; }
 [[ -f "$SCRIPT_DIR/reported-model.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/reported-model.sh"; }
+[[ -f "$SCRIPT_DIR/orchestrator-budget.sh" ]] && { # shellcheck source=/dev/null
+  . "$SCRIPT_DIR/orchestrator-budget.sh"; }
 # Untracked local overrides (gitignored) — sourced LAST so they win. Copy
 # config.local.sh.example to config.local.sh to define/override backends & roles.
 # RALPH_NO_LOCAL_CONFIG=1 skips it — used by the test suite so a developer's machine
@@ -893,6 +895,11 @@ write_last_run() {
     echo "WIP_REF=${WIP_REF_LAST:-}"
     echo "WIP_NS=${WIP_REF_NS:-}/${TS:-}"
     echo "ROUND_USAGE_FILE=$RUN_DIR/round-usage.jsonl"
+    echo "ORCHESTRATOR_BUDGET_TOKENS=${RALPH_BUDGET_TOKENS:-}"
+    echo "ORCHESTRATOR_BUDGET_STOP_PCT=${RALPH_BUDGET_STOP_PCT:-100}"
+    echo "ORCHESTRATOR_BUDGET_THRESHOLD_TOKENS=${RALPH_BUDGET_THRESHOLD_TOKENS:-}"
+    echo "ORCHESTRATOR_BUDGET_OBSERVED_TOKENS=${RALPH_BUDGET_OBSERVED_TOKENS:-0}"
+    echo "ORCHESTRATOR_BUDGET_UNKNOWN_ROUNDS=${RALPH_BUDGET_UNKNOWN_ROUNDS:-0}"
     ralph_env_assignment PROVIDER_QUOTA_PROVIDER "${RALPH_QUOTA_PROVIDER:-}"
     ralph_env_assignment PROVIDER_QUOTA_CREDENTIAL_POOL "${RALPH_QUOTA_CREDENTIAL_POOL:-}"
     ralph_env_assignment PROVIDER_QUOTA_SCOPE "${RALPH_QUOTA_SCOPE:-}"
@@ -959,6 +966,8 @@ on_interrupt() {
   echo "RALPH_DB_PORT=$RALPH_DB_PORT"
   echo "RALPH_PREVIEW_URL=$RALPH_PREVIEW_URL"
   echo "RALPH_COMPOSE_PROJECT=$RALPH_COMPOSE_PROJECT"
+  echo "RALPH_ORCHESTRATOR_BUDGET_TOKENS=${RALPH_ORCHESTRATOR_BUDGET_TOKENS:-}"
+  echo "RALPH_ORCHESTRATOR_STOP_PCT=${RALPH_ORCHESTRATOR_STOP_PCT:-100}"
 } > "$RUN_DIR/config.resolved.env"
 
 echo ""
@@ -980,6 +989,7 @@ else
 fi
 echo "  max attempts/task: $MAX_ITERATIONS   agent-error retries: $AGENT_RETRIES   resume: $RESUMING"
 echo "  auto-approve builder: $AUTO_APPROVE_BUILDER   stop-on-fail: $STOP_ON_FAIL"
+echo "  token budget:  ${RALPH_ORCHESTRATOR_BUDGET_TOKENS:-(off)}   stop pct: ${RALPH_ORCHESTRATOR_STOP_PCT:-100}"
 echo "  preview:       $PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  (url after batch: $RALPH_PREVIEW_URL)}"
 echo "  artifacts:     $RUN_DIR"
 echo "═══════════════════════════════════════════════════════"
@@ -1010,6 +1020,12 @@ AGENT_ERROR_ROLE=""        # "builder" | "reviewer" when an unrecoverable ERROR 
 QUOTA_ROLE=""
 AGENT_ERROR_EXIT=""
 HALTED_TASK=""
+BUDGET_REACHED="false"
+RALPH_BUDGET_CONFIGURED="false"; RALPH_BUDGET_REACHED="false"
+RALPH_BUDGET_TOKENS="${RALPH_ORCHESTRATOR_BUDGET_TOKENS:-}"
+RALPH_BUDGET_STOP_PCT="${RALPH_ORCHESTRATOR_STOP_PCT:-100}"
+RALPH_BUDGET_THRESHOLD_TOKENS=""; RALPH_BUDGET_OBSERVED_TOKENS="0"
+RALPH_BUDGET_UNKNOWN_ROUNDS="0"
 
 # Resume pointer is valid from the first task onward, and a signal leaves it
 # INTERRUPTED (not stale) so `--resume` works even if you stop the run on purpose.
@@ -1032,6 +1048,11 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     continue
   fi
   if [[ "$ATTEMPTED" -ge "$TASK_RUN_COUNT" ]]; then break; fi
+  # Re-read the persisted aggregate immediately before dispatch. This matters on
+  # --resume as well as after an ordinarily completed prior round.
+  set +e; ralph_orchestrator_budget_refresh "$RUN_DIR"; BUDGET_RC=$?; set -e
+  if [[ "$BUDGET_RC" -eq 2 ]]; then die "Invalid orchestrator budget configuration."; fi
+  if [[ "$BUDGET_RC" -eq 0 ]]; then BUDGET_REACHED="true"; break; fi
   ATTEMPTED=$((ATTEMPTED + 1))
   TASK_FILE="$TASKS_DIR/$FN"
 
@@ -1197,6 +1218,14 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   ralph_round_usage_line "$RUN_DIR" "$IDX" "$ROUND_BUILDER_ATTEMPTS" \
     "$ROUND_REVIEWER_ATTEMPTS" "$ROUND_QUOTA_REJECTED"
 
+  # A provider failure retains its reactive #28 terminal state. Otherwise tally
+  # the just-flushed round before deciding whether another task may be dispatched.
+  if [[ -z "$AGENT_ERROR_ROLE" ]]; then
+    set +e; ralph_orchestrator_budget_refresh "$RUN_DIR"; BUDGET_RC=$?; set -e
+    if [[ "$BUDGET_RC" -eq 2 ]]; then die "Invalid orchestrator budget configuration."; fi
+    [[ "$BUDGET_RC" -eq 0 ]] && BUDGET_REACHED="true"
+  fi
+
   # Unrecoverable agent (builder/reviewer) ERROR → halt: do not commit, do not
   # count this task as PASS/FAIL.
   if [[ -n "$AGENT_ERROR_ROLE" ]]; then
@@ -1250,6 +1279,11 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     echo ""
   } >> "$CONTEXT_FILE"
 
+  if [[ "$BUDGET_REACHED" == "true" ]]; then
+    echo "Orchestrator token budget reached after task $IDX; no next round will be dispatched."
+    break
+  fi
+
   if [[ ( "$TASK_STATUS" == "FAIL" || "$TASK_STATUS" == "BLOCKED" ) && "$STOP_ON_FAIL" == "true" ]]; then
     echo "Task $IDX ended $TASK_STATUS and --stop-on-fail is set. Stopping batch."
     STOPPED_EARLY="true"
@@ -1262,7 +1296,7 @@ done 3< "$MANIFEST"
 # URL (same scripts as `ralph review`). Left running for review; `ralph cleanup`
 # stops it via the preview-down script.
 PREVIEW_RAN="false"; PREVIEW_UP_OK=""; E2E_OK=""
-if [[ "$PREVIEW_ENABLED" == "true" && -z "$AGENT_ERROR_ROLE" ]]; then
+if [[ "$PREVIEW_ENABLED" == "true" && -z "$AGENT_ERROR_ROLE" && "$BUDGET_REACHED" != "true" ]]; then
   PREVIEW_RAN="true"
   echo ""
   echo "── End-of-batch preview ──────────────────────"
@@ -1294,6 +1328,8 @@ if [[ -n "$AGENT_ERROR_ROLE" ]]; then
   if [[ -n "$QUOTA_ROLE" ]]; then OUTCOME="PROVIDER_QUOTA_EXHAUSTED"
   elif [[ "$AGENT_ERROR_ROLE" == "reviewer" ]]; then OUTCOME="REVIEWER_UNAVAILABLE"
   else OUTCOME="BUILDER_UNAVAILABLE"; fi
+elif [[ "$BUDGET_REACHED" == "true" ]]; then
+  OUTCOME="ORCHESTRATOR_BUDGET_REACHED"
 elif [[ "$STOPPED_EARLY" == "true" ]]; then
   OUTCOME="STOPPED_ON_FAIL"
 elif [[ "$FAILED" -gt 0 ]]; then
@@ -1320,6 +1356,11 @@ REPORT="$RUN_DIR/final-report.md"
   echo "- Builder: $BUILDER  |  Reviewer: $REVIEWER (read-only)"
   echo "- Auto-approve builder: $AUTO_APPROVE_BUILDER  |  Stop-on-fail: $STOP_ON_FAIL"
   echo "- Check command: $CHECK_CMD"
+  if [[ "$RALPH_BUDGET_CONFIGURED" == "true" ]]; then
+    echo "- Orchestrator token budget: $RALPH_BUDGET_TOKENS at $RALPH_BUDGET_STOP_PCT% (threshold: $RALPH_BUDGET_THRESHOLD_TOKENS; observed: $RALPH_BUDGET_OBSERVED_TOKENS; unknown rounds counted as zero: $RALPH_BUDGET_UNKNOWN_ROUNDS)"
+  else
+    echo "- Orchestrator token budget: off"
+  fi
   if [[ "$PRIMER_STATUS" == "deliberate-opt-out" ]]; then
     echo "- Repo primer: deliberately disabled (RALPH_PRIMER_OPTOUT=1)"
   elif [[ -n "$PRIMER_WARNING" ]]; then
@@ -1332,6 +1373,8 @@ REPORT="$RUN_DIR/final-report.md"
     echo "- Preview: ${PREVIEW_UP_OK:+up=$PREVIEW_UP_OK }${E2E_OK:+e2e=$E2E_OK }URL=$RALPH_PREVIEW_URL"
   elif [[ -n "$AGENT_ERROR_ROLE" ]]; then
     echo "- Preview: skipped (batch halted on $AGENT_ERROR_ROLE error)"
+  elif [[ "$BUDGET_REACHED" == "true" ]]; then
+    echo "- Preview: skipped (orchestrator budget reached)"
   else
     echo "- Preview: disabled"
   fi
@@ -1470,6 +1513,13 @@ if [[ -n "$AGENT_ERROR_ROLE" ]]; then
   echo "    ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
   echo "═══════════════════════════════════════════════════════"
   exit 4
+fi
+if [[ "$BUDGET_REACHED" == "true" ]]; then
+  echo "  ⏹ ORCHESTRATOR_BUDGET_REACHED — budget=$RALPH_BUDGET_TOKENS tokens pct=$RALPH_BUDGET_STOP_PCT observed=$RALPH_BUDGET_OBSERVED_TOKENS tokens."
+  if [[ "$RALPH_BUDGET_UNKNOWN_ROUNDS" -gt 0 ]]; then
+    echo "  Note: $RALPH_BUDGET_UNKNOWN_ROUNDS round(s) had unknown usage and counted as 0; no token values were fabricated."
+  fi
+  echo "  Worktree and artifacts are preserved; no next round was dispatched."
 fi
 if [[ "$PREVIEW_RAN" == "true" && "$PREVIEW_UP_OK" == "true" ]]; then
   echo "  Preview:   $RALPH_PREVIEW_URL  (running — open it to review the whole batch)"
