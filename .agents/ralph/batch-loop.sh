@@ -621,7 +621,10 @@ stop_snapshotter() {
 # exit of the backend tool — not a code/check failure, which surfaces via check).
 # Returns 0 if the builder ran; 1 if it errored after all retries (caller halts).
 run_builder_attempt() {  # <prompt_file> <log_file>
-  local prompt="$1" log="$2" i rc delay="$AGENT_RETRY_DELAY"
+  local prompt="$1" log="$2" i rc delay="$AGENT_RETRY_DELAY" provider pool
+  provider="${BUILDER_PROVIDER:-$BUILDER}"
+  pool="${RALPH_BUILDER_CREDENTIAL_POOL:-$provider}"
+  if ralph_quota_pool_is_exhausted "$pool"; then QUOTA_ROLE="builder"; return 1; fi
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "[RALPH_DRY_RUN] builder skipped." > "$log"
     printf 'batch dry-run task %s iter %s: %s\n' "$IDX" "$ITER" "$TITLE" >> "$WORKDIR/batch-dry-run.txt"
@@ -630,7 +633,7 @@ run_builder_attempt() {  # <prompt_file> <log_file>
   fi
   for (( i=1; i<=AGENT_ERROR_ATTEMPTS; i++ )); do
     set +e; run_backend "$BUILDER_CMD" "$prompt" "$log"; rc=$?; set -e
-    if ralph_detect_quota_exhaustion "$log" "${BUILDER_PROVIDER:-$BUILDER}"; then
+    if ralph_detect_quota_exhaustion "$log" "$provider" "$pool"; then
       QUOTA_ROLE="builder"
       return 1
     fi
@@ -646,13 +649,18 @@ run_builder_attempt() {  # <prompt_file> <log_file>
 # never trusted from model text). ERROR = backend non-zero exit OR no VERDICT line.
 # Retries ONLY on ERROR with backoff. Sets REVIEWER_OUTCOME and VERDICT.
 run_reviewer_attempt() {  # <prompt_file> <out_file>
-  local prompt="$1" out="$2" i rc v delay="$AGENT_RETRY_DELAY"
+  local prompt="$1" out="$2" i rc v delay="$AGENT_RETRY_DELAY" provider pool
+  provider="${REVIEWER_PROVIDER:-$REVIEWER}"
+  pool="${RALPH_REVIEWER_CREDENTIAL_POOL:-$provider}"
+  if ralph_quota_pool_is_exhausted "$pool"; then
+    QUOTA_ROLE="reviewer"; REVIEWER_OUTCOME="QUOTA"; VERDICT=""; return 1
+  fi
   for (( i=1; i<=AGENT_ERROR_ATTEMPTS; i++ )); do
     if [[ "$DRY_RUN" == "1" ]]; then
       { echo "### Must-fix issues"; echo "- none (dry run)"; echo ""; echo "VERDICT: PASS"; } > "$out"; rc=0
     else
       set +e; run_backend "$REVIEWER_CMD" "$prompt" "$out"; rc=$?; set -e
-      if ralph_detect_quota_exhaustion "$out" "${REVIEWER_PROVIDER:-$REVIEWER}"; then
+      if ralph_detect_quota_exhaustion "$out" "$provider" "$pool"; then
         QUOTA_ROLE="reviewer"; REVIEWER_OUTCOME="QUOTA"; VERDICT=""
         return 1
       fi
@@ -694,10 +702,11 @@ write_last_run() {
     echo "USE_WORKTREE=true"
     echo "WIP_REF=${WIP_REF_LAST:-}"
     echo "WIP_NS=${WIP_REF_NS:-}/${TS:-}"
-    echo "PROVIDER_QUOTA_PROVIDER=${RALPH_QUOTA_PROVIDER:-}"
-    echo "PROVIDER_QUOTA_SCOPE=${RALPH_QUOTA_SCOPE:-}"
-    echo "PROVIDER_QUOTA_OBSERVED_AT=${RALPH_QUOTA_OBSERVED_AT:-}"
-    echo "PROVIDER_QUOTA_RESET_AT=${RALPH_QUOTA_RESET_AT:-}"
+    ralph_env_assignment PROVIDER_QUOTA_PROVIDER "${RALPH_QUOTA_PROVIDER:-}"
+    ralph_env_assignment PROVIDER_QUOTA_CREDENTIAL_POOL "${RALPH_QUOTA_CREDENTIAL_POOL:-}"
+    ralph_env_assignment PROVIDER_QUOTA_SCOPE "${RALPH_QUOTA_SCOPE:-}"
+    ralph_env_assignment PROVIDER_QUOTA_OBSERVED_AT "${RALPH_QUOTA_OBSERVED_AT:-}"
+    ralph_env_assignment PROVIDER_QUOTA_RESET_AT "${RALPH_QUOTA_RESET_AT:-}"
   } > "$TARGET_REPO/.ralph/last-run.env"
 }
 

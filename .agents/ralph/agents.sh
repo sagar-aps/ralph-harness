@@ -63,9 +63,66 @@ resolve_backend_cmd() {
 # explicit usage-limit exhaustion and a reset time. Operators may replace the
 # ERE with RALPH_QUOTA_REGEX for providers that use different terminal wording.
 # On a match, machine-friendly RALPH_QUOTA_* globals are set and persisted when
-# RALPH_QUOTA_ARTIFACT names a run artifact. Returns 0 only on a match.
-ralph_detect_quota_exhaustion() {  # <logfile> [provider_or_pool]
-  local logfile="$1" provider="${2:-unknown}" regex line reset scope observed
+# RALPH_QUOTA_ARTIFACT names a run artifact. Credential-pool identity is explicit
+# because two backend names can share one provider account. Returns 0 on a match.
+ralph_env_assignment() {  # <name> <value> -- emit a safely sourceable assignment
+  printf '%s=' "$1"
+  printf '%q' "$2"
+  printf '\n'
+}
+
+ralph_quota_reset_elapsed() {  # <reset timestamp>
+  [[ -n "$1" ]] || return 1
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import datetime
+import sys
+
+raw = sys.argv[1].strip().replace("Z", "+00:00")
+try:
+    reset = datetime.datetime.fromisoformat(raw)
+except ValueError:
+    raise SystemExit(1)
+if reset.tzinfo is None:
+    reset = reset.replace(tzinfo=datetime.timezone.utc)
+raise SystemExit(0 if datetime.datetime.now(datetime.timezone.utc) >= reset else 1)
+PY
+}
+
+ralph_quota_forget_pool() {  # <credential_pool>
+  local wanted="$1" line pool kept=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    pool="${line%%|*}"
+    [[ "$pool" == "$wanted" ]] && continue
+    kept="${kept}${kept:+
+}${line}"
+  done <<EOF
+${RALPH_QUOTA_OPEN_CIRCUITS:-}
+EOF
+  RALPH_QUOTA_OPEN_CIRCUITS="$kept"
+  export RALPH_QUOTA_OPEN_CIRCUITS
+}
+
+ralph_quota_pool_is_exhausted() {  # <credential_pool>
+  local wanted="$1" line pool reset
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    pool="${line%%|*}"
+    reset="${line#*|}"
+    [[ "$pool" == "$wanted" ]] || continue
+    if ralph_quota_reset_elapsed "$reset"; then
+      ralph_quota_forget_pool "$wanted"
+      return 1
+    fi
+    return 0
+  done <<EOF
+${RALPH_QUOTA_OPEN_CIRCUITS:-}
+EOF
+  return 1
+}
+
+ralph_detect_quota_exhaustion() {  # <logfile> [provider] [credential_pool]
+  local logfile="$1" provider="${2:-unknown}" pool="${3:-${2:-unknown}}" regex line reset scope observed record
   regex="${RALPH_QUOTA_REGEX:-}"
   [[ -n "$regex" ]] || regex='usage[[:space:]]+limit[[:space:]]+reached.*reset[[:space:]]+at[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}'
   [[ -f "$logfile" ]] || return 1
@@ -79,17 +136,24 @@ ralph_detect_quota_exhaustion() {  # <logfile> [provider_or_pool]
   observed="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   RALPH_QUOTA_PROVIDER="$provider"
+  RALPH_QUOTA_CREDENTIAL_POOL="$pool"
   RALPH_QUOTA_SCOPE="$scope"
   RALPH_QUOTA_OBSERVED_AT="$observed"
   RALPH_QUOTA_RESET_AT="$reset"
-  export RALPH_QUOTA_PROVIDER RALPH_QUOTA_SCOPE RALPH_QUOTA_OBSERVED_AT RALPH_QUOTA_RESET_AT
+  record="${pool}|${reset}"
+  ralph_quota_forget_pool "$pool"
+  RALPH_QUOTA_OPEN_CIRCUITS="${RALPH_QUOTA_OPEN_CIRCUITS}${RALPH_QUOTA_OPEN_CIRCUITS:+
+}${record}"
+  export RALPH_QUOTA_PROVIDER RALPH_QUOTA_CREDENTIAL_POOL RALPH_QUOTA_SCOPE \
+    RALPH_QUOTA_OBSERVED_AT RALPH_QUOTA_RESET_AT RALPH_QUOTA_OPEN_CIRCUITS
   if [[ -n "${RALPH_QUOTA_ARTIFACT:-}" ]]; then
     {
-      echo "STATUS=PROVIDER_QUOTA_EXHAUSTED"
-      echo "PROVIDER=$RALPH_QUOTA_PROVIDER"
-      echo "SCOPE=$RALPH_QUOTA_SCOPE"
-      echo "OBSERVED_AT=$RALPH_QUOTA_OBSERVED_AT"
-      echo "RESET_AT=$RALPH_QUOTA_RESET_AT"
+      ralph_env_assignment STATUS PROVIDER_QUOTA_EXHAUSTED
+      ralph_env_assignment PROVIDER "$RALPH_QUOTA_PROVIDER"
+      ralph_env_assignment CREDENTIAL_POOL "$RALPH_QUOTA_CREDENTIAL_POOL"
+      ralph_env_assignment SCOPE "$RALPH_QUOTA_SCOPE"
+      ralph_env_assignment OBSERVED_AT "$RALPH_QUOTA_OBSERVED_AT"
+      ralph_env_assignment RESET_AT "$RALPH_QUOTA_RESET_AT"
     } > "$RALPH_QUOTA_ARTIFACT"
   fi
   return 0

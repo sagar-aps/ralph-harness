@@ -416,8 +416,53 @@ console.log("11b) terminal provider quota halts after exactly one invocation");
     const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
     check(/STATUS=PROVIDER_QUOTA_EXHAUSTED/.test(lastRun), "last-run.env records quota terminal status");
     check(/PROVIDER_QUOTA_PROVIDER=quota/.test(lastRun), "last-run.env records exhausted provider");
-    check(/PROVIDER_QUOTA_RESET_AT=2026-08-03 07:27:58/.test(lastRun), "last-run.env records reset timestamp");
+    const sourced = spawnSync("bash", ["-c", '. "$1"; printf "%s|%s|%s" "$PROVIDER_QUOTA_PROVIDER" "$PROVIDER_QUOTA_SCOPE" "$PROVIDER_QUOTA_RESET_AT"', "bash", path.join(target, ".ralph", "last-run.env")], { encoding: "utf-8" });
+    check(sourced.status === 0 && sourced.stdout === "quota|5 hour|2026-08-03 07:27:58", "last-run.env is safely sourceable and preserves spaced metadata");
     check(!existsSync(path.join(batchRunDir(target), "task-001-iter-1-reviewer.md")), "reviewer is not dispatched after builder quota");
+  } finally {
+    cleanup(target);
+  }
+}
+
+console.log("11c) quota circuit is credential-pool aware and reset-aware");
+{
+  const st = stateDir();
+  const quotaLog = path.join(st, "pool-quota.log");
+  const expiredLog = path.join(st, "expired-quota.log");
+  writeFileSync(quotaLog, "Usage limit reached for 5 hour. Your limit will reset at 2099-08-03 07:27:58\n");
+  writeFileSync(expiredLog, "Usage limit reached for 5 hour. Your limit will reset at 2000-08-03 07:27:58\n");
+  const helper = spawnSync("bash", ["-c", `
+    source ${path.join(repoRoot, ".agents", "ralph", "agents.sh")}
+    ralph_detect_quota_exhaustion ${quotaLog} zai shared-account
+    ralph_quota_pool_is_exhausted shared-account || exit 10
+    ralph_quota_pool_is_exhausted unrelated-account && exit 11
+    ralph_detect_quota_exhaustion ${expiredLog} zai expired-account
+    ralph_quota_pool_is_exhausted expired-account && exit 12
+    printf "%s|%s" "$RALPH_QUOTA_PROVIDER" "$RALPH_QUOTA_CREDENTIAL_POOL"
+  `], { encoding: "utf-8" });
+  check(helper.status === 0, "same credential pool is suppressed while an unrelated pool remains dispatchable");
+  check(helper.stdout === "zai|expired-account", "credential-pool identity is tracked independently from provider");
+}
+
+console.log("11d) reviewer quota does not consume another builder iteration");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  const st = stateDir();
+  const builderCalls = path.join(st, "reviewer-quota-builder-calls");
+  const reviewerCalls = path.join(st, "reviewer-quota-reviewer-calls");
+  try {
+    const builder = `bash -c 'echo call >> ${builderCalls}; echo changed >> README.md'`;
+    const reviewer = `bash -c 'echo call >> ${reviewerCalls}; echo "Usage limit reached for daily review. Your limit will reset at 2099-08-03 07:27:58"; exit 1'`;
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "other", "--reviewer", "quota-review", "--auto-approve-builder", "--max-iterations", "5"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_OTHER_CMD: builder, AGENT_QUOTA_REVIEW_CMD: reviewer, RALPH_BUILDER_CREDENTIAL_POOL: "build-account", RALPH_REVIEWER_CREDENTIAL_POOL: "review-account" },
+    );
+    check(r.status === 4 && /PROVIDER_QUOTA_EXHAUSTED/.test(`${r.stdout}${r.stderr}`), "reviewer quota has the distinct terminal state");
+    check(readFileSync(builderCalls, "utf-8").trim().split("\n").length === 1, "reviewer quota does not trigger another builder iteration");
+    check(readFileSync(reviewerCalls, "utf-8").trim().split("\n").length === 1, "reviewer quota is not retried");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/PROVIDER_QUOTA_CREDENTIAL_POOL=review-account/.test(lastRun), "exhausted reviewer credential pool is persisted");
   } finally {
     cleanup(target);
   }

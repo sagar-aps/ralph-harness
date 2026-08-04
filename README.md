@@ -556,7 +556,11 @@ ralph batch \
   `PROVIDER_QUOTA_EXHAUSTED`, recording its provider and reset time. The configurable
   `RALPH_QUOTA_REGEX` ERE defaults to explicit
   `usage limit reached ... reset at YYYY-MM-DD HH:MM:SS` responses, so an ordinary
-  transient 429 does not open the circuit breaker.
+  transient 429 does not open the circuit breaker. Pool identity defaults to the
+  provider name and can be set with `RALPH_BUILDER_CREDENTIAL_POOL` /
+  `RALPH_REVIEWER_CREDENTIAL_POOL` when backend names share credentials. Open pools
+  are skipped for the rest of the run; unrelated pools remain dispatchable, and a
+  parsed elapsed reset time closes the circuit automatically.
 - **Task BLOCKED (needs a human).** Beyond PASS/FAIL, the reviewer may vote
   `VERDICT: BLOCKED` when a task is well-defined but not completable *in scope* —
   contradictory/impossible acceptance, needs access or a product decision, or an
