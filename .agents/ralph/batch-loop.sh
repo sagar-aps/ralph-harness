@@ -809,7 +809,9 @@ run_builder_attempt() {  # <prompt_file> <log_file>
   for (( i=1; i<=AGENT_ERROR_ATTEMPTS; i++ )); do
     ROUND_BUILDER_ATTEMPTS=$((ROUND_BUILDER_ATTEMPTS + 1))
     set +e; run_backend "$BUILDER_CMD" "$prompt" "$log"; rc=$?; set -e
-    if ralph_detect_quota_exhaustion "$log" "$provider" "$pool"; then
+    # #47: only a FAILED backend (rc!=0) can be a real quota wall; a successful builder
+    # whose diff contains quota sample text must not self-trip the breaker.
+    if [[ "$rc" -ne 0 ]] && ralph_detect_quota_exhaustion "$log" "$provider" "$pool"; then
       ROUND_BUILDER_ATTEMPTS=$((ROUND_BUILDER_ATTEMPTS - 1))
       ROUND_QUOTA_REJECTED=$((ROUND_QUOTA_REJECTED + 1))
       QUOTA_ROLE="builder"
@@ -839,7 +841,8 @@ run_reviewer_attempt() {  # <prompt_file> <out_file>
     else
       ROUND_REVIEWER_ATTEMPTS=$((ROUND_REVIEWER_ATTEMPTS + 1))
       set +e; run_backend "$REVIEWER_CMD" "$prompt" "$out"; rc=$?; set -e
-      if ralph_detect_quota_exhaustion "$out" "$provider" "$pool"; then
+      # #47: gate on a failed backend (see builder note above).
+      if [[ "$rc" -ne 0 ]] && ralph_detect_quota_exhaustion "$out" "$provider" "$pool"; then
         ROUND_REVIEWER_ATTEMPTS=$((ROUND_REVIEWER_ATTEMPTS - 1))
         ROUND_QUOTA_REJECTED=$((ROUND_QUOTA_REJECTED + 1))
         QUOTA_ROLE="reviewer"; REVIEWER_OUTCOME="QUOTA"; VERDICT=""

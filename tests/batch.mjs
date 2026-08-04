@@ -433,6 +433,30 @@ console.log("11b) terminal provider quota halts after exactly one invocation");
   }
 }
 
+console.log("11b-fix) a SUCCESSFUL builder (exit 0) emitting quota sample text does NOT trip the breaker (#47)");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  const st = stateDir();
+  const calls = path.join(st, "quota-false-calls");
+  try {
+    // Builder makes a real change AND prints the quota phrase, but exits 0 (success) —
+    // exactly the #26 scenario (editing the quota tests). Must NOT be read as a quota wall.
+    const builder = `bash -c 'echo call >> ${calls}; echo "API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2026-08-03 07:27:58]"; echo changed >> README.md'`;
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "qfalse", "--reviewer", "okrev", "--auto-approve-builder", "--max-iterations", "5"],
+      { ...noDelay, RALPH_WORKTREE_DIR: wtBase(target), AGENT_QFALSE_CMD: builder, AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""' },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(!/PROVIDER_QUOTA_EXHAUSTED/.test(out), "exit-0 builder with quota text does NOT trigger PROVIDER_QUOTA_EXHAUSTED");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(!/STATUS=PROVIDER_QUOTA_EXHAUSTED/.test(lastRun), "last-run.env does not record a false quota halt");
+    check(existsSync(path.join(batchRunDir(target), "task-001-iter-1-reviewer.md")), "reviewer IS dispatched after a successful builder despite quota sample text");
+  } finally {
+    cleanup(target);
+  }
+}
+
 console.log("11c) quota circuit is credential-pool aware and reset-aware");
 {
   const st = stateDir();
