@@ -5,40 +5,24 @@ another on the SAME shared branch/worktree, so your work persists and later task
 build on it. Implement exactly the one task below, then leave a durable handoff.
 
 A separate read-only **reviewer** will judge your work and return `VERDICT: PASS`,
-`VERDICT: FAIL`, or `VERDICT: BLOCKED`. You get up to {{MAX_ITERATIONS}} attempt(s) at
-THIS task: if the check fails or the reviewer says FAIL, you'll be re-invoked with the
-feedback below to fix it. Saying you are "done" does not complete the task — only
-passing the check and the reviewer does.
+`VERDICT: FAIL`, or `VERDICT: BLOCKED`. You get a bounded number of attempts at
+THIS task (the budget and which attempt you are on are stated under "Attempt" near
+the end of this prompt): if the check fails or the reviewer says FAIL, you'll be
+re-invoked with the feedback below to fix it. Saying you are "done" does not
+complete the task — only passing the check and the reviewer does.
+
+<!--
+  PROMPT ASSEMBLY ORDER IS LOAD-BEARING (see issue #32).
+  Sections are ordered most-stable first so that provider prefix caches can hit:
+  invariant prose -> primer -> rules/steps -> per-run context -> per-task ->
+  per-attempt. Everything below the DYNAMIC BOUNDARY changes between attempts.
+  Do not move dynamic content upward, and do not introduce a placeholder that
+  varies per run/attempt above the boundary — a single such token invalidates the
+  whole cached prefix beneath it. tests/prompt-cache-prefix.mjs enforces this.
+-->
 
 ## Repo primer (orientation — read first)
 {{PRIMER}}
-
-## Context
-- Target repo (your working directory): {{TARGET_REPO}}
-- Shared batch branch: {{BRANCH}}
-- This is task {{TASK_NUMBER}} of {{TASK_TOTAL}}.
-- Attempt {{ATTEMPT}} of {{MAX_ITERATIONS}} for this task.
-- Check command: {{CHECK_CMD}}
-- Handoff file (you MUST update this every task): {{HANDOFF_PATH}}
-- Project agent guide (if present): {{AGENTS_PATH}}
-- Builder auto-approve mode: {{AUTO_APPROVE}}
-
-## Previous reviewer feedback for this task (address every must-fix item)
-{{PREVIOUS_REVIEW}}
-
-## Previous check output for this task
-{{PREVIOUS_CHECK}}
-
-## Previous acceptance/verify failure (resolve this to complete the task)
-The reviewer approved a prior attempt, but the acceptance gate (heavier verify)
-failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
-{{PREVIOUS_VERIFY}}
-
-## Accumulated context from earlier tasks in this batch
-{{ACCUMULATED_CONTEXT}}
-
-## Current task ({{TASK_NUMBER}}/{{TASK_TOTAL}}): {{TASK_TITLE}}
-{{TASK_CONTENT}}
 
 ## Rules (non-negotiable)
 - You are already inside the shared worktree. Do NOT `cd` elsewhere.
@@ -62,6 +46,37 @@ failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
 3. Make the smallest correct change that satisfies this task.
 4. Run the check command (`{{CHECK_CMD}}`) and fix any failures.
 5. Update the handoff file (format below). REQUIRED on every task.
+
+## If the task is genuinely blocked (use rarely)
+If you conclude the task cannot be completed as specified — the acceptance criteria
+are contradictory or impossible, it needs access or a product decision you cannot
+make, or it requires an architectural change far beyond this task — do NOT thrash or
+fake a fix. Do your best partial work, then add this section to the handoff:
+
+```
+## BLOCKED — request human review
+- Why it cannot be done in scope (concrete evidence: files, errors, contradictions).
+- What a human must decide or provide to unblock it.
+```
+
+This is only a *request*: the read-only reviewer verifies it independently. If the
+evidence holds, the task is marked BLOCKED and escalated to a human; if not, you'll be
+asked to keep trying. A hard-but-doable task is NOT blocked — reserve this for real
+structural/scope blockers.
+
+## Context
+- Target repo (your working directory): {{TARGET_REPO}}
+- Shared batch branch: {{BRANCH}}
+- Check command: {{CHECK_CMD}}
+- Handoff file (you MUST update this every task): {{HANDOFF_PATH}}
+- Project agent guide (if present): {{AGENTS_PATH}}
+- Builder auto-approve mode: {{AUTO_APPROVE}}
+
+## Accumulated context from earlier tasks in this batch
+{{ACCUMULATED_CONTEXT}}
+
+## Current task ({{TASK_NUMBER}}/{{TASK_TOTAL}}): {{TASK_TITLE}}
+{{TASK_CONTENT}}
 
 ## Handoff file format ({{HANDOFF_PATH}})
 ```
@@ -95,22 +110,24 @@ failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
 - ...
 ```
 
-## If the task is genuinely blocked (use rarely)
-If you conclude the task cannot be completed as specified — the acceptance criteria
-are contradictory or impossible, it needs access or a product decision you cannot
-make, or it requires an architectural change far beyond this task — do NOT thrash or
-fake a fix. Do your best partial work, then add this section to the handoff:
+<!-- ================== DYNAMIC BOUNDARY ==================
+     Everything below changes between attempts on the same task.
+     Nothing below this line may be moved above it. -->
 
-```
-## BLOCKED — request human review
-- Why it cannot be done in scope (concrete evidence: files, errors, contradictions).
-- What a human must decide or provide to unblock it.
-```
+## Attempt
+Attempt {{ATTEMPT}} of {{MAX_ITERATIONS}} for this task. This is task
+{{TASK_NUMBER}} of {{TASK_TOTAL}}.
 
-This is only a *request*: the read-only reviewer verifies it independently. If the
-evidence holds, the task is marked BLOCKED and escalated to a human; if not, you'll be
-asked to keep trying. A hard-but-doable task is NOT blocked — reserve this for real
-structural/scope blockers.
+## Previous reviewer feedback for this task (address every must-fix item)
+{{PREVIOUS_REVIEW}}
+
+## Previous check output for this task
+{{PREVIOUS_CHECK}}
+
+## Previous acceptance/verify failure (resolve this to complete the task)
+The reviewer approved a prior attempt, but the acceptance gate (heavier verify)
+failed. Fix the cause below; "reviewer said PASS" is not enough on its own.
+{{PREVIOUS_VERIFY}}
 
 When finished, stop. The harness runs the check and the reviewer automatically,
 commits your work on the shared branch, then moves to the next task.
