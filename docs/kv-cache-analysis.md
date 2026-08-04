@@ -375,6 +375,63 @@ no provider spend. Two adjustments:
 3. Add a regression assertion that no `PROMPT_*` template places a dynamic
    marker before the end of the stable block, so the fix cannot silently rot.
 
+## Implementation result (reorder + gate slice)
+
+Both `PROMPT_batch_*.md` templates reordered into stability tiers — invariant prose
+→ primer → rules/steps/blocked → per-run context → per-task → **dynamic boundary**
+→ attempt + `PREVIOUS_*`. `tests/prompt-cache-prefix.mjs` added to `npm test`.
+
+Measured on one identical fixture (60-line primer, 1 task, forced 2 attempts),
+before vs after:
+
+| | before | after |
+|---|---|---|
+| prompt size | 10,700 B | 11,540 B (+7.9 %) |
+| cross-**attempt** stable prefix | 5,954 B (~1,488 tok) | **10,923 B (~2,730 tok)** |
+| cross-**run** stable prefix | 409 B (~102 tok) | **8,748 B (~2,187 tok)** |
+
+Two honest observations:
+
+1. **Cross-attempt caching was already possible before the reorder** on a fixture
+   with a large primer — 1,488 tok clears the 1024 minimum. The reorder nearly
+   doubles it, but the qualitative change is cross-**run**: 102 → 2,187 tokens,
+   i.e. from structurally impossible to comfortably above threshold on every
+   backend. That is the OpenAI bucket-routing fix.
+2. **The prompt grew 840 B** (the boundary comments and the new `## Attempt`
+   heading). Raw size went up; effective cost went down. On this fixture, at a
+   0.1× cached-read rate the warm-cache input cost falls ~68 % cross-attempt
+   (5,341 → 1,709 B-equivalent) and ~66 % cross-run (10,700 → 3,667), because the
+   cacheable share rises from 56 % to 95 %.
+
+### The gate is not vacuous
+
+Verified by reintroducing the exact pre-#32 defect — putting `{{MAX_ITERATIONS}}`
+back into the intro prose — which collapses the cross-run prefix to 409 B and
+fails the suite. Notably the **cross-attempt assertions still passed** in that
+state, because within a single run the attempt budget is constant. So the
+acceptance's attempt-to-attempt gate alone would *not* have caught it; the
+cross-run test is what pins the regression. That asymmetry is the main argument
+for keeping test 3.
+
+### Deliberate deviations from a pure reorder
+
+- `{{MAX_ITERATIONS}}` was removed from the intro sentence and now renders only in
+  the dynamic `## Attempt` block. The placeholder is preserved, just relocated —
+  it cannot stay in the intro without defeating the whole exercise, since it sits
+  at ~110 tokens inside OpenAI's cache-key window.
+- Two HTML comments were added marking the boundary and warning against moving
+  dynamic content upward. They cost ~500 B of prompt and are the only thing
+  telling a future editor that the ordering is load-bearing.
+
+### Known limit, not addressed here
+
+The cross-run prefix still terminates where the first run-scoped path appears —
+`{{AGENTS_PATH}}` / `{{CHECK_CMD}}` are referenced inside the Rules block, and the
+worktree path embeds `RUN_ID`. Pushing those references out (e.g. Rules pointing at
+"the check command listed under Context") would extend the cross-run prefix
+further, but it is rewording rather than reordering and was left out of this
+slice.
+
 ## Sequencing
 
 Per the owner's decision, #32 lands after everything up to and including it. The
