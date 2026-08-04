@@ -18,6 +18,7 @@ ralph_round_usage_line() {  # <run-dir> <round> <builder-count> <reviewer-count>
 import glob
 import json
 import os
+import re
 import sys
 
 (run_dir, round_id, timestamp, builder_provider, builder_model,
@@ -64,12 +65,69 @@ if "unknown" in (input_tokens, output_tokens, cached_tokens):
 else:
     total_tokens = input_tokens + output_tokens + cached_tokens
 
+# Provider-reported model (from the #40 usage-sidecar family, see reported-model.sh).
+# Absent sidecar or absent field -> "unknown", never fabricated. When several
+# iterations of the same role ran this round, the LAST iteration that reported a
+# model wins (mirrors how the round's own PASS/FAIL is decided by the final attempt).
+def reported_model(role):
+    pattern = os.path.join(run_dir, "task-{}-iter-*-{}.model.json".format(round_id, role))
+
+    def iter_num(p):
+        m = re.search(r"-iter-(\d+)-", os.path.basename(p))
+        return int(m.group(1)) if m else -1
+
+    for sidecar in sorted(glob.glob(pattern), key=iter_num, reverse=True):
+        try:
+            with open(sidecar, encoding="utf-8") as handle:
+                value = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        model = value.get("model") if isinstance(value, dict) else None
+        if isinstance(model, str) and model.strip():
+            return model
+    return "unknown"
+
+def model_match(requested, reported):
+    # "default" means no explicit pin was requested, so there is nothing to confirm
+    # or contradict -- not evidence of a mismatch. A single reported model is also not
+    # proof a pin WAS honored: some providers (e.g. Z.AI's Anthropic-compatible
+    # endpoint) can normalize/alias model names, so "match" here means "consistent
+    # with the pin", not "verified against the provider".
+    if reported == "unknown" or requested == "default":
+        return "unknown"
+    return "match" if requested == reported else "mismatch"
+
+builder_reported_model = reported_model("builder")
+reviewer_reported_model = reported_model("reviewer")
+builder_model_match = model_match(builder_model, builder_reported_model)
+reviewer_model_match = model_match(reviewer_model, reviewer_reported_model)
+
+for role, requested, reported, match in (
+    ("builder", builder_model, builder_reported_model, builder_model_match),
+    ("reviewer", reviewer_model, reviewer_reported_model, reviewer_model_match),
+):
+    if match == "mismatch":
+        print(
+            "ralph: NOTE: {} routing mismatch — requested model '{}' but provider "
+            "reported '{}'. A single reported model is not proof a pin was honored "
+            "(some providers normalize/alias model names).".format(role, requested, reported),
+            file=sys.stderr,
+        )
+
 record = {
     "timestamp": timestamp,
     "round": "task-{}".format(round_id),
     "agents": {
-        "builder": {"provider": builder_provider, "requested_model": builder_model, "role": "builder"},
-        "reviewer": {"provider": reviewer_provider, "requested_model": reviewer_model, "role": "reviewer"},
+        "builder": {
+            "provider": builder_provider, "requested_model": builder_model,
+            "reported_model": builder_reported_model, "model_match": builder_model_match,
+            "role": "builder",
+        },
+        "reviewer": {
+            "provider": reviewer_provider, "requested_model": reviewer_model,
+            "reported_model": reviewer_reported_model, "model_match": reviewer_model_match,
+            "role": "reviewer",
+        },
     },
     "invocations": {
         "builder_attempts": builder_count,
@@ -94,9 +152,12 @@ print(
     "USAGE timestamp={} round=task-{} "
     "builder_provider={} builder_model={} reviewer_provider={} reviewer_model={} roles=builder,reviewer "
     "builder_attempts={} reviewer_attempts={} quota_rejected={} "
-    "input={} output={} cached={} total={}".format(
+    "input={} output={} cached={} total={} "
+    "builder_reported_model={} builder_model_match={} "
+    "reviewer_reported_model={} reviewer_model_match={}".format(
         timestamp, round_id, builder_provider, builder_model, reviewer_provider, reviewer_model,
         builder_count, reviewer_count, quota_count, shown(input_tokens), shown(output_tokens),
-        shown(cached_tokens), shown(total_tokens)))
+        shown(cached_tokens), shown(total_tokens),
+        builder_reported_model, builder_model_match, reviewer_reported_model, reviewer_model_match))
 PY
 }

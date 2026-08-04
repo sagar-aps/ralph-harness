@@ -39,6 +39,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/review-config.sh"; }
 [[ -f "$SCRIPT_DIR/round-usage.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/round-usage.sh"; }
+[[ -f "$SCRIPT_DIR/reported-model.sh" ]] && { # shellcheck source=/dev/null
+  . "$SCRIPT_DIR/reported-model.sh"; }
 # Untracked local overrides (gitignored) — sourced LAST so they win. Copy
 # config.local.sh.example to config.local.sh to define/override backends & roles.
 # RALPH_NO_LOCAL_CONFIG=1 skips it — used by the test suite so a developer's machine
@@ -683,6 +685,10 @@ run_backend() {
     fi
   ) 2>&1 | tee "$logfile"
   status=${PIPESTATUS[0]}
+  # Reported-model capture MUST run before extract_usage: extract_usage rewrites
+  # $logfile from raw JSON to plain text in place, so the model id has to be pulled
+  # out of the untouched log first.
+  ralph_capture_reported_model "$logfile" "${logfile%.*}.model.json"
   # Always attempt extraction (safe no-op for non-JSON): if json output ever reaches
   # the verdict grep un-extracted, it silently never matches -> ERROR-retry storm.
   extract_usage "$logfile" "${logfile%.*}.usage.json"
