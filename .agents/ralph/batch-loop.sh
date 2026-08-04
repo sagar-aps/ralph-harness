@@ -225,10 +225,13 @@ REVIEWER_REQUESTED_MODEL="${REVIEWER_REQUESTED_MODEL:-default}"
 # broken; revisit when #44 lands.
 #
 # run_backend's extraction (always on) turns either shape back into the plain-text log
-# the verdict grep reads, so this stays safe. Off by default.
+# the verdict grep reads, and an unrecognised JSON shape is salvaged rather than left to
+# break the verdict parse (see extract_usage) -- which is what makes this safe to have
+# ON BY DEFAULT. Cost visibility is the whole point of the harness on capped plans, so
+# it is opt-OUT: set RALPH_USAGE=0 to disable.
 RALPH_CLAUDE_LIKE="${RALPH_CLAUDE_LIKE:-claude rlaude zlaude}"
 RALPH_CODEX_LIKE="${RALPH_CODEX_LIKE:-codex}"
-if [[ "${RALPH_USAGE:-0}" == "1" ]]; then
+if [[ "${RALPH_USAGE:-1}" == "1" ]]; then
   add_json_flag() {
     local c="$1" first name rest
     first="${c%% *}"; name="$(basename "$first")"
@@ -545,6 +548,7 @@ PY
 extract_usage() {  # <logfile> <sidecar>
   local log="$1" side="$2"
   [[ -s "$log" ]] || return 0
+  rm -f "$side.shape-drift" 2>/dev/null || true
   python3 - "$log" "$side" <<'PY' 2>/dev/null || true
 import json, sys
 log, side = sys.argv[1], sys.argv[2]
@@ -592,7 +596,42 @@ if obj is None:
                 and it.get("type") == "agent_message" and isinstance(it.get("text"), str):
             texts.append(it["text"])
     if usage is None:
-        sys.exit(0)   # neither shape -> leave the log alone, write no sidecar
+        # UNKNOWN JSON SHAPE. This is the dangerous case and the reason usage capture
+        # can be on by default: if a CLI renames its events, leaving the raw JSON in
+        # the log means the reviewer's `^VERDICT:` grep never matches -> every attempt
+        # becomes REVIEWER_UNAVAILABLE and retries to MAX_ITERATIONS, on every run, with
+        # a symptom that points nowhere near the cause.
+        #
+        # So salvage correctness and give up only on the metrics: walk the events for
+        # any string under a "text" key at any depth (the generic assistant-text shape)
+        # and rebuild a plain-text log from those. Metrics degrade to absent; the verdict
+        # still parses. A loud stderr note names the shape so it gets fixed.
+        if events:
+            found = []
+            def harvest(o, depth=0):
+                if depth > 8 or len(found) > 200:
+                    return
+                if isinstance(o, dict):
+                    t = o.get("text")
+                    if isinstance(t, str) and t.strip():
+                        found.append(t)
+                    for v in o.values():
+                        harvest(v, depth + 1)
+                elif isinstance(o, list):
+                    for v in o:
+                        harvest(v, depth + 1)
+            for e in events:
+                harvest(e)
+            if found:
+                salvaged = "\n".join(found).rstrip() + "\n"
+                if len(salvaged) > 256 * 1024:
+                    salvaged = salvaged[: 256 * 1024] + "\n[...truncated by harness...]\n"
+                open(log, "w", encoding="utf-8").write(salvaged)
+                try:
+                    open(side + ".shape-drift", "w", encoding="utf-8").write("1\n")
+                except Exception:
+                    pass
+        sys.exit(0)   # no sidecar either way
     if texts:
         open(log, "w", encoding="utf-8").write("\n".join(texts).rstrip() + "\n")
     num = lambda x: x if isinstance(x, (int, float)) else None
@@ -626,6 +665,10 @@ json.dump({
 }, open(side, "w", encoding="utf-8"), indent=2)
 open(side, "a", encoding="utf-8").write("\n")
 PY
+  if [[ -f "$side.shape-drift" ]]; then
+    rm -f "$side.shape-drift"
+    echo "ralph: WARNING: agent emitted JSON in an unrecognised shape: recovered the text so the verdict still parses, but usage metrics were NOT captured for this attempt. The backend CLI likely changed its event names - update extract_usage in batch-loop.sh (see .agents/ralph/references/TOKEN_ECONOMICS.md)." >&2
+  fi
 }
 
 run_backend() {

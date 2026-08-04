@@ -65,20 +65,24 @@
 # ---------------------------------------------------------------------------
 # 5) Per-attempt token/cost usage (cost visibility on capped plans)
 # ---------------------------------------------------------------------------
-# RALPH_USAGE=1 makes instrumented builders/reviewers emit machine-readable usage in
+# RALPH_USAGE makes instrumented builders/reviewers emit machine-readable usage in
 # `ralph batch`, and writes a per-attempt sidecar next to each attempt log:
 #   .agent-run/<run>/task-<NNN>-iter-<N>-<role>.usage.json
 # with numeric input/output/cache_read/cache_creation tokens (plus num_turns,
-# duration_ms and total_cost_usd where the backend reports them). Off by default —
-# uncomment the line below to make it the default on THIS machine.
-# : "${RALPH_USAGE:=1}"
+# duration_ms and total_cost_usd where the backend reports them).
+#
+# ON BY DEFAULT — cost visibility is opt-OUT, not opt-in. Uncomment to disable on
+# THIS machine:
+# : "${RALPH_USAGE:=0}"
 #
 # Which backends are instrumented, and with what (see references/TOKEN_ECONOMICS.md):
 #   claude family  --output-format json   cache_read_input_tokens / cache_creation_input_tokens
 #   codex          --json (JSONL)         cached_input_tokens / cache_write_input_tokens
 #   opencode       not instrumented       output shape unverified while it hangs (#44)
 # Anything else is left untouched. The JSON is always extracted back to plain text
-# before the verdict parse, so enabling this never causes spurious reviewer ERRORs.
+# before the verdict parse, so this never causes spurious reviewer ERRORs — including
+# when a CLI changes its event names: an unrecognised shape is salvaged for its text
+# (verdict still parses) and the harness warns that metrics were skipped.
 #
 # Covers the bare `claude` binary and claude-CLI wrappers (rlaude/zlaude), plus `codex`.
 # Add other wrapper names if you use them:

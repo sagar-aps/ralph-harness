@@ -56,6 +56,13 @@ retry prompt**. Fixed by extracting the findings block (#41).
 Before optimising a prompt for caching, check whether the content needs to be there
 at all.
 
+**Version caveat on that example.** The 64-84 % figures come from archived runs on
+codex **0.133.0 / 0.145.0**, which echoed the input prompt to stdout. Codex **0.146.0
+does not** — a 12,006 B prompt produced 3 bytes of stdout. So on current codex that
+particular win is ~nil; the extraction remains as version-defence (older codex, other
+CLIs) and as a cap on runaway reviewer output. Measure your own CLI version before
+quoting a saving.
+
 ---
 
 ## 3. Provider facts
@@ -95,6 +102,12 @@ inference will work.
 
 All three have a JSON mode. Field names differ from the underlying APIs — use these,
 not the provider docs' names.
+
+Usage capture is **on by default** (`RALPH_USAGE=0` to disable). It is safe to default
+because an unrecognised JSON shape is salvaged rather than left to break the verdict
+grep: the harness recovers any `text` values, rewrites the log so `^VERDICT:` still
+matches, writes no sidecar, and warns that metrics were skipped. A CLI renaming its
+events therefore costs metrics, never a run.
 
 | backend | flag | cache-read field | cache-write field |
 |---|---|---|---|

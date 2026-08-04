@@ -154,7 +154,10 @@ console.log("7) dry run end-to-end: RALPH_PROFILE + --profile resolve through `r
     const out = `${r.stdout}${r.stderr}`;
     check(r.status === 0, `dry-run batch with --profile resolves and exits 0 (got ${r.status})`);
     check(/builder:\s+ralph-build\s+->\s+codex exec .*model_reasoning_effort=high/.test(out), "--builder-effort high overrode the cheap preset through the CLI");
-    check(/reviewer:\s+ralph-review .*->\s+codex exec --sandbox read-only/.test(out), "reviewer composed read-only from the preset");
+    // `--json` may sit between `exec` and the sandbox flag when usage capture is on
+    // (the default — see RALPH_USAGE in batch-loop.sh). The property under test is that
+    // the reviewer is composed READ-ONLY, which the optional flag does not affect.
+    check(/reviewer:\s+ralph-review .*->\s+codex exec (?:--json )?--sandbox read-only/.test(out), "reviewer composed read-only from the preset");
   } finally {
     try { rmSync(wt, { recursive: true, force: true }); } catch {}
     rmSync(target, { recursive: true, force: true });
