@@ -237,6 +237,69 @@ console.log("3) builder prompt: cache-key window is byte-identical ACROSS RUNS")
   }
 }
 
+console.log("4) PREVIOUS_REVIEW carries the reviewer's FINDINGS, not its raw stdout (#41)");
+{
+  const target = makeTarget();
+  const plan = onePlan();
+  const primer = makePrimer();
+  // A reviewer that behaves like codex: echo the whole input prompt to stdout (so the
+  // echo contains the template's OWN headings and VERDICT examples), then reply.
+  const ECHOREV =
+    'bash -c \'cat; printf "\\n### Must-fix issues\\n- SENTINEL-MUSTFIX tighten the regex\\n\\n### Evidence\\n- file.py:1\\n\\nVERDICT: FAIL\\n"\'';
+  try {
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "echorev",
+        "--primer", primer.file, "--auto-approve-builder", "--max-tasks", "1", "--max-iterations", "2"],
+      { RALPH_AGENT_RETRY_DELAY: "0", RALPH_DRY_RUN: "", RALPH_WORKTREE_DIR: wtBase(target),
+        AGENT_FB_CMD: FB, AGENT_ECHOREV_CMD: ECHOREV },
+    );
+    const runDir = latestRunDir(target);
+    const raw = readFileSync(path.join(runDir, "task-001-iter-1-reviewer.md"), "utf-8");
+    const fb = readFileSync(path.join(runDir, "task-001-iter-1-reviewer-feedback.md"), "utf-8");
+    const p2 = readFileSync(path.join(runDir, "task-001-iter-2-builder-prompt.md"), "utf-8");
+
+    check(raw.includes("Git diff produced by the builder"), "raw reviewer log did echo its input (fixture is representative)");
+    check(fb.length < raw.length / 2, `feedback is much smaller than raw stdout (${fb.length} B vs ${raw.length} B)`);
+    check(fb.trimStart().startsWith("### Must-fix issues"), "feedback starts at the findings block, not the echoed template");
+    check(fb.includes("SENTINEL-MUSTFIX"), "the actual must-fix item survived");
+    check(fb.trimEnd().endsWith("VERDICT: FAIL"), "feedback ends at the verdict line");
+    check(!fb.includes("Git diff produced by the builder"), "echoed git diff is NOT in the feedback");
+
+    check(p2.includes("SENTINEL-MUSTFIX"), "the builder's retry prompt carries the must-fix item");
+    check(!p2.includes("Git diff produced by the builder"), "the builder's retry prompt does NOT carry the echoed diff");
+  } finally {
+    cleanup(target);
+    rmSync(plan, { recursive: true, force: true });
+    rmSync(primer.dir, { recursive: true, force: true });
+  }
+}
+
+console.log("5) unrecognisable reviewer output falls back to the raw log (never drop feedback)");
+{
+  const target = makeTarget();
+  const plan = onePlan();
+  const primer = makePrimer();
+  // No findings headings at all — just a bare verdict plus prose.
+  const BARE = 'bash -c \'printf "the diff is wrong in several places\\nVERDICT: FAIL\\n"\'';
+  try {
+    ralph(
+      ["batch", "--repo", target, "--plan", plan, "--builder", "fb", "--reviewer", "barerev",
+        "--primer", primer.file, "--auto-approve-builder", "--max-tasks", "1", "--max-iterations", "2"],
+      { RALPH_AGENT_RETRY_DELAY: "0", RALPH_DRY_RUN: "", RALPH_WORKTREE_DIR: wtBase(target),
+        AGENT_FB_CMD: FB, AGENT_BAREREV_CMD: BARE },
+    );
+    const runDir = latestRunDir(target);
+    const fb = readFileSync(path.join(runDir, "task-001-iter-1-reviewer-feedback.md"), "utf-8");
+    const p2 = readFileSync(path.join(runDir, "task-001-iter-2-builder-prompt.md"), "utf-8");
+    check(fb.includes("the diff is wrong"), "fell back to raw output rather than emitting nothing");
+    check(p2.includes("the diff is wrong"), "builder still receives the feedback on retry");
+  } finally {
+    cleanup(target);
+    rmSync(plan, { recursive: true, force: true });
+    rmSync(primer.dir, { recursive: true, force: true });
+  }
+}
+
 if (failures) {
   console.error(`\n${failures} check(s) failed`);
   process.exit(1);

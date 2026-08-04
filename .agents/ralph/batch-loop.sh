@@ -451,6 +451,43 @@ PY
 # regression. Extracting `.result` back into the log the grep reads prevents that.
 # Safe no-op for plain-text backends (codex/opencode/etc.): the log is left untouched
 # and no sidecar is written. python3 is already a hard dependency of this loop.
+# Trim a reviewer stdout log down to its findings block, for feeding back to the next
+# builder attempt as {{PREVIOUS_REVIEW}}. Raw stdout is kept on disk untouched; this
+# only changes what gets RE-SENT. On any doubt it copies the raw log — never drop
+# reviewer feedback, which is correctness-critical to the iterate loop. (#41)
+extract_review_findings() {  # <raw reviewer log> <dst feedback file>
+  local raw="$1" dst="$2"
+  [[ -s "$raw" ]] || { : > "$dst"; return 0; }
+  python3 - "$raw" "$dst" <<'PY' 2>/dev/null || cp "$raw" "$dst" 2>/dev/null || true
+import re, sys
+raw_p, dst_p = sys.argv[1], sys.argv[2]
+raw = open(raw_p, encoding="utf-8", errors="replace").read()
+# Anchors. end: the LAST "VERDICT: X" line (template says write nothing after it).
+# window: everything after the last echoed-template tail marker, if the backend echoed
+# our prompt -- otherwise the template's OWN heading/VERDICT examples win the match.
+# start: the earliest findings heading inside that window.
+HEADINGS = ("### Must-fix issues", "### Should-fix issues", "### Evidence", "### Blocker report")
+TEMPLATE_TAIL = "Write nothing after it."
+MAX_BYTES = 64 * 1024
+last = None
+for last in re.finditer(r"^VERDICT:[ \t]*(PASS|FAIL|BLOCKED)[ \t]*$", raw, re.M):
+    pass
+if not last:
+    raise SystemExit(1)                       # no verdict -> fall back to raw
+cut = raw.rfind(TEMPLATE_TAIL, 0, last.start())
+lo = cut + len(TEMPLATE_TAIL) if cut >= 0 else 0
+window = raw[lo:last.start()]
+hits = [h for h in (window.find(x) for x in HEADINGS) if h >= 0]
+if not hits:
+    raise SystemExit(1)                       # no findings block -> fall back to raw
+out = raw[lo + min(hits):last.end()].strip() + "\n"
+if len(out) > MAX_BYTES:
+    out = out[:MAX_BYTES] + "\n[...truncated by harness...]\n"
+open(dst_p, "w", encoding="utf-8").write(out)
+PY
+  [[ -s "$dst" ]] || cp "$raw" "$dst" 2>/dev/null || true
+}
+
 extract_usage() {  # <logfile> <sidecar>
   local log="$1" side="$2"
   [[ -s "$log" ]] || return 0
@@ -842,6 +879,9 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     ITER_HANDOFF="$RUN_DIR/task-$IDX-iter-$ITER-handoff.md"
     REVIEWER_PROMPT_R="$RUN_DIR/task-$IDX-iter-$ITER-reviewer-prompt.md"
     ITER_REVIEWER_OUT="$RUN_DIR/task-$IDX-iter-$ITER-reviewer.md"
+    # Trimmed findings actually re-sent to the next builder attempt (#41). Kept as its
+    # own artifact so what the builder saw is auditable next to the raw stdout.
+    ITER_REVIEWER_FB="$RUN_DIR/task-$IDX-iter-$ITER-reviewer-feedback.md"
 
     export R_TASK_NUM="$IDX" R_TASK_TITLE="$TITLE" R_TASK_FILE="$TASK_FILE" \
            R_CONTEXT_FILE="$CONTEXT_FILE" HANDOFF_PATH \
@@ -957,7 +997,13 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
       PREV_VERIFY="$ITER_VERIFY_LOG"
     fi
     # Feed this attempt's reviewer + check logs back into the next builder attempt.
-    PREV_REVIEW="$ITER_REVIEWER_OUT"; PREV_CHECK="$ITER_CHECK_LOG"
+    # Send the reviewer's FINDINGS, not its raw stdout: argv/stdin CLIs like codex echo
+    # the whole input prompt (including the builder's own git diff) before replying, so
+    # re-sending the log verbatim round-trips 60-85% of a retry prompt back to the
+    # builder. Falls back to the raw log if no findings block is recognisable, so
+    # feedback is never silently dropped. (#41)
+    extract_review_findings "$ITER_REVIEWER_OUT" "$ITER_REVIEWER_FB"
+    PREV_REVIEW="$ITER_REVIEWER_FB"; PREV_CHECK="$ITER_CHECK_LOG"
     [[ "$ITER" -lt "$MAX_ITERATIONS" ]] && echo "    not passing — retrying with feedback"
   done
 
