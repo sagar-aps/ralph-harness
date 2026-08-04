@@ -42,6 +42,23 @@ Keep this file short. It is always loaded into context.
   `<target>/.ralph/last-run.env`; artifacts: `<target>/.ralph/runs/<run-id>/` (review)
   or `<target>/.agent-run/batch-<ts>/` (batch).
 
+## Token economics (read before reasoning about cost or caching)
+
+A batch here can burn hundreds of millions of tokens, and most intuitive assumptions
+about prompt caching in this repo are wrong. **`.agents/ralph/references/TOKEN_ECONOMICS.md`**
+is the single source of truth for provider cache behaviour, cached-token pricing, and
+how to read usage out of each CLI. Read it before you claim a change will reduce spend,
+edit a `PROMPT_*` template, or add a usage/cache column to a report.
+
+The three things people get wrong most often:
+
+- **Prompt caching works on the claude family and NOT on codex** (measured). Do not
+  promise cache savings on a codex-backed run.
+- **Deleting a token beats caching it** — cached tokens still bill at 10–20 %.
+- **Prompt-template ordering is load-bearing.** Templates are ordered most-stable-first
+  around a `DYNAMIC BOUNDARY`; one per-attempt token above it invalidates everything
+  below. `tests/prompt-cache-prefix.mjs` enforces this.
+
 ## Quirks / Guardrails
 **Add any common quirks guiderails here as needed**
 

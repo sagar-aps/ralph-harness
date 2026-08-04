@@ -77,6 +77,9 @@ at <where>, go"):
 1. Read this charter and the harness label protocol at
    `.agents/ralph/references/LABELS.md`. (You do **not** read the target's CLAUDE.md /
    AGENTS.md — repo knowledge is the Builder's and the Manager's, not yours.)
+   Also read `.agents/ralph/references/TOKEN_ECONOMICS.md` before choosing backends per
+   role or estimating spend: prompt caching works on the claude family and **not** on
+   codex (measured), so a retry-heavy run's cost profile depends on that choice.
    Then **arm the floor guard**: `source .agents/ralph/floor-guard.sh` (see "Identity and
    the hard floor" — it mechanically refuses merge/approve/default-push, no App required).
 2. Run `ralph init-target --repo <target>` (installs the Manager + builder skills, task
