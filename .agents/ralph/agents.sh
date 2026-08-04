@@ -32,6 +32,56 @@ AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt}"
 
 DEFAULT_AGENT="codex"
 
+# Print the values selected by --model VALUE, --model=VALUE, or -m VALUE in a
+# command template, one per line. Python shlex keeps quoted wrapper arguments
+# intact without evaluating any part of the command.
+ralph_command_model_values() {  # <command>
+  python3 - "$1" <<'PY'
+import shlex
+import sys
+
+try:
+    words = shlex.split(sys.argv[1])
+except ValueError as exc:
+    print(f"ralph: cannot inspect backend model selectors: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+i = 0
+while i < len(words):
+    word = words[i]
+    if word in ("--model", "-m"):
+        if i + 1 >= len(words):
+            print(f"ralph: backend model selector {word} has no value", file=sys.stderr)
+            raise SystemExit(1)
+        print(words[i + 1])
+        i += 2
+        continue
+    if word.startswith("--model="):
+        value = word.split("=", 1)[1]
+        if not value:
+            print("ralph: backend model selector --model= has no value", file=sys.stderr)
+            raise SystemExit(1)
+        print(value)
+    i += 1
+PY
+}
+
+ralph_validate_model_selectors() {  # <command label> <command>
+  local label="$1" values count first rest
+  values="$(ralph_command_model_values "$2")" || return 1
+  [[ -n "$values" ]] || return 0
+  count="$(printf '%s\n' "$values" | wc -l | tr -d ' ')"
+  [[ "$count" -le 1 ]] && return 0
+  first="${values%%$'\n'*}"
+  rest="${values#*$'\n'}"
+  if [[ "$rest" == "$first" && "$rest" != *$'\n'* ]]; then
+    echo "ralph: duplicate model selectors in $label both select '$first'; keep exactly one model selector" >&2
+  else
+    echo "ralph: conflicting model selectors in $label select '$first' and '$(printf '%s' "$rest" | tr '\n' ',')'; keep exactly one authoritative model selector" >&2
+  fi
+  return 1
+}
+
 # Resolve a backend NAME (e.g. "claude", "opencode-z", "codex-readonly") to its
 # command template. Unknown names fall back to AGENT_<UPPER_WITH_UNDERSCORES>_CMD
 # so new backends only need a variable defined here or in config.sh — no code
@@ -40,22 +90,24 @@ resolve_backend_cmd() {
   # Note: do NOT inline `${VAR:-default}` fallbacks here — the templates contain
   # `{prompt}` whose `}` would prematurely close the expansion. All AGENT_*_CMD
   # vars are defined above (or in config.sh), so a plain expansion is correct.
-  local name="$1"
+  local name="$1" cmd
   case "$name" in
-    claude)          echo "${AGENT_CLAUDE_CMD}" ;;
-    droid)           echo "${AGENT_DROID_CMD}" ;;
-    opencode)        echo "${AGENT_OPENCODE_CMD}" ;;
-    opencode-z)      echo "${AGENT_OPENCODE_Z_CMD}" ;;
-    codex|"")        echo "${AGENT_CODEX_CMD}" ;;
-    codex-write)     echo "${AGENT_CODEX_WRITE_CMD}" ;;
-    codex-readonly)  echo "${AGENT_CODEX_READONLY_CMD}" ;;
+    claude)          cmd="${AGENT_CLAUDE_CMD}" ;;
+    droid)           cmd="${AGENT_DROID_CMD}" ;;
+    opencode)        cmd="${AGENT_OPENCODE_CMD}" ;;
+    opencode-z)      cmd="${AGENT_OPENCODE_Z_CMD}" ;;
+    codex|"")        cmd="${AGENT_CODEX_CMD}" ;;
+    codex-write)     cmd="${AGENT_CODEX_WRITE_CMD}" ;;
+    codex-readonly)  cmd="${AGENT_CODEX_READONLY_CMD}" ;;
     *)
       # Generic fallback: foo-bar -> $AGENT_FOO_BAR_CMD
       local var
       var="AGENT_$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')_CMD"
-      echo "${!var:-}"
+      cmd="${!var:-}"
       ;;
   esac
+  ralph_validate_model_selectors "backend '$name'" "$cmd" || return 1
+  printf '%s\n' "$cmd"
 }
 
 # Detect an exhausted provider usage window in a captured backend log. This is
@@ -183,28 +235,41 @@ ralph_effort_flag() {  # <provider> <effort>
 }
 
 ralph_provider_cmd() {  # <mode: build|review> <provider> <model> <effort>
-  local mode="$1" provider="$2" model="$3" effort="$4" e mflag
+  local mode="$1" provider="$2" model="$3" effort="$4" e mflag cmd base values
   e="$(ralph_effort_flag "$provider" "$effort")"
   case "$provider" in
     codex)
       mflag=""; [[ -n "$model" ]] && mflag=" -m $model"
       if [[ "$mode" == "review" ]]; then
-        printf 'codex exec --sandbox read-only%s%s -' "$mflag" "$e"
+        cmd="$(printf 'codex exec --sandbox read-only%s%s -' "$mflag" "$e")"
       else
-        printf 'codex exec --yolo --skip-git-repo-check%s%s -' "$mflag" "$e"
+        cmd="$(printf 'codex exec --yolo --skip-git-repo-check%s%s -' "$mflag" "$e")"
       fi ;;
     claude)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
-      printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude%s -p --dangerously-skip-permissions' "$mflag" ;;
+      cmd="$(printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude%s -p --dangerously-skip-permissions' "$mflag")" ;;
     opencode)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
-      printf 'opencode run%s' "$mflag" ;;
+      cmd="$(printf 'opencode run%s' "$mflag")" ;;
     droid)
-      printf 'droid exec --skip-permissions-unsafe -f {prompt}' ;;
+      cmd='droid exec --skip-permissions-unsafe -f {prompt}' ;;
     *)
-      # Unknown provider name: fall back to a same-named backend template if one exists.
-      printf '%s' "$(resolve_backend_cmd "$provider")" ;;
+      # A custom provider is a wrapper backend. Reconcile its default model with
+      # Ralph's explicit role model before composing the final command.
+      base="$(resolve_backend_cmd "$provider")" || return 1
+      cmd="$base"
+      if [[ -n "$model" ]]; then
+        values="$(ralph_command_model_values "$base")" || return 1
+        if [[ -z "$values" ]]; then
+          cmd="$base --model $model"
+        elif [[ "$values" != "$model" ]]; then
+          echo "ralph: model selection conflict for $mode provider '$provider': wrapper selects '$values' but Ralph explicitly requested '$model'; remove the wrapper model selector or omit Ralph's model setting" >&2
+          return 1
+        fi
+      fi ;;
   esac
+  ralph_validate_model_selectors "$mode provider '$provider' command" "$cmd" || return 1
+  printf '%s' "$cmd"
 }
 
 # A preset fills any UNSET knob (an explicit spec still wins via :=).
@@ -218,12 +283,15 @@ ralph_apply_profile() {  # <profile>
 }
 
 ralph_resolve_role_agents() {
+  local build_cmd review_cmd
   # Act only if the operator asked for normalized selection.
   [[ -n "${RALPH_PROFILE:-}${BUILDER_PROVIDER:-}${REVIEWER_PROVIDER:-}${BUILDER_MODEL:-}${REVIEWER_MODEL:-}${BUILDER_EFFORT:-}${REVIEWER_EFFORT:-}" ]] || return 0
   [[ -n "${RALPH_PROFILE:-}" ]] && ralph_apply_profile "$RALPH_PROFILE"
   : "${BUILDER_PROVIDER:=codex}" "${REVIEWER_PROVIDER:=codex}"
-  AGENT_RALPH_BUILD_CMD="$(ralph_provider_cmd build "$BUILDER_PROVIDER" "${BUILDER_MODEL:-}" "${BUILDER_EFFORT:-}")"
-  AGENT_RALPH_REVIEW_CMD="$(ralph_provider_cmd review "$REVIEWER_PROVIDER" "${REVIEWER_MODEL:-}" "${REVIEWER_EFFORT:-}")"
+  build_cmd="$(ralph_provider_cmd build "$BUILDER_PROVIDER" "${BUILDER_MODEL:-}" "${BUILDER_EFFORT:-}")" || return 1
+  review_cmd="$(ralph_provider_cmd review "$REVIEWER_PROVIDER" "${REVIEWER_MODEL:-}" "${REVIEWER_EFFORT:-}")" || return 1
+  AGENT_RALPH_BUILD_CMD="$build_cmd"
+  AGENT_RALPH_REVIEW_CMD="$review_cmd"
   export AGENT_RALPH_BUILD_CMD AGENT_RALPH_REVIEW_CMD
   # Point the roles at the synthetic backends unless already pinned (flag/env wins).
   : "${BUILDER:=ralph-build}" "${REVIEWER:=ralph-review}"

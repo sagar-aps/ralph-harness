@@ -24,6 +24,7 @@ function resolve(env) {
     strip_autoapprove(){ sed -E 's/ --dangerously-skip-permissions//g; s/ --skip-permissions-unsafe//g; s/ --yolo//g'; }
     source ${JSON.stringify(agentsSh)}
     ralph_resolve_role_agents
+    echo "STATUS=$?"
     echo "BUILDER=\${BUILDER:-<unset>}"
     echo "REVIEWER=\${REVIEWER:-<unset>}"
     echo "BUILD=\${AGENT_RALPH_BUILD_CMD:-<unset>}"
@@ -35,7 +36,7 @@ function resolve(env) {
   const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", env: { ...process.env, ...env } });
   const out = `${r.stdout}${r.stderr}`;
   const get = (k) => (out.match(new RegExp(`^${k}=(.*)$`, "m")) || [])[1] ?? "";
-  return { BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), CLAUDE: get("CLAUDE"), OPENCODE: get("OPENCODE"), raw: out };
+  return { status: Number(get("STATUS")), BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), CLAUDE: get("CLAUDE"), OPENCODE: get("OPENCODE"), raw: out };
 }
 
 const claudeEnvUnsetPrefix = "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude";
@@ -113,7 +114,25 @@ done
   rmSync(fixture, { recursive: true, force: true });
 }
 
-console.log("6) dry run end-to-end: RALPH_PROFILE + --profile resolve through `ralph batch`");
+console.log("6) wrapper model hygiene: one authoritative selector or an early conflict");
+{
+  const base = { BUILDER_PROVIDER: "wrapped", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" };
+  const matching = resolve({ ...base, AGENT_WRAPPED_CMD: "wrapped --model opus -p", BUILDER_MODEL: "opus" });
+  check(matching.status === 0 && matching.BUILD === "wrapped --model opus -p", "matching wrapper and Ralph models compose with one selector");
+  check((matching.BUILD.match(/--model/g) || []).length === 1, "matching model selector is not duplicated");
+
+  const missing = resolve({ ...base, AGENT_WRAPPED_CMD: "wrapped -p", BUILDER_MODEL: "glm-4.7" });
+  check(missing.status === 0 && missing.BUILD === "wrapped -p --model glm-4.7", "wrapper without a model receives Ralph's single explicit selector");
+
+  const conflict = resolve({ ...base, AGENT_WRAPPED_CMD: "wrapped --model opus -p", BUILDER_MODEL: "glm-4.7" });
+  check(conflict.status !== 0, "conflicting wrapper and Ralph models fail during resolution");
+  check(conflict.raw.includes("wrapper selects 'opus' but Ralph explicitly requested 'glm-4.7'"), "conflict error names both model values");
+
+  const duplicate = resolve({ ...base, AGENT_WRAPPED_CMD: "wrapped --model opus --model opus -p", BUILDER_MODEL: "" });
+  check(duplicate.status !== 0 && duplicate.raw.includes("duplicate model selectors") && duplicate.raw.includes("'opus'"), "duplicate selectors fail before command dispatch with their value");
+}
+
+console.log("7) dry run end-to-end: RALPH_PROFILE + --profile resolve through `ralph batch`");
 {
   const target = mkdtempSync(path.join(tmpdir(), "ralph-as-"));
   const g = (args) => spawnSync("git", args, { cwd: target, encoding: "utf-8" });

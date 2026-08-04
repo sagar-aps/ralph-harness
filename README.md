@@ -216,6 +216,11 @@ defaults without merge conflicts or leaking your setup. Precedence, highest firs
 contains `{prompt}` (a quoted prompt-file path is substituted) or reads the prompt
 from stdin — see `config.local.sh.example` for the full set of examples.
 
+When normalized selection supplies an explicit model for a custom wrapper, Ralph
+requires the wrapper command and the role setting to agree and composes exactly one
+model selector. Z.AI's usage API may normalize model names, so one model name in its
+usage report does not by itself confirm that the requested pin was honored.
+
 ### Run one PRD/task
 
 ```bash
