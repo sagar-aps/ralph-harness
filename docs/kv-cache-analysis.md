@@ -264,6 +264,75 @@ Two things fall out of this that are worth acting on independently:
    Fixing only the `## Context` block leaves this one, so the reorder must cover
    both or cross-run reuse stays broken.
 
+## Finding 5 — provider docs change the design, not just the rationale
+
+Read against each provider's own caching documentation (Aug 2026):
+
+| | OpenAI / codex | Z.AI / opencode | Anthropic / claude |
+|---|---|---|---|
+| mechanism | automatic prefix cache | implicit prefix cache | explicit `cache_control` |
+| minimum prefix | **1024 tok** | not documented | 512 / 1024 / 2048 / 4096 by model |
+| match rule | **exact prefix only** | "minor formatting differences may affect cache effectiveness" | exact prefix |
+| **cache-key routing** | **hash of the first ~256 tokens** (+ optional `prompt_cache_key`) | not documented | prefix |
+| cached-token price | cached-input rate; **writes cost 1.25×** on GPT-5.6+ | ~18.6 % of standard on pay-per-token; **0.1×** on the Coding Plan | 0.1× read, 1.25× write (5 m) / 2× (1 h) |
+| usage field | `usage.prompt_tokens_details.cached_tokens` (Chat Completions) / `usage.input_tokens_details.cached_tokens` (Responses) | `usage.prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` / `cache_creation_input_tokens` |
+| TTL | ≥30 min on GPT-5.6+ (`prompt_cache_options.ttl`); else 5–10 min idle, 1 h max | "reasonable time limits", unspecified | 5 min default, 1 h opt-in |
+| documented best practice | *"Structure prompts with static or repeated content at the beginning and dynamic, user-specific content at the end."* | identical-prefix recognition | stable content first |
+
+Note the Z.AI **caching guide** says cached tokens bill at "usually 50 % of
+standard price", but its **pricing** pages put GLM-5.2 cached input at
+$0.26 vs $1.40 (≈18.6 %) and the Coding Plan at 0.1×. The ticket's ~20 %
+premise is right; the guide's 50 % is stale generic wording. Treat the pricing
+page as authoritative.
+
+### The cache-key window changes the diagnosis for codex
+
+OpenAI routes on a hash of roughly the **first 256 tokens**. Anything dynamic
+inside that window doesn't merely shorten the prefix — it lands the request in a
+**different cache bucket entirely**. Measured against a real builder prompt,
+ralph has two dynamic markers inside that window, and one of them I had missed:
+
+| byte | ≈tok | marker | in key window? |
+|---|---|---|---|
+| ~448 | **~110** | `{{MAX_ITERATIONS}}` — *"You get up to N attempt(s)"*, line 8, **before the primer** | **yes** |
+| ~821 | ~205 | `{{TARGET_REPO}}` — worktree path embeds `RUN_ID` | **yes** |
+| ~860 | ~215 | `{{BRANCH}}` — embeds `RUN_ID` | **yes** |
+| ~3247 | ~811 | `{{TASK_NUMBER}}` / `{{TASK_TOTAL}}` / `{{ATTEMPT}}` | no |
+
+`{{MAX_ITERATIONS}}` demonstrably varies across the archives — `5` in the 21
+aug02 runs, `3` in the 9 aug0304 runs — so changing `--max-iterations` between
+runs silently changes the cache bucket on codex.
+
+So there are **two independent failures on OpenAI**, not one:
+
+1. **Routing miss** — `MAX_ITERATIONS`, worktree path and branch sit inside the
+   ~256-token key window, so no two runs share a bucket.
+2. **Below threshold** — even within one run the prefix caps at ~811 tokens,
+   under the 1024-token minimum.
+
+### Design constraints this imposes
+
+- **Moving the `## Context` block is not sufficient.** `{{MAX_ITERATIONS}}` is
+  embedded in the intro *prose* at ~110 tokens, ahead of everything. It has to be
+  rewritten out of that paragraph (or the attempt budget stated only in the
+  dynamic suffix) or the first 256 tokens still differ per run. A naive
+  block-move fix passes an attempt-to-attempt diff test and still misses.
+- **Target the first 256 tokens explicitly.** The gate should assert byte
+  identity over the first ~1 KB across runs, not only "up to the first dynamic
+  marker" — those are different assertions and only the former protects codex
+  routing.
+- **`prompt_cache_key` is worth investigating.** OpenAI accepts an explicit
+  cache-routing key. `agents.sh` already passes codex config through
+  (`codex exec -c model_reasoning_effort=…`), so `-c prompt_cache_key=<repo>`
+  may be plumbable — which would pin routing per *repo* instead of per *run* and
+  fix failure (1) independently of ordering. Unverified; needs a codex-CLI check.
+- **Z.AI's "minor formatting differences" wording is a caution.** Its matcher is
+  documented less strictly than OpenAI's "exact prefix". Don't assume Z.AI
+  tolerance justifies a looser gate — hold the strict byte-identical standard,
+  which satisfies all three providers.
+- **Anthropic remains ordering-only for ralph.** `cache_control` needs API
+  access ralph doesn't have (Finding 3). Ordering is still the whole lever there.
+
 ## Measurement: what is actually reportable
 
 | provider / CLI | cache field | how to get it | verdict |
