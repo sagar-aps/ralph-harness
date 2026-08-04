@@ -345,6 +345,34 @@ console.log("6) ralph cleanup removes worktree and handles a missing one");
   }
 }
 
+console.log("N) builder backend failure halts fast as BUILDER_UNAVAILABLE, not MAX_ITERATIONS retries [#37]");
+{
+  // NOT dry-run: a real fixture builder that exits non-zero (like opencode hitting
+  // 'Argument list too long'). The loop must halt after ONE attempt, not silently
+  // retry a dead backend for all iterations (which wasted issue-32's run).
+  const { target } = makeTarget();
+  try {
+    const r = ralph(
+      ["review", "1", "--repo", target, "--builder", "failb", "--reviewer", "okrev", "--max-iterations", "5", "--allow-dirty"],
+      {
+        RALPH_WORKTREE_DIR: wtDirFor(target),
+        AGENT_FAILB_CMD: 'bash -c "echo boom-backend-crashed >&2; exit 1"',
+        AGENT_OKREV_CMD: 'bash -c "printf \\"VERDICT: PASS\\n\\""',
+      },
+    );
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status !== 0, "review exits non-zero on builder backend failure");
+    check(/Builder backend .* ERROR \(exit=1\)/.test(out), "reports the builder ERROR with its exit code");
+    check(/BUILDER_UNAVAILABLE/.test(out) && !/FAILED_MAX_ITERATIONS/.test(out), "banner shows BUILDER_UNAVAILABLE, not FAILED_MAX_ITERATIONS");
+    const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(/STATUS=BUILDER_UNAVAILABLE/.test(lastRun), "last-run.env records BUILDER_UNAVAILABLE");
+    const attempts = readdirSync(latestRunDir(target)).filter((f) => /^builder_output_\d+\.log$/.test(f)).length;
+    check(attempts === 1, `only ONE builder attempt (got ${attempts}), not retried on a dead backend`);
+  } finally {
+    cleanupTarget(target);
+  }
+}
+
 if (failures) {
   console.error(`\nReview-loop smoke tests FAILED (${failures} assertion failure(s)).`);
   process.exit(1);

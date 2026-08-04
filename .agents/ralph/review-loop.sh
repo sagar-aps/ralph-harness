@@ -472,6 +472,7 @@ write_last_run "RUNNING"
 PREV_REVIEW=""; PREV_CHECK=""; PREV_PREVIEW=""; PREV_E2E=""
 OUTCOME="FAILED_MAX_ITERATIONS"
 ITERS_RUN=0
+BUILDER_ERROR=0
 PREVIEW_STARTED="false"
 PREVIEW_KEPT="false"
 LAST_PREVIEW_UP_LOG=""; LAST_E2E_LOG=""
@@ -509,7 +510,18 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     git -C "$WORKDIR" add -A >/dev/null 2>&1 || true
     git -C "$WORKDIR" commit -qm "ralph dry-run iter $i" >/dev/null 2>&1 || true
   else
-    set +e; run_backend "$BUILDER_CMD" "$BUILDER_PROMPT_R" "$BUILDER_LOG"; set -e
+    set +e; run_backend "$BUILDER_CMD" "$BUILDER_PROMPT_R" "$BUILDER_LOG"; BUILDER_RC=$?; set -e
+    if [[ "$BUILDER_RC" -ne 0 ]]; then
+      # #37: a non-zero builder exit is a BACKEND error (crash, quota, argv-too-long) —
+      # not work for the reviewer to judge. Fail fast with the reason instead of running
+      # check+reviewer and silently burning the remaining iterations on a dead backend
+      # (which is exactly what wasted issue-32's run: opencode hit 'Argument list too
+      # long' and produced nothing, yet the loop retried it 5x).
+      echo "Builder backend '$BUILDER' ERROR (exit=$BUILDER_RC) — halting review; no further iterations." >&2
+      echo "  last builder output:" >&2; tail -n 6 "$BUILDER_LOG" 2>/dev/null | sed 's/^/    /' >&2
+      OUTCOME="BUILDER_UNAVAILABLE"; BUILDER_ERROR=1
+      break
+    fi
   fi
 
   # 2. Check command (cwd = WORKDIR). Runs even in dry-run.
@@ -614,8 +626,10 @@ echo ""
 echo "═══════════════════════════════════════════════════════"
 if [[ "$OUTCOME" == "READY_FOR_HUMAN_REVIEW" ]]; then
   echo "  ✅ READY_FOR_HUMAN_REVIEW (after $ITERS_RUN iteration(s))"
+elif [[ "$OUTCOME" == "BUILDER_UNAVAILABLE" ]]; then
+  echo "  ❌ BUILDER_UNAVAILABLE — builder backend '$BUILDER' failed (exit ${BUILDER_RC:-?}); halted after $ITERS_RUN iteration(s)."
 else
-  echo "  ❌ FAILED_MAX_ITERATIONS ($MAX_ITERATIONS iterations)"
+  echo "  ❌ $OUTCOME (after $ITERS_RUN iteration(s))"
 fi
 echo "───────────────────────────────────────────────────────"
 echo "  Branch:    $BRANCH (NOT merged)"
