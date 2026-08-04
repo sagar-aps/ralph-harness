@@ -3,7 +3,7 @@
 
 AGENT_CODEX_CMD="codex exec --yolo --skip-git-repo-check -"
 AGENT_CODEX_INTERACTIVE_CMD="codex --yolo {prompt}"
-AGENT_CLAUDE_CMD="claude -p --dangerously-skip-permissions \"\$(cat {prompt})\""
+AGENT_CLAUDE_CMD="env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude -p --dangerously-skip-permissions \"\$(cat {prompt})\""
 AGENT_CLAUDE_INTERACTIVE_CMD="claude --dangerously-skip-permissions {prompt}"
 AGENT_DROID_CMD="droid exec --skip-permissions-unsafe -f {prompt}"
 AGENT_DROID_INTERACTIVE_CMD="droid --skip-permissions-unsafe {prompt}"
@@ -94,7 +94,7 @@ ralph_provider_cmd() {  # <mode: build|review> <provider> <model> <effort>
       fi ;;
     claude)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
-      printf 'claude%s -p --dangerously-skip-permissions "$(cat {prompt})"' "$mflag" ;;
+      printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude%s -p --dangerously-skip-permissions "$(cat {prompt})"' "$mflag" ;;
     opencode)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
       printf 'opencode run%s "$(cat {prompt})"' "$mflag" ;;

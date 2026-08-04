@@ -201,6 +201,12 @@ if [[ "${RALPH_USAGE:-0}" == "1" ]]; then
     local c="$1" first name rest
     first="${c%% *}"; name="$(basename "$first")"
     [[ "$c" == *--output-format* ]] && { printf '%s' "$c"; return; }   # already set
+    # The shipped claude backend is hermetic and therefore starts with `env -u ...`.
+    # Add the CLI flag after its actual executable, not after the env wrapper.
+    if [[ "$name" == "env" && "$c" == *" claude "* ]]; then
+      printf '%s' "${c/ claude / claude --output-format json }"
+      return
+    fi
     case " $RALPH_CLAUDE_LIKE " in
       *" $name "*)                                    # claude CLI (or a known wrapper)
         if [[ "$c" == *" "* ]]; then rest="${c#* }"; printf '%s --output-format json %s' "$first" "$rest";

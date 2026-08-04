@@ -29,12 +29,15 @@ function resolve(env) {
     echo "BUILD=\${AGENT_RALPH_BUILD_CMD:-<unset>}"
     echo "REVIEW=\${AGENT_RALPH_REVIEW_CMD:-<unset>}"
     echo "REVIEW_STRIPPED=$(printf '%s' "\${AGENT_RALPH_REVIEW_CMD:-}" | strip_autoapprove)"
+    echo "CLAUDE=\${AGENT_CLAUDE_CMD}"
   `;
   const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", env: { ...process.env, ...env } });
   const out = `${r.stdout}${r.stderr}`;
   const get = (k) => (out.match(new RegExp(`^${k}=(.*)$`, "m")) || [])[1] ?? "";
-  return { BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), raw: out };
+  return { BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), CLAUDE: get("CLAUDE"), raw: out };
 }
+
+const claudeEnvUnsetPrefix = "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude";
 
 console.log("1) resolution (no quota): presets and explicit knobs compose the right commands");
 {
@@ -47,7 +50,7 @@ console.log("1) resolution (no quota): presets and explicit knobs compose the ri
   check(hi.BUILD === "codex exec --yolo --skip-git-repo-check -c model_reasoning_effort=high -", "explicit codex/high builder");
 
   const cl = resolve({ BUILDER_PROVIDER: "claude", BUILDER_MODEL: "sonnet", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
-  check(cl.BUILD === 'claude --model sonnet -p --dangerously-skip-permissions "$(cat {prompt})"', "claude builder uses --model + {prompt} template");
+  check(cl.BUILD === `${claudeEnvUnsetPrefix} --model sonnet -p --dangerously-skip-permissions "$(cat {prompt})"`, "claude builder clears inherited provider env and uses --model + {prompt} template");
 }
 
 console.log("2) invariants: reviewer read-only after strip_autoapprove; require_backend sees a real binary first");
@@ -72,7 +75,40 @@ console.log("4) per-run override: an explicit knob beats the preset");
   check(/model_reasoning_effort=high/.test(o.BUILD), "BUILDER_EFFORT=high overrides cheap's low");
 }
 
-console.log("5) dry run end-to-end: RALPH_PROFILE + --profile resolve through `ralph batch`");
+console.log("5) claude env hygiene: shipped and normalized commands unset inherited provider config");
+{
+  const fixture = mkdtempSync(path.join(tmpdir(), "ralph-claude-env-"));
+  const stub = path.join(fixture, "claude");
+  const prompt = path.join(fixture, "prompt.txt");
+  writeFileSync(stub, `#!/usr/bin/env bash
+for name in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
+  if printenv "$name" >/dev/null; then printf '%s\\n' "SET:$name"; else printf '%s\\n' "UNSET:$name"; fi
+done
+`);
+  chmodSync(stub, 0o755);
+  writeFileSync(prompt, "fixture prompt\n");
+  const inherited = {
+    ANTHROPIC_API_KEY: "sentinel",
+    ANTHROPIC_AUTH_TOKEN: "sentinel",
+    ANTHROPIC_BASE_URL: "https://sentinel.invalid",
+    ANTHROPIC_DEFAULT_SONNET_MODEL: "sentinel",
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: "sentinel",
+    ANTHROPIC_DEFAULT_OPUS_MODEL: "sentinel",
+  };
+  const expected = Object.keys(inherited).map((name) => `UNSET:${name}`).join("\n");
+  const commands = resolve({ BUILDER_PROVIDER: "claude", BUILDER_MODEL: "sonnet", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
+  for (const [label, command] of [["shipped", commands.CLAUDE], ["normalized", commands.BUILD]]) {
+    const rendered = command.replace("{prompt}", JSON.stringify(prompt));
+    const r = spawnSync("bash", ["-c", rendered], {
+      encoding: "utf-8",
+      env: { ...process.env, ...inherited, PATH: `${fixture}${path.delimiter}${process.env.PATH ?? ""}` },
+    });
+    check(r.status === 0 && r.stdout.trim() === expected, `${label} claude command hides all inherited provider variables from the executable`);
+  }
+  rmSync(fixture, { recursive: true, force: true });
+}
+
+console.log("6) dry run end-to-end: RALPH_PROFILE + --profile resolve through `ralph batch`");
 {
   const target = mkdtempSync(path.join(tmpdir(), "ralph-as-"));
   const g = (args) => spawnSync("git", args, { cwd: target, encoding: "utf-8" });
@@ -89,7 +125,7 @@ console.log("5) dry run end-to-end: RALPH_PROFILE + --profile resolve through `r
   try {
     const r = spawnSync(process.execPath, [cliPath, "batch", "--repo", target, "--plan", plan, "--profile", "cheap", "--builder-effort", "high"], {
       encoding: "utf-8",
-      env: { ...process.env, RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wt },
+      env: { ...process.env, BUILDER: "", REVIEWER: "", RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wt },
     });
     const out = `${r.stdout}${r.stderr}`;
     check(r.status === 0, `dry-run batch with --profile resolves and exits 0 (got ${r.status})`);
