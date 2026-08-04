@@ -23,6 +23,12 @@
 # Example: a "zlaude" backend (Claude Code wired to the Z.AI plan):
 # AGENT_ZLAUDE_CMD='zlaude -p --dangerously-skip-permissions "$(cat {prompt})"'
 #   ...then:  ralph batch --builder zlaude --reviewer codex-readonly ...
+# Or inline the env (no wrapper on PATH), one backend per GLM model, reading stdin
+# (claude reads the prompt from stdin, so no {prompt}/ARG_MAX issue):
+#   _Z='env ANTHROPIC_API_KEY= ANTHROPIC_BASE_URL=https://z.ai ANTHROPIC_AUTH_TOKEN=<your-zai-token> -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude -p --dangerously-skip-permissions --model'
+#   AGENT_ZLAUDE47_CMD="$_Z glm-4.7"  ;  AGENT_ZLAUDE45AIR_CMD="$_Z glm-4.5-air"  ;  unset _Z
+#   ...then:  ralph review --builder zlaude47 --reviewer zlaude45air ...
+#   (Pick a GLM model your plan includes — glm-5.2-highspeed 429s on some tiers.)
 # IMPORTANT for ANY claude-CLI-to-alternate-endpoint wrapper (zlaude/rlaude/...): the
 # wrapper MUST `unset ANTHROPIC_API_KEY`. A stray key takes precedence over
 # ANTHROPIC_AUTH_TOKEN, so the CLI silently authenticates to real Anthropic instead of
@@ -43,7 +49,10 @@
 # 2) Override an existing backend's command
 # ---------------------------------------------------------------------------
 # Don't have codex? Point the name at whatever you use, or change its flags.
-# AGENT_OPENCODE_Z_CMD='opencode run --model glm-4.6'
+# opencode takes the message as an ARGV arg (NOT stdin), and you MUST pin a model your
+# plan includes — the auto-default (glm-5.2-highspeed) 429s on plans without it and the
+# SDK retry-loops on the 429, which looks like a hang / exit 124 (#44):
+# AGENT_OPENCODE_Z_CMD='opencode run -m zai-coding-plan/glm-4.7 "$(cat {prompt})"'
 # AGENT_CLAUDE_CMD='claude -p --dangerously-skip-permissions'
 
 # ---------------------------------------------------------------------------
@@ -78,7 +87,7 @@
 # Which backends are instrumented, and with what (see references/TOKEN_ECONOMICS.md):
 #   claude family  --output-format json   cache_read_input_tokens / cache_creation_input_tokens
 #   codex          --json (JSONL)         cached_input_tokens / cache_write_input_tokens
-#   opencode       not instrumented       output shape unverified while it hangs (#44)
+#   opencode       not instrumented       argv-only (no stdin); pin -m to a plan model (#44)
 # Anything else is left untouched. The JSON is always extracted back to plain text
 # before the verdict parse, so this never causes spurious reviewer ERRORs — including
 # when a CLI changes its event names: an unrecognised shape is salvaged for its text

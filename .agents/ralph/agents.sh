@@ -7,7 +7,13 @@ AGENT_CLAUDE_CMD="env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_
 AGENT_CLAUDE_INTERACTIVE_CMD="claude --dangerously-skip-permissions {prompt}"
 AGENT_DROID_CMD="droid exec --skip-permissions-unsafe -f {prompt}"
 AGENT_DROID_INTERACTIVE_CMD="droid --skip-permissions-unsafe {prompt}"
-AGENT_OPENCODE_CMD="opencode run"
+# opencode reads the prompt as a POSITIONAL argv arg — it does NOT read stdin
+# (unlike claude/codex), so the message must be interpolated on argv (ARG_MAX-bound).
+# NOTE (#44): on the Z.AI Coding Plan, opencode's auto-selected default model
+# (glm-5.2-highspeed) 429s with "plan does not include …" and the AI-SDK retry-loops
+# on it (looks like a hang / exit 124). Pin a plan-included model with `-m`, e.g.
+# `opencode run -m zai-coding-plan/glm-4.7 "$(cat {prompt})"` (see config.local.sh.example).
+AGENT_OPENCODE_CMD='opencode run "$(cat {prompt})"'
 AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt}"
 # Uncomment to use server mode (faster, avoids cold boot):
 # AGENT_OPENCODE_CMD="opencode run --attach http://localhost:4096"
@@ -18,7 +24,8 @@ AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt}"
 # templates containing `{prompt}` don't trip bash brace-matching in `${VAR:-...}`.
 # "opencode-z" is OpenCode authenticated with the Z.AI Coding Plan. Same binary
 # as opencode; named separately so a role can pin it explicitly.
-[[ -n "${AGENT_OPENCODE_Z_CMD:-}" ]] || AGENT_OPENCODE_Z_CMD='opencode run'
+# opencode-z: argv message (no stdin) + pin a plan-included model (#44).
+[[ -n "${AGENT_OPENCODE_Z_CMD:-}" ]] || AGENT_OPENCODE_Z_CMD='opencode run "$(cat {prompt})"'
 # Role selection is operator guidance, not harness enforcement: prefer different
 # agents for builder and reviewer, and give the reviewer a read-only/sandbox flag
 # whenever its CLI supports one. For other agents, define a backend using that
