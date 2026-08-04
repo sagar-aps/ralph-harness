@@ -189,24 +189,41 @@ REVIEWER_CMD="$(reviewer_cmd_for "$REVIEWER")"
 [[ -n "$BUILDER_CMD" ]] || die "Unknown builder backend: $BUILDER"
 [[ -n "$REVIEWER_CMD" ]] || die "Unknown reviewer backend: $REVIEWER"
 
-# RALPH_USAGE=1 makes claude-CLI agents emit `--output-format json` so run_backend
-# can capture per-attempt token/cost usage. Applies to the bare `claude` binary AND to
-# claude-CLI wrappers (rlaude/zlaude and anything in RALPH_CLAUDE_LIKE) — they take the
-# same flag. Other backends (codex/opencode/...) are left untouched. run_backend's
-# extraction (always on) turns the JSON back into the plain-text log the verdict grep
-# reads, so this stays safe. Off by default.
+# RALPH_USAGE=1 makes agents emit machine-readable usage so run_backend can capture
+# per-attempt tokens/cost. Two families are supported, each with its own flag and its
+# own JSON shape (see .agents/ralph/references/TOKEN_ECONOMICS.md):
+#
+#   claude-CLI family  --output-format json   cache_read_input_tokens / cache_creation_input_tokens
+#   codex              --json (JSONL)         cached_input_tokens / cache_write_input_tokens
+#
+# opencode is deliberately NOT instrumented: it accepts `--format json` but its usage
+# field names are unverified (it hangs when invoked non-interactively — #44), and
+# injecting a flag whose output shape we cannot parse would leave the reviewer's
+# `^VERDICT:` grep staring at JSON, which silently burns every attempt. Unknown beats
+# broken; revisit when #44 lands.
+#
+# run_backend's extraction (always on) turns either shape back into the plain-text log
+# the verdict grep reads, so this stays safe. Off by default.
 RALPH_CLAUDE_LIKE="${RALPH_CLAUDE_LIKE:-claude rlaude zlaude}"
+RALPH_CODEX_LIKE="${RALPH_CODEX_LIKE:-codex}"
 if [[ "${RALPH_USAGE:-0}" == "1" ]]; then
   add_json_flag() {
     local c="$1" first name rest
     first="${c%% *}"; name="$(basename "$first")"
-    [[ "$c" == *--output-format* ]] && { printf '%s' "$c"; return; }   # already set
+    [[ "$c" == *--output-format* || "$c" == *" --json"* ]] && { printf '%s' "$c"; return; }
     # The shipped claude backend is hermetic and therefore starts with `env -u ...`.
     # Add the CLI flag after its actual executable, not after the env wrapper.
     if [[ "$name" == "env" && "$c" == *" claude "* ]]; then
       printf '%s' "${c/ claude / claude --output-format json }"
       return
     fi
+    case " $RALPH_CODEX_LIKE " in
+      *" $name "*)
+        # codex takes --json on the `exec` subcommand. Insert straight after `exec` so
+        # it lands ahead of the sandbox/effort flags and the trailing stdin `-`.
+        if [[ "$c" == *" exec "* ]]; then printf '%s' "${c/ exec / exec --json }"; else printf '%s' "$c"; fi
+        return ;;
+    esac
     case " $RALPH_CLAUDE_LIKE " in
       *" $name "*)                                    # claude CLI (or a known wrapper)
         if [[ "$c" == *" "* ]]; then rest="${c#* }"; printf '%s --output-format json %s' "$first" "$rest";
@@ -515,7 +532,50 @@ for cand in [raw, *reversed(raw.splitlines())]:
         obj = o
         break
 if obj is None:
-    sys.exit(0)  # not Claude JSON -> leave the log as-is, write no sidecar
+    # Not Claude JSON. Try codex JSONL (`codex exec --json`): usage rides the final
+    # `turn.completed` event, and the assistant text lives in `item.completed` events
+    # of type `agent_message`. Rebuild the plain-text log from those so the verdict
+    # grep still works, exactly as the Claude branch does with `.result`.
+    events = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line[0] != "{":
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            continue
+    usage = None
+    texts = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "turn.completed" and isinstance(e.get("usage"), dict):
+            usage = e["usage"]                       # last one wins
+        it = e.get("item")
+        if e.get("type") == "item.completed" and isinstance(it, dict) \
+                and it.get("type") == "agent_message" and isinstance(it.get("text"), str):
+            texts.append(it["text"])
+    if usage is None:
+        sys.exit(0)   # neither shape -> leave the log alone, write no sidecar
+    if texts:
+        open(log, "w", encoding="utf-8").write("\n".join(texts).rstrip() + "\n")
+    num = lambda x: x if isinstance(x, (int, float)) else None
+    # Field names differ from both the OpenAI API and the Claude CLI -- see
+    # TOKEN_ECONOMICS.md. cache_write is reported but unpopulated on this path
+    # (always 0 even when cached_input_tokens grows), so it is recorded as-is and
+    # must not be read as "nothing was cached".
+    json.dump({
+        "input": num(usage.get("input_tokens")),
+        "output": num(usage.get("output_tokens")),
+        "cache_read": num(usage.get("cached_input_tokens")),
+        "cache_creation": num(usage.get("cache_write_input_tokens")),
+        "reasoning_output": num(usage.get("reasoning_output_tokens")),
+        "num_turns": None,
+        "duration_ms": None,
+        "total_cost_usd": None,
+    }, open(side, "w", encoding="utf-8"), indent=2)
+    sys.exit(0)
 res = obj.get("result")
 open(log, "w", encoding="utf-8").write((res if isinstance(res, str) else json.dumps(res)) + "\n")
 u = obj.get("usage") or {}
