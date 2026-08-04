@@ -3,7 +3,7 @@
 // happen. Must NOT be listed in `test:dogfood` (it invokes check.sh, which would
 // re-invoke test:dogfood -> recurse).
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,6 +46,27 @@ console.log("dogfood/#35: re-entrancy guard + dogfood check");
   check(/dogfood mode/.test(out), "runs in dogfood mode when nested");
   check(/shell-syntax: all passed/.test(out), "the non-recursive subset actually ran");
   check(!/Agent loop smoke tests/.test(out), "did NOT run the recursive loop suites (no fork-bomb path)");
+}
+
+// 3) Dogfood is HARNESS-ONLY: a DIFFERENT repo that reuses this exact check.sh must
+//    NOT enter dogfood mode, even nested — it runs its own full check. (Guards against
+//    the harness breaking other repos by mistake.)
+{
+  const fake = mkdtempSync(path.join(tmpdir(), "ralph-notharness-"));
+  mkdirSync(path.join(fake, "scripts"));
+  copyFileSync(path.join(repoRoot, "scripts/check.sh"), path.join(fake, "scripts/check.sh"));
+  writeFileSync(
+    path.join(fake, "package.json"),
+    JSON.stringify({ name: "some-other-repo", scripts: { test: "echo FULL_CHECK_RAN" } }),
+  );
+  const r = spawnSync("bash", [path.join(fake, "scripts", "check.sh")], {
+    encoding: "utf-8",
+    cwd: fake,
+    env: { ...process.env, RALPH_IN_PREFLIGHT: "1" },
+  });
+  const out = `${r.stdout}${r.stderr}`;
+  check(!/dogfood mode/.test(out), "a non-harness repo does NOT enter dogfood mode when nested");
+  check(/FULL_CHECK_RAN/.test(out), "a non-harness repo runs its FULL check even when nested");
 }
 
 console.log(failures ? `\ndogfood/#35 regression FAILED (${failures})` : "\ndogfood/#35 regression passed.");

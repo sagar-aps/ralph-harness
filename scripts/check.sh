@@ -13,9 +13,15 @@
 # subset (CLI smoke + shell-syntax parse of every script). The FULL suite remains the
 # top-level / merge gate (CI and the Manager run `npm test` before accepting).
 set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-if [[ "${RALPH_IN_PREFLIGHT:-}" == "1" ]]; then
-  echo "check.sh: dogfood mode (nested in a ralph check) — running non-recursive subset (npm run test:dogfood)"
+# Dogfood mode is HARNESS-ONLY. It activates only when BOTH hold:
+#   (a) we are nested inside a ralph-invoked check (RALPH_IN_PREFLIGHT=1), AND
+#   (b) this really IS the ralph harness repo (package.json identity).
+# (b) guarantees no other target can shrink its own check by mistake — even if a repo
+# ever copies this script, the identity check fails there and it runs its full check.
+if [[ "${RALPH_IN_PREFLIGHT:-}" == "1" ]] && grep -q '"@iannuttall/ralph"' "$ROOT/package.json" 2>/dev/null; then
+  echo "check.sh: dogfood mode (ralph-harness self-host, nested check) — non-recursive subset (npm run test:dogfood)"
   npm run test:dogfood
 else
   npm test
