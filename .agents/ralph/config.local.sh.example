@@ -25,7 +25,9 @@
 #   ...then:  ralph batch --builder zlaude --reviewer codex-readonly ...
 # Or inline the env (no wrapper on PATH), one backend per GLM model, reading stdin
 # (claude reads the prompt from stdin, so no {prompt}/ARG_MAX issue):
-#   _Z='env ANTHROPIC_API_KEY= ANTHROPIC_BASE_URL=https://z.ai ANTHROPIC_AUTH_TOKEN=<your-zai-token> -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude -p --dangerously-skip-permissions --model'
+#   (base = the Anthropic-compat route api.z.ai/api/anthropic, NOT https://z.ai; and
+#    fully UNSET ANTHROPIC_API_KEY — an empty value still shadows AUTH_TOKEN → claude.ai.)
+#   _Z='env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=<your-zai-token> claude -p --dangerously-skip-permissions --model'
 #   AGENT_ZLAUDE47_CMD="$_Z glm-4.7"  ;  AGENT_ZLAUDE45AIR_CMD="$_Z glm-4.5-air"  ;  unset _Z
 #   ...then:  ralph review --builder zlaude47 --reviewer zlaude45air ...
 #   (Pick a GLM model your plan includes — glm-5.2-highspeed 429s on some tiers.)
