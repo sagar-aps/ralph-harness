@@ -257,7 +257,8 @@ ralph_provider_cmd() {  # <mode: build|review> <provider> <model> <effort>
       cmd="$(printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude%s -p --dangerously-skip-permissions' "$mflag")" ;;
     opencode)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
-      cmd="$(printf 'opencode run%s' "$mflag")" ;;
+      # opencode reads the message from argv, not stdin (#44) — keep {prompt}.
+      cmd="$(printf 'opencode run%s "$(cat {prompt})"' "$mflag")" ;;
     droid)
       cmd='droid exec --skip-permissions-unsafe -f {prompt}' ;;
     *)

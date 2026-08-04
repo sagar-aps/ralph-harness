@@ -55,8 +55,9 @@ console.log("1) resolution (no quota): presets and explicit knobs compose the ri
   check(cl.BUILD === `${claudeEnvUnsetPrefix} --model sonnet -p --dangerously-skip-permissions`, "claude builder clears inherited provider env and uses --model + stdin");
 
   const oc = resolve({ BUILDER_PROVIDER: "opencode", BUILDER_MODEL: "openai/gpt-5", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
-  check(oc.OPENCODE === "opencode run" && oc.BUILD === "opencode run --model openai/gpt-5", "shipped and normalized opencode commands use stdin");
-  check(!cl.CLAUDE.includes("{prompt}") && !cl.BUILD.includes("{prompt}") && !oc.OPENCODE.includes("{prompt}") && !oc.BUILD.includes("{prompt}"), "stdin backends contain no {prompt} argv interpolation");
+  check(oc.OPENCODE === 'opencode run "$(cat {prompt})"' && oc.BUILD === 'opencode run --model openai/gpt-5 "$(cat {prompt})"', "shipped and normalized opencode commands use argv (opencode has no stdin path, #44)");
+  check(!cl.CLAUDE.includes("{prompt}") && !cl.BUILD.includes("{prompt}"), "claude/codex stdin backends contain no {prompt} argv interpolation");
+  check(oc.OPENCODE.includes("{prompt}") && oc.BUILD.includes("{prompt}"), "opencode (argv-only) DOES interpolate {prompt} — it cannot read stdin (#44)");
 }
 
 console.log("2) invariants: reviewer read-only after strip_autoapprove; require_backend sees a real binary first");
