@@ -30,3 +30,7 @@ dist/
 .plans-*/
 .agent-run/
 .agent-handoff.md
+# Per-issue PRD/story JSON handed to `ralph review --prd` are throwaway dispatch
+# artifacts, not harness source. Ignoring them keeps `ralph integrate` from
+# tripping on an untracked working tree. Force-add (`git add -f`) to keep a specific one.
+.agents/tasks/
