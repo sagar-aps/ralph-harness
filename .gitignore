@@ -18,6 +18,8 @@ pnpm-debug.log*
 
 # Untracked local agent/backend config (copy from config.local.sh.example)
 .agents/ralph/config.local.sh
+# Operator-supplied identity wrapper (soft dependency; ambient gh auth is the fallback)
+.agents/ralph/identity.sh
 
 # Temp
 .tmp/

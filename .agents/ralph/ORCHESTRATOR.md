@@ -38,15 +38,18 @@ into ticket/PR comments and labels.
 You act under the **orchestrator identity** (machine account / GitHub App), distinct from the
 Owner and the Manager.
 
-**Activating it is a soft dependency.** Where the setup provides an identity wrapper, run
-GitHub-writing commands through it (`<wrapper> orchestrator <command…>`) — including
+**Activating it is a soft dependency.** At boot, resolve the identity wrapper in this order:
+`$RALPH_IDENTITY_WRAPPER` when that environment variable names an executable file → the
+executable default `.agents/ralph/identity.sh` → the Owner's ambient `gh auth`. Run every
+GitHub-writing command through the resolved wrapper as
+`.agents/ralph/identity.sh orchestrator <command…>` (or
+`"$RALPH_IDENTITY_WRAPPER" orchestrator <command…>` when the override won) — including
 `ralph integrate --pr`, whose `git push` and `gh pr create` inherit the identity from the
-environment. The harness itself is unchanged and unaware: if credentials are absent or a
-token cannot be minted, the wrapper prints a note to stderr and runs the command unchanged
-under the Owner's ambient `gh auth`. **Never treat a missing identity as a blocker** — the
-loop must run either way. Just be aware which one you are: a PR you file as the Owner cannot
-be formally approved by a Manager who is also the Owner, so say so in the PR body when you
-are in fallback mode, and let the Manager fall back to a review comment.
+environment. The harness itself is unchanged and unaware: if either wrapper is absent, is not
+executable, fails, cannot mint a token, or reports fallback, continue in fallback mode under
+the Owner's ambient `gh auth`. **Never treat a missing or failed identity wrapper as a
+blocker** — the loop must run either way. State that fallback mode plainly in every PR body so
+a Manager acting as the same Owner knows to use a review comment instead of formal approval.
 
 **The floor below is charter-enforced, and mechanically backstopped.** GitHub's
 `Pull requests: write` is all-or-nothing: the same permission that lets you open a PR and
@@ -80,8 +83,11 @@ at <where>, go"):
    Also read `.agents/ralph/references/TOKEN_ECONOMICS.md` before choosing backends per
    role or estimating spend: prompt caching works on the claude family and **not** on
    codex (measured), so a retry-heavy run's cost profile depends on that choice.
-   Then **arm the floor guard**: `source .agents/ralph/floor-guard.sh` (see "Identity and
-   the hard floor" — it mechanically refuses merge/approve/default-push, no App required).
+   Then **resolve and activate the identity wrapper** in the order defined under "Identity
+   and the hard floor"; record whether it selected the override, the default
+   `.agents/ralph/identity.sh`, or ambient-`gh` fallback. Immediately after that, **arm the
+   floor guard**: `source .agents/ralph/floor-guard.sh` (it mechanically refuses
+   merge/approve/default-push, no App required).
 2. Run `ralph init-target --repo <target>` (installs the Manager + builder skills, task
    scaffolding, and the label protocol into the target). Never overwrite a filled-in charter.
 3. Locate the backlog the Owner named (GitHub Issues by default, or the PRD/task dir).
@@ -89,8 +95,9 @@ at <where>, go"):
    and no Manager has run yet, create them (`gh label create … --force` is idempotent) — but
    `spec:ready` and every `## Acceptance` remain the Manager's to grant.
 
-**Resume boot** (already-initialized target): reconstruct state from GitHub alone — all state
-lives there, none in the dead session: `gh issue list --label now --label spec:ready`,
+**Resume boot** (already-initialized target): resolve and activate the identity wrapper, then
+arm the floor guard, exactly as in first-boot step 1. Reconstruct state from GitHub alone — all
+state lives there, none in the dead session: `gh issue list --label now --label spec:ready`,
 `gh pr list` (yours awaiting Manager review; Manager comments on them), open `blocked:manager`
 items you are waiting on. Then re-arm the loop (below).
 
