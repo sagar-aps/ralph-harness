@@ -237,13 +237,15 @@ RALPH_CLAUDE_LIKE="${RALPH_CLAUDE_LIKE:-claude rlaude zlaude}"
 RALPH_CODEX_LIKE="${RALPH_CODEX_LIKE:-codex}"
 if [[ "${RALPH_USAGE:-1}" == "1" ]]; then
   add_json_flag() {
-    local c="$1" first name rest
+    local c="$1" backend="$2" first name rest
     first="${c%% *}"; name="$(basename "$first")"
     [[ "$c" == *--output-format* || "$c" == *" --json"* ]] && { printf '%s' "$c"; return; }
-    # The shipped claude backend is hermetic and therefore starts with `env -u ...`.
-    # Add the CLI flag after its actual executable, not after the env wrapper.
-    if [[ "$name" == "env" && "$c" == *" claude "* ]]; then
-      printf '%s' "${c/ claude / claude --output-format json }"
+    # Model-pinned aliases commonly start with `env ... claude --model ...`, so
+    # neither the first command token (`env`) nor the backend name (`claude-sonnet`)
+    # is an exact RALPH_CLAUDE_LIKE member. Match the underlying executable on shell
+    # whitespace boundaries and insert the flag there, not after the env wrapper.
+    if [[ "$name" == "env" && "$c" =~ (^|[[:space:]])claude([[:space:]]|$) ]]; then
+      printf '%s' "$c" | sed -E 's/(^|[[:space:]])claude([[:space:]]|$)/\1claude --output-format json\2/'
       return
     fi
     case " $RALPH_CODEX_LIKE " in
@@ -254,14 +256,20 @@ if [[ "${RALPH_USAGE:-1}" == "1" ]]; then
         return ;;
     esac
     case " $RALPH_CLAUDE_LIKE " in
-      *" $name "*)                                    # claude CLI (or a known wrapper)
+      *" $name "*|*" $backend "*)                     # claude CLI (or a known wrapper)
         if [[ "$c" == *" "* ]]; then rest="${c#* }"; printf '%s --output-format json %s' "$first" "$rest";
         else printf '%s --output-format json' "$c"; fi ;;
-      *) printf '%s' "$c" ;;                          # not a claude CLI: unsupported flag
+      *)
+        case "$backend" in
+          claude-*)                                    # model-pinned/custom Claude alias
+            if [[ "$c" == *" "* ]]; then rest="${c#* }"; printf '%s --output-format json %s' "$first" "$rest";
+            else printf '%s --output-format json' "$c"; fi ;;
+          *) printf '%s' "$c" ;;                      # not a claude CLI: unsupported flag
+        esac ;;
     esac
   }
-  BUILDER_CMD="$(add_json_flag "$BUILDER_CMD")"
-  REVIEWER_CMD="$(add_json_flag "$REVIEWER_CMD")"
+  BUILDER_CMD="$(add_json_flag "$BUILDER_CMD" "$BUILDER")"
+  REVIEWER_CMD="$(add_json_flag "$REVIEWER_CMD" "$REVIEWER")"
 fi
 [[ -f "$BUILDER_PROMPT" ]] || die "Batch builder prompt not found: $BUILDER_PROMPT"
 [[ -f "$REVIEWER_PROMPT" ]] || die "Batch reviewer prompt not found: $REVIEWER_PROMPT"

@@ -102,6 +102,20 @@ console.log("1) RALPH_USAGE=1 injects the right flag per backend family (dry-run
     check(!/--json|--output-format|--format json/.test(bcmd), `opencode left uninstrumented (${bcmd})`);
   } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
 }
+{
+  const t = makeTarget();
+  const plan = onePlan();
+  try {
+    // zlaude remains an explicitly configured claude-CLI wrapper. Z.AI may omit
+    // cache_creation_input_tokens, but it still needs Claude JSON mode for reads.
+    ralph(["batch", "--repo", t, "--plan", plan, "--builder", "zlaude", "--reviewer", "codex-readonly",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_DRY_RUN: "1", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(t),
+        AGENT_ZLAUDE_CMD: 'zlaude --model glm-4.7 -p "$(cat {prompt})"' });
+    const bcmd = (cfg(t).match(/^BUILDER_CMD=(.*)$/m) || [])[1] || "";
+    check(/zlaude --output-format json/.test(bcmd), "zlaude wrapper still gets Claude JSON instrumentation");
+  } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
+}
 
 console.log("2) codex JSONL -> usage sidecar, and the log is rewritten so ^VERDICT: still greps");
 {
@@ -149,7 +163,47 @@ console.log("2) codex JSONL -> usage sidecar, and the log is rewritten so ^VERDI
   } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); rmSync(fixDir, { recursive: true, force: true }); }
 }
 
-console.log("3) a non-JSON backend is still left completely alone");
+console.log("3) a model-pinned claude alias gets JSON instrumentation and a usage sidecar");
+{
+  const t = makeTarget();
+  const plan = onePlan();
+  const fixDir = mkdtempSync(path.join(tmpdir(), "ralph-usage51-claude-"));
+  const stub = path.join(fixDir, "claude");
+  writeScript(stub, `#!/usr/bin/env bash
+case " $* " in
+  *" --output-format json "*) ;;
+  *) printf 'VERDICT: PASS\\n'; exit 0 ;;
+esac
+cat <<'JSON'
+{"type":"result","subtype":"success","result":"### Must-fix issues\\n- none\\n\\nVERDICT: PASS","usage":{"input_tokens":321,"output_tokens":17,"cache_read_input_tokens":89,"cache_creation_input_tokens":4},"num_turns":2,"duration_ms":700,"total_cost_usd":0.01}
+JSON
+`);
+  const FB = 'bash -c "echo x >> progress.txt; printf \\"# handoff\\n\\" > .agent-handoff.md"';
+  try {
+    const r = ralph(["batch", "--repo", t, "--plan", plan, "--builder", "fb", "--reviewer", "claude-sonnet",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_AGENT_RETRY_DELAY: "0", RALPH_DRY_RUN: "", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(t),
+        PATH: `${fixDir}:${process.env.PATH}`, AGENT_FB_CMD: FB,
+        AGENT_CLAUDE_SONNET_CMD: 'env FIXTURE_CLAUDE=1  claude --model sonnet -p "$(cat {prompt})"' });
+    const out = `${r.stdout}${r.stderr}`;
+    const rd = runDirOf(t);
+    const side = path.join(rd, "task-001-iter-1-reviewer.usage.json");
+    check(r.status === 0 && /verdict: PASS/.test(out), "model-pinned claude-sonnet batch passes");
+    check(existsSync(side), "model-pinned claude-sonnet writes a usage sidecar");
+    if (existsSync(side)) {
+      const u = JSON.parse(readFileSync(side, "utf-8"));
+      check(u.input === 321 && u.output === 17 && u.cache_read === 89 && u.cache_creation === 4,
+        "claude-sonnet sidecar populates input/output/cache fields");
+    }
+    const log = readFileSync(path.join(rd, "task-001-iter-1-reviewer.md"), "utf-8");
+    check(/^VERDICT: PASS$/m.test(log) && !log.includes('"usage"'),
+      "claude-sonnet JSON result is extracted back to a greppable log");
+  } finally {
+    cleanup(t); rmSync(plan, { recursive: true, force: true }); rmSync(fixDir, { recursive: true, force: true });
+  }
+}
+
+console.log("4) a non-JSON backend is still left completely alone");
 {
   const t = makeTarget();
   const plan = onePlan();
@@ -166,7 +220,7 @@ console.log("3) a non-JSON backend is still left completely alone");
   } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
 }
 
-console.log("4) usage capture is ON by default, and OFF only when asked");
+console.log("5) usage capture is ON by default, and OFF only when asked");
 {
   const t = makeTarget();
   const plan = onePlan();
@@ -190,7 +244,7 @@ console.log("4) usage capture is ON by default, and OFF only when asked");
   } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
 }
 
-console.log("5) GUARD: an unrecognised JSON shape must not break the verdict parse");
+console.log("6) GUARD: an unrecognised JSON shape must not break the verdict parse");
 {
   // This is what makes default-on safe. Simulate a CLI that renamed its events: the
   // JSON is well-formed but nothing matches the shapes we know. Without the salvage,
