@@ -190,6 +190,15 @@ function loadRunMeta(repo, runArg) {
   return { runId, runDir, meta };
 }
 
+function agentAttribution(meta, role) {
+  const upper = role.toUpperCase();
+  const backend = meta[upper] || "unknown";
+  const provider = meta[`${upper}_PROVIDER`] || backend || "unknown";
+  const recordedModel = meta[`${upper}_MODEL`] || "unknown";
+  const model = recordedModel === "default" ? "unknown" : recordedModel;
+  return `${backend} (provider: ${provider}, model: ${model})`;
+}
+
 // Shared by `cleanup` and the default cleanup that `integrate` runs on success.
 // Conservative by design: refuses a dirty worktree without force; keeps the branch.
 function doCleanup(repo, runId, meta, deleteBranch, force) {
@@ -1321,7 +1330,7 @@ async function main() {
         const bodyLines = [`Automated ralph run \`${runId}\` on branch \`${branch}\`.`, ""];
         if (issues.length) bodyLines.push(...issues.map((n) => `Fixes #${n}`), "");
         bodyLines.push(
-          `Builder: ${meta.BUILDER || "?"} · Reviewer: ${meta.REVIEWER || "?"} (read-only).`,
+          `Builder: ${agentAttribution(meta, "builder")} · Reviewer: ${agentAttribution(meta, "reviewer")} (read-only).`,
           "Reviewed in-loop (READY_FOR_HUMAN_REVIEW); NOT merged — human review required.",
         );
         const create = spawnSync(

@@ -135,12 +135,25 @@ console.log("1) Review loop WITHOUT preview");
   const { target, mainHead } = makeTarget();
   try {
     const r = ralph(
-      ["review", "1", "--repo", target, "--builder", "opencode", "--reviewer", "claude", "--max-iterations", "2"],
-      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtDirFor(target) },
+      ["review", "1", "--repo", target,
+        "--builder", "fixture-build", "--reviewer", "fixture-review",
+        "--builder-provider", "opencode", "--builder-model", "fixture-builder-model",
+        "--reviewer-provider", "claude", "--reviewer-model", "fixture-reviewer-model",
+        "--max-iterations", "2"],
+      {
+        RALPH_DRY_RUN: "1",
+        RALPH_WORKTREE_DIR: wtDirFor(target),
+        AGENT_FIXTURE_BUILD_CMD: "opencode run --model fixture-builder-model {prompt}",
+        AGENT_FIXTURE_REVIEW_CMD: "claude --model fixture-reviewer-model -p",
+      },
     );
     const out = `${r.stdout}${r.stderr}`;
     check(r.status === 0, "exits 0");
     check(out.includes("READY_FOR_HUMAN_REVIEW"), "reaches READY_FOR_HUMAN_REVIEW");
+    check(out.includes("builder=fixture-build (provider=opencode, model=fixture-builder-model)"),
+      "READY banner identifies the resolved builder backend, provider, and model");
+    check(out.includes("reviewer=fixture-review (provider=claude, model=fixture-reviewer-model)"),
+      "READY banner identifies the resolved reviewer backend, provider, and model");
     check(git(target, ["rev-parse", "HEAD"]) === mainHead, "target main HEAD unchanged (no auto-merge)");
     check(git(target, ["branch", "--list", "ralph/*"]).includes("ralph/"), "ralph/* branch created");
     const runDir = latestRunDir(target);
@@ -158,6 +171,15 @@ console.log("1) Review loop WITHOUT preview");
     }
     const lastRun = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
     check(/STATUS=READY_FOR_HUMAN_REVIEW/.test(lastRun), "last-run.env records READY status");
+    check(/BUILDER=fixture-build\nBUILDER_PROVIDER=opencode\nBUILDER_MODEL=fixture-builder-model/.test(lastRun),
+      "PR handoff metadata records resolved builder attribution");
+    check(/REVIEWER=fixture-review\nREVIEWER_PROVIDER=claude\nREVIEWER_MODEL=fixture-reviewer-model/.test(lastRun),
+      "PR handoff metadata records resolved reviewer attribution");
+    const finalStatus = readFileSync(path.join(runDir, "final_status.md"), "utf-8");
+    check(finalStatus.includes("Builder backend: fixture-build (provider: opencode, model: fixture-builder-model)"),
+      "final handoff artifact includes builder attribution");
+    check(finalStatus.includes("Reviewer backend: fixture-review (provider: claude, model: fixture-reviewer-model)"),
+      "final handoff artifact includes reviewer attribution");
     check(!existsSync(path.join(runDir, "preview_up_1.log")), "no preview artifacts when preview disabled");
   } finally {
     cleanupTarget(target);

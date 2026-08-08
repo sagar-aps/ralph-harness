@@ -179,7 +179,11 @@ boot). Each pass:
    branch buys you a rebase request from the Manager instead of a review, costing a whole
    round. File the PR with `Fixes #<N>` in the body — `ralph integrate --pr` derives that from
    the branch name for a single ticket; for a **bundled batch** run that closes several tickets
-   on one branch, set `RALPH_FIXES="1 3 4"` so every issue is closed on merge. State plainly what you verified on dev
+   on one branch, set `RALPH_FIXES="1 3 4"` so every issue is closed on merge. As a standing
+   behavior, every PR body must state the builder and reviewer backend/agent that produced the
+   work, including the resolved
+   provider and model when known (`unknown` when unavailable); use the run handoff metadata and
+   never hardcode these values. State plainly what you verified on dev
    vs. what can only be confirmed by a prod deploy — with a concrete root-cause mechanism for
    anything not dev-verifiable. If verification **genuinely requires a prod deploy, do NOT
    deploy prod** — file the PR, note that final verification needs prod, and defer that step

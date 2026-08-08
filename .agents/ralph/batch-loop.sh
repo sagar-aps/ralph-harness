@@ -219,6 +219,14 @@ BUILDER_REQUESTED_MODEL="${BUILDER_MODEL:-$(ralph_command_model_values "$BUILDER
 REVIEWER_REQUESTED_MODEL="${REVIEWER_MODEL:-$(ralph_command_model_values "$REVIEWER_CMD" | head -n1)}"
 BUILDER_REQUESTED_MODEL="${BUILDER_REQUESTED_MODEL:-default}"
 REVIEWER_REQUESTED_MODEL="${REVIEWER_REQUESTED_MODEL:-default}"
+BUILDER_RESOLVED_PROVIDER="${BUILDER_PROVIDER:-$BUILDER}"
+REVIEWER_RESOLVED_PROVIDER="${REVIEWER_PROVIDER:-$REVIEWER}"
+BUILDER_RESOLVED_MODEL="$BUILDER_REQUESTED_MODEL"
+REVIEWER_RESOLVED_MODEL="$REVIEWER_REQUESTED_MODEL"
+if [[ "$BUILDER_RESOLVED_MODEL" == "default" ]]; then BUILDER_RESOLVED_MODEL="unknown"; fi
+if [[ "$REVIEWER_RESOLVED_MODEL" == "default" ]]; then REVIEWER_RESOLVED_MODEL="unknown"; fi
+BUILDER_RESOLVED_PROVIDER="${BUILDER_RESOLVED_PROVIDER:-unknown}"
+REVIEWER_RESOLVED_PROVIDER="${REVIEWER_RESOLVED_PROVIDER:-unknown}"
 
 # RALPH_USAGE=1 makes agents emit machine-readable usage so run_backend can capture
 # per-attempt tokens/cost. Two families are supported, each with its own flag and its
@@ -905,6 +913,12 @@ write_last_run() {
     echo "RALPH_APP_PORT=${RALPH_APP_PORT:-}"
     echo "RALPH_DB_PORT=${RALPH_DB_PORT:-}"
     echo "USE_WORKTREE=true"
+    echo "BUILDER=$BUILDER"
+    echo "BUILDER_PROVIDER=$BUILDER_RESOLVED_PROVIDER"
+    echo "BUILDER_MODEL=$BUILDER_RESOLVED_MODEL"
+    echo "REVIEWER=$REVIEWER"
+    echo "REVIEWER_PROVIDER=$REVIEWER_RESOLVED_PROVIDER"
+    echo "REVIEWER_MODEL=$REVIEWER_RESOLVED_MODEL"
     echo "WIP_REF=${WIP_REF_LAST:-}"
     echo "WIP_NS=${WIP_REF_NS:-}/${TS:-}"
     echo "ROUND_USAGE_FILE=$RUN_DIR/round-usage.jsonl"
@@ -1268,7 +1282,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     echo "- Check exit: $CHECK_STATUS"
     [[ -n "$VERIFY_CMD" ]] && echo "- Verify exit: ${VERIFY_STATUS:-not reached}"
     echo "- Reviewer verdict: $VERDICT"
-    echo "- PR provenance (paste into the PR): builder: $BUILDER, reviewer: $REVIEWER, iterations: $ITERS_USED"
+    echo "- PR provenance (paste into the PR): builder: $BUILDER (provider: $BUILDER_RESOLVED_PROVIDER, model: $BUILDER_RESOLVED_MODEL), reviewer: $REVIEWER (provider: $REVIEWER_RESOLVED_PROVIDER, model: $REVIEWER_RESOLVED_MODEL), iterations: $ITERS_USED"
     echo "- Commit: $HEAD_BEFORE -> $HEAD_AFTER"
     echo ""
     echo "## Files changed"
@@ -1510,6 +1524,9 @@ echo ""
 echo "═══════════════════════════════════════════════════════"
 echo "  Batch $OUTCOME"
 echo "  attempted=$ATTEMPTED completed=$COMPLETED failed=$FAILED blocked=$BLOCKED_COUNT skipped-on-resume=$SKIPPED"
+if [[ "$OUTCOME" == "READY_FOR_HUMAN_REVIEW" ]]; then
+  echo "  Agents: builder=$BUILDER (provider=$BUILDER_RESOLVED_PROVIDER, model=$BUILDER_RESOLVED_MODEL); reviewer=$REVIEWER (provider=$REVIEWER_RESOLVED_PROVIDER, model=$REVIEWER_RESOLVED_MODEL)"
+fi
 echo "───────────────────────────────────────────────────────"
 echo "  Branch:    $BRANCH (NOT merged)"
 echo "  Worktree:  $WORKDIR"
