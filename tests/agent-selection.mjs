@@ -69,6 +69,62 @@ console.log("2) invariants: reviewer read-only after strip_autoapprove; require_
   check(/--sandbox read-only/.test(mx.REVIEW), "codex reviewer is sandboxed read-only");
 }
 
+console.log("2b) Z.AI composer: hermetic env, arbitrary model passthrough, and read-only reviewer");
+{
+  const z = resolve({
+    BUILDER_PROVIDER: "zai", BUILDER_MODEL: "glm-5.2", BUILDER_EFFORT: "high",
+    REVIEWER_PROVIDER: "zlaude", REVIEWER_MODEL: "glm-4.5-air", REVIEWER_EFFORT: "low",
+    RALPH_PROFILE: "", BUILDER: "", REVIEWER: "",
+  });
+  const zaiPrefix = 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_BASE_URL="${RALPH_ZAI_BASE_URL:-https://api.z.ai/api/anthropic}" ANTHROPIC_AUTH_TOKEN="${RALPH_ZAI_AUTH_TOKEN:-}" claude -p';
+  check(z.BUILD === `${zaiPrefix} --dangerously-skip-permissions --model glm-5.2`, "zai builder composes hermetic runtime env and passes its model by name");
+  check(z.REVIEW_STRIPPED === `${zaiPrefix} --model glm-4.5-air`, "zlaude alias reviewer passes its model and has no permission-skip flag");
+  check(!z.BUILD.includes("ANTHROPIC_API_KEY=") && z.BUILD.includes("env -u ANTHROPIC_API_KEY"), "zai fully unsets ANTHROPIC_API_KEY instead of assigning it empty");
+  check(!z.BUILD.includes("model_reasoning_effort") && !z.REVIEW.includes("model_reasoning_effort"), "zai ignores effort");
+  for (const model of ["glm-4.7", "glm-4.5-air", "glm-5.1", "glm-5.2"]) {
+    const named = resolve({ BUILDER_PROVIDER: "zai", BUILDER_MODEL: model, RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
+    check(named.BUILD.endsWith(` --model ${model}`), `zai passes arbitrary plan model ${model} directly to claude`);
+  }
+
+  const fixture = mkdtempSync(path.join(tmpdir(), "ralph-zai-env-"));
+  const stub = path.join(fixture, "claude");
+  writeFileSync(stub, `#!/usr/bin/env bash
+printf 'API_KEY=%s\\n' "\${ANTHROPIC_API_KEY-unset}"
+printf 'BASE=%s\\n' "\${ANTHROPIC_BASE_URL-unset}"
+printf 'TOKEN=%s\\n' "\${ANTHROPIC_AUTH_TOKEN-unset}"
+printf 'PINS=%s,%s,%s\\n' "\${ANTHROPIC_DEFAULT_SONNET_MODEL-unset}" "\${ANTHROPIC_DEFAULT_HAIKU_MODEL-unset}" "\${ANTHROPIC_DEFAULT_OPUS_MODEL-unset}"
+printf 'ARGS=%s\\n' "$*"
+read -r prompt
+printf 'STDIN=%s\\n' "$prompt"
+`);
+  chmodSync(stub, 0o755);
+  const run = spawnSync("bash", ["-c", z.REVIEW_STRIPPED], {
+    encoding: "utf-8",
+    input: "fixture prompt\n",
+    env: {
+      ...process.env,
+      PATH: `${fixture}${path.delimiter}${process.env.PATH ?? ""}`,
+      RALPH_ZAI_AUTH_TOKEN: "fixture-token",
+      RALPH_ZAI_BASE_URL: "https://fixture.invalid/anthropic",
+      ANTHROPIC_API_KEY: "must-disappear",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "must-disappear",
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "must-disappear",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "must-disappear",
+    },
+  });
+  check(run.status === 0 && run.stdout.includes("API_KEY=unset") && run.stdout.includes("PINS=unset,unset,unset"), "zai fixture sees API key and all model pins unset");
+  check(run.stdout.includes("BASE=https://fixture.invalid/anthropic") && run.stdout.includes("TOKEN=fixture-token"), "zai fixture reads base URL and token from runtime env");
+  check(run.stdout.includes("ARGS=-p --model glm-4.5-air") && run.stdout.includes("STDIN=fixture prompt"), "zai reviewer invokes claude read-only with requested model and stdin prompt");
+
+  const defaultRun = spawnSync("env", ["-u", "RALPH_ZAI_BASE_URL", "-u", "RALPH_ZAI_AUTH_TOKEN", "bash", "-c", z.BUILD], {
+    encoding: "utf-8",
+    input: "default fixture\n",
+    env: { ...process.env, PATH: `${fixture}${path.delimiter}${process.env.PATH ?? ""}` },
+  });
+  check(defaultRun.status === 0 && defaultRun.stdout.includes("BASE=https://api.z.ai/api/anthropic") && defaultRun.stdout.includes("TOKEN="), "zai defaults to the verified API route and still forms with an empty token");
+  rmSync(fixture, { recursive: true, force: true });
+}
+
 console.log("3) backward-compat: no spec/preset -> resolver is a no-op");
 {
   const none = resolve({ RALPH_PROFILE: "", BUILDER_PROVIDER: "", REVIEWER_PROVIDER: "", BUILDER_MODEL: "", REVIEWER_MODEL: "", BUILDER_EFFORT: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });

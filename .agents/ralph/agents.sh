@@ -230,8 +230,9 @@ ralph_detect_quota_exhaustion() {  # <logfile> [provider] [credential_pool]
 # BUILDER/REVIEWER still wins, a set knob beats a preset default.
 #
 # Effort scale: low|medium|high. codex maps it directly; claude effort is deferred
-# (needs MAX_THINKING_TOKENS, which can't ride in the command string); opencode/droid
-# ignore it. Reviewer read-only is preserved: codex uses --sandbox read-only, and
+# (needs MAX_THINKING_TOKENS, which can't ride in the command string); zai,
+# opencode, and droid ignore it. Reviewer read-only is preserved: codex uses
+# --sandbox read-only, and
 # every builder's permission-skip flag is stripped by strip_autoapprove downstream.
 ralph_effort_flag() {  # <provider> <effort>
   [[ -n "$2" ]] || return 0
@@ -255,6 +256,11 @@ ralph_provider_cmd() {  # <mode: build|review> <provider> <model> <effort>
     claude)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
       cmd="$(printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude%s -p --dangerously-skip-permissions' "$mflag")" ;;
+    zai|zlaude)
+      mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
+      # Keep these as runtime environment references: resolved commands are logged,
+      # so expanding the auth token while composing would leak it into run artifacts.
+      cmd="$(printf 'env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_BASE_URL="${RALPH_ZAI_BASE_URL:-https://api.z.ai/api/anthropic}" ANTHROPIC_AUTH_TOKEN="${RALPH_ZAI_AUTH_TOKEN:-}" claude -p --dangerously-skip-permissions%s' "$mflag")" ;;
     opencode)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
       # opencode reads the message from argv, not stdin (#44) — keep {prompt}.

@@ -20,17 +20,12 @@
 # either contains {prompt} (replaced with a quoted prompt-file path) OR reads the
 # prompt from stdin. Once defined, use it as any role: `--builder <name>`.
 #
-# Example: a "zlaude" backend (Claude Code wired to the Z.AI plan):
+# Example: a custom "zlaude" backend (Claude Code wired to the Z.AI plan):
 # AGENT_ZLAUDE_CMD='zlaude -p --dangerously-skip-permissions "$(cat {prompt})"'
 #   ...then:  ralph batch --builder zlaude --reviewer codex-readonly ...
-# Or inline the env (no wrapper on PATH), one backend per GLM model, reading stdin
-# (claude reads the prompt from stdin, so no {prompt}/ARG_MAX issue):
-#   (base = the Anthropic-compat route api.z.ai/api/anthropic, NOT https://z.ai; and
-#    fully UNSET ANTHROPIC_API_KEY — an empty value still shadows AUTH_TOKEN → claude.ai.)
-#   _Z='env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic ANTHROPIC_AUTH_TOKEN=<your-zai-token> claude -p --dangerously-skip-permissions --model'
-#   AGENT_ZLAUDE47_CMD="$_Z glm-4.7"  ;  AGENT_ZLAUDE45AIR_CMD="$_Z glm-4.5-air"  ;  unset _Z
-#   ...then:  ralph review --builder zlaude47 --reviewer zlaude45air ...
-#   (Pick a GLM model your plan includes — glm-5.2-highspeed 429s on some tiers.)
+# The normalized `zai` provider below is preferred when you want to select any GLM
+# model by name without defining one AGENT_*_CMD backend per model. Explicit custom
+# backends like this remain supported.
 # IMPORTANT for ANY claude-CLI-to-alternate-endpoint wrapper (zlaude/rlaude/...): the
 # wrapper MUST `unset ANTHROPIC_API_KEY`. A stray key takes precedence over
 # ANTHROPIC_AUTH_TOKEN, so the CLI silently authenticates to real Anthropic instead of
@@ -119,7 +114,17 @@
 # : "${REVIEWER_PROVIDER:=codex}"  ; : "${REVIEWER_EFFORT:=low}"
 # : "${BUILDER_MODEL:=}"           ; : "${REVIEWER_MODEL:=}"       # empty = provider default
 # Providers: codex (effort -> -c model_reasoning_effort), claude (model only; effort
-# deferred), opencode (model only), droid. Reviewer stays read-only automatically.
+# deferred), zai/zlaude (Z.AI model by name), opencode (model only), droid. Reviewer
+# stays read-only automatically.
+# Z.AI uses Claude Code with stdin and fully unsets ANTHROPIC_API_KEY plus the three
+# ANTHROPIC_DEFAULT_*_MODEL pins. Keep the token in this ignored file or your env;
+# never commit it. The default base is the verified Anthropic-compatible route
+# https://api.z.ai/api/anthropic (https://z.ai is not an API endpoint):
+# : "${RALPH_ZAI_BASE_URL:=https://api.z.ai/api/anthropic}"
+# : "${RALPH_ZAI_AUTH_TOKEN:=your-zai-token}"
+# Then select any plan model directly, with no AGENT_ZLAUDE*_CMD model remap:
+#   ralph batch ... --builder-provider zai --builder-model glm-5.2 \
+#     --reviewer-provider zai --reviewer-model glm-4.5-air
 # Per-run override without editing this file:
 #   RALPH_PROFILE=cheap ralph batch ...        BUILDER_EFFORT=high ralph batch ...
 #   ralph batch --profile max --reviewer-effort low ...
