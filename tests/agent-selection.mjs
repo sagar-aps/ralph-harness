@@ -30,13 +30,14 @@ function resolve(env) {
     echo "BUILD=\${AGENT_RALPH_BUILD_CMD:-<unset>}"
     echo "REVIEW=\${AGENT_RALPH_REVIEW_CMD:-<unset>}"
     echo "REVIEW_STRIPPED=$(printf '%s' "\${AGENT_RALPH_REVIEW_CMD:-}" | strip_autoapprove)"
+    echo "BUILDER_RESOLVED=$(resolve_backend_cmd "\${BUILDER:-}")"
     echo "CLAUDE=\${AGENT_CLAUDE_CMD}"
     echo "OPENCODE=\${AGENT_OPENCODE_CMD}"
   `;
   const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", env: { ...process.env, ...env } });
   const out = `${r.stdout}${r.stderr}`;
   const get = (k) => (out.match(new RegExp(`^${k}=(.*)$`, "m")) || [])[1] ?? "";
-  return { status: Number(get("STATUS")), BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), CLAUDE: get("CLAUDE"), OPENCODE: get("OPENCODE"), raw: out };
+  return { status: Number(get("STATUS")), BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), BUILDER_RESOLVED: get("BUILDER_RESOLVED"), CLAUDE: get("CLAUDE"), OPENCODE: get("OPENCODE"), raw: out };
 }
 
 const claudeEnvUnsetPrefix = "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude";
@@ -81,6 +82,19 @@ console.log("2b) Z.AI composer: hermetic env, arbitrary model passthrough, and r
   check(z.REVIEW_STRIPPED === `${zaiPrefix} --model glm-4.5-air`, "zlaude alias reviewer passes its model and has no permission-skip flag");
   check(!z.BUILD.includes("ANTHROPIC_API_KEY=") && z.BUILD.includes("env -u ANTHROPIC_API_KEY"), "zai fully unsets ANTHROPIC_API_KEY instead of assigning it empty");
   check(!z.BUILD.includes("model_reasoning_effort") && !z.REVIEW.includes("model_reasoning_effort"), "zai ignores effort");
+  const convenient = resolve({
+    BUILDER: "zai", BUILDER_PROVIDER: "", BUILDER_MODEL: "glm-5.2", BUILDER_EFFORT: "",
+    REVIEWER: "zlaude", REVIEWER_PROVIDER: "", REVIEWER_MODEL: "glm-4.5-air", REVIEWER_EFFORT: "",
+    RALPH_PROFILE: "",
+  });
+  check(convenient.BUILDER === "ralph-build" && convenient.BUILD === z.BUILD, "--builder zai plus a model reaches the normalized Z.AI composer");
+  check(convenient.REVIEWER === "ralph-review" && convenient.REVIEW_STRIPPED === z.REVIEW_STRIPPED, "--reviewer zlaude plus a model reaches the read-only normalized composer");
+
+  const custom = resolve({
+    BUILDER: "zai", AGENT_ZAI_CMD: "custom-zai -p", BUILDER_PROVIDER: "", BUILDER_MODEL: "glm-5.2", BUILDER_EFFORT: "",
+    REVIEWER: "", REVIEWER_PROVIDER: "codex", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", RALPH_PROFILE: "",
+  });
+  check(custom.BUILDER === "zai" && custom.BUILDER_RESOLVED === "custom-zai -p", "an explicit AGENT_ZAI_CMD keeps the legacy custom-backend path");
   for (const model of ["glm-4.7", "glm-4.5-air", "glm-5.1", "glm-5.2"]) {
     const named = resolve({ BUILDER_PROVIDER: "zai", BUILDER_MODEL: model, RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
     check(named.BUILD.endsWith(` --model ${model}`), `zai passes arbitrary plan model ${model} directly to claude`);

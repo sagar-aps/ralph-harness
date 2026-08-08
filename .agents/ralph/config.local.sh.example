@@ -123,8 +123,10 @@
 # : "${RALPH_ZAI_BASE_URL:=https://api.z.ai/api/anthropic}"
 # : "${RALPH_ZAI_AUTH_TOKEN:=your-zai-token}"
 # Then select any plan model directly, with no AGENT_ZLAUDE*_CMD model remap:
-#   ralph batch ... --builder-provider zai --builder-model glm-5.2 \
-#     --reviewer-provider zai --reviewer-model glm-4.5-air
+#   ralph batch ... --builder zai --builder-model glm-5.2 \
+#     --reviewer zai --reviewer-model glm-4.5-air
+# (`--builder-provider zai` / `--reviewer-provider zai` are equivalent normalized
+# spellings. A defined AGENT_ZAI_CMD or AGENT_ZLAUDE_CMD still takes precedence.)
 # Per-run override without editing this file:
 #   RALPH_PROFILE=cheap ralph batch ...        BUILDER_EFFORT=high ralph batch ...
 #   ralph batch --profile max --reviewer-effort low ...

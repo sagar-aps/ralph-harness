@@ -297,7 +297,29 @@ ralph_apply_profile() {  # <profile>
 }
 
 ralph_resolve_role_agents() {
-  local build_cmd review_cmd
+  local build_cmd review_cmd role_name role_var
+  # `--builder zai --builder-model ...` is the convenient Z.AI spelling from the
+  # operator docs. Treat zai/zlaude as normalized providers when there is no
+  # same-named explicit AGENT_*_CMD override; an override keeps the legacy custom
+  # backend path and therefore remains fully backward-compatible.
+  if [[ -z "${BUILDER_PROVIDER:-}" ]]; then
+    case "${BUILDER:-}" in
+      zai|zlaude)
+        role_name="$BUILDER"
+        role_var="AGENT_$(printf '%s' "$role_name" | tr 'a-z-' 'A-Z_')_CMD"
+        if [[ -z "${!role_var:-}" ]]; then BUILDER_PROVIDER="$role_name"; BUILDER=""; fi
+        ;;
+    esac
+  fi
+  if [[ -z "${REVIEWER_PROVIDER:-}" ]]; then
+    case "${REVIEWER:-}" in
+      zai|zlaude)
+        role_name="$REVIEWER"
+        role_var="AGENT_$(printf '%s' "$role_name" | tr 'a-z-' 'A-Z_')_CMD"
+        if [[ -z "${!role_var:-}" ]]; then REVIEWER_PROVIDER="$role_name"; REVIEWER=""; fi
+        ;;
+    esac
+  fi
   # Act only if the operator asked for normalized selection.
   [[ -n "${RALPH_PROFILE:-}${BUILDER_PROVIDER:-}${REVIEWER_PROVIDER:-}${BUILDER_MODEL:-}${REVIEWER_MODEL:-}${BUILDER_EFFORT:-}${REVIEWER_EFFORT:-}" ]] || return 0
   [[ -n "${RALPH_PROFILE:-}" ]] && ralph_apply_profile "$RALPH_PROFILE"

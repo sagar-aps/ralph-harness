@@ -422,7 +422,7 @@ Batch options (ralph batch):
 
 Agent selection (ralph batch / review) — compose a backend from {provider,model,effort}:
   --profile cheap|balanced|max        Preset per-role provider/effort (fills unset knobs)
-  --builder-provider <p>              codex | claude | zai | opencode | droid  (reviewer: --reviewer-provider)
+  --builder-provider <p>              codex | claude | zai|zlaude | opencode | droid  (reviewer: --reviewer-provider)
   --builder-effort low|medium|high    codex maps to model_reasoning_effort (reviewer: --reviewer-effort)
   --builder-model <m>                 Model id; empty = provider default (reviewer: --reviewer-model)
                                       Precedence: flag > config.local.sh > ralph.target.json "agents" > default
