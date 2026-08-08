@@ -87,6 +87,11 @@ emit("cfg_down", p.get("down"))
 emit("cfg_url", p.get("url"))
 emit("cfg_e2e", p.get("e2e"))
 emit("cfg_host", p.get("host"))
+# Identity marker (issue-53): declarative identity configuration
+i = d.get("identity", {}) if isinstance(d, dict) else {}
+emit("cfg_identity_enabled", i.get("enabled"))
+emit("cfg_identity_wrapper", i.get("wrapper"))
+emit("cfg_identity_role", i.get("role"))
 # Normalized agent selection (#4): an optional "agents" block declares per-role
 # provider/model/effort and/or a profile as a repo-level default.
 # NOTE: keep this heredoc body free of apostrophes and unbalanced ()/{} — Bash 3.2
