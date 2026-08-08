@@ -22,6 +22,7 @@ forever. Urgency travels through labels, not through loop speed.
 | `blocked:orchestrator` | Manager | The Manager has handed work back to the orchestrator: an arbitration question answered on the thread, or a PR rejected with changes requested. The Manager posts the decision as a comment and applies this label in the same action. **The Manager never removes it** — the orchestrator clears it once it has acted (fixes pushed, ticket resumed). |
 | `verify:pending` | Manager | Merged, awaiting deploy-time acceptance. The Manager clears it after verifying deployed reality. |
 | `recommendation` | Manager | A suggested change/improvement awaiting owner or Manager triage (not yet `now`/`later`). |
+| `complexity:{trivial,small,medium,large}` | Manager | Estimated effort/difficulty, set at acceptance time (exactly one per implementable issue, with a one-line rationale in the issue). Input to the orchestrator's model/effort/tier selection (efficiency mode): cheaper tier for lower complexity, stronger for higher. |
 
 ## Invariants both roles must honor
 
