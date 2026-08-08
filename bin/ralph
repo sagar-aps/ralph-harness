@@ -57,6 +57,7 @@ const review = {
   skipPreflight: false,
   // batch resume
   resume: false,
+  reportJson: false,
 };
 
 function exists(p) {
@@ -377,6 +378,7 @@ Commands:
                                       also installs the Manager skill (.claude/skills/manager/)
   install-agent-commands [--agent X]  Install operator commands (claude|codex|copilot)
   overview                            Render a human overview from PRD JSON
+  report [--repo <target>] [--json]   Show per-ticket usage summary from .ralph/ledger.jsonl
   help                                Show this message
 
 Options:
@@ -642,6 +644,10 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--no-preflight" || arg === "--skip-preflight") {
     review.skipPreflight = true;
+    continue;
+  }
+  if (arg === "--json") {
+    review.reportJson = true;
     continue;
   }
   if (arg === "--resume") {
@@ -1534,6 +1540,21 @@ async function main() {
       }
     }
     process.exit(0);
+  }
+
+  if (cmd === "report") {
+    const targetRepo = review.repo || process.env.TARGET_REPO || process.cwd();
+    const repo = path.resolve(process.cwd(), targetRepo);
+    const reportTemplateDir = exists(localDir) ? localDir : globalDir;
+    const reportScript = path.join(reportTemplateDir, "report.py");
+    if (!exists(reportScript)) {
+      console.error(`report.py not found at ${reportScript}`);
+      process.exit(1);
+    }
+    const pyArgs = [reportScript, repo];
+    if (review.reportJson) pyArgs.push("--json");
+    const result = spawnSync("python3", pyArgs, { stdio: "inherit" });
+    process.exit(result.status ?? 1);
   }
 
   const templateDir = exists(localDir) ? localDir : globalDir;
