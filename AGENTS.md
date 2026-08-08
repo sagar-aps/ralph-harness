@@ -33,7 +33,10 @@ Keep this file short. It is always loaded into context.
   (`RALPH_AGENT_RETRIES`) then halts the batch with `REVIEWER_UNAVAILABLE` /
   `BUILDER_UNAVAILABLE` (exit 4); `--resume` continues, skipping already-PASSed tasks.
 - Backends/roles: `.agents/ralph/agents.sh` (`resolve_backend_cmd`); prompts
-  `PROMPT_builder.md` / `PROMPT_reviewer.md`; config `review-config.sh`.
+  `PROMPT_builder.md` / `PROMPT_reviewer.md`; config `review-config.sh`. The
+  cron/orchestrator loop DRIVER is a third, independent role:
+  `RALPH_CRON_DRIVER` (convention in `config.sh`, resolved by
+  `ralph_resolve_cron_driver`), owned by the orchestrator per `ORCHESTRATOR.md`.
 - Target scaffolding templates: `.agents/ralph/target-templates/` (used by
   `ralph init-target`). Operator commands: canonical set in `agent-commands/ralph/`,
   adapted per agent (claude/codex/copilot) by `ralph install-agent-commands`.

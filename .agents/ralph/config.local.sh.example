@@ -132,6 +132,35 @@
 #   ralph batch --profile max --reviewer-effort low ...
 
 # ---------------------------------------------------------------------------
+# 7) Cron/orchestrator loop DRIVER — RALPH_CRON_DRIVER (#52)
+# ---------------------------------------------------------------------------
+# The DRIVER is the agent that wakes on your recurring cadence (hourly cron, timer,
+# session loop), reads ORCHESTRATOR.md and runs one pass. It is a THIRD role: setting
+# it does NOT touch builder/reviewer selection above, and BUILDER/REVIEWER do not
+# touch it. A driver script resolves it with `ralph_resolve_cron_driver` (agents.sh),
+# which returns a command exactly the way the roles get theirs — so anything usable as
+# a backend is usable as a driver.
+#
+# Either spelling works (the normalized spec wins if both are set):
+# : "${RALPH_CRON_DRIVER:=codex}"                 # a backend name: codex, zlaude,
+#                                                 # opencode-z, or your AGENT_<NAME>_CMD
+# : "${RALPH_CRON_DRIVER_PROVIDER:=zai}"          # or a normalized {provider,model,effort}
+# : "${RALPH_CRON_DRIVER_MODEL:=glm-4.5-air}"
+# : "${RALPH_CRON_DRIVER_EFFORT:=low}"            # low|medium|high (codex maps it)
+#
+# Unset -> RALPH_CRON_DRIVER_DEFAULT (config.sh) -> $DEFAULT_AGENT, i.e. whatever this
+# install already drives agents with. Repoint the default instead of hardcoding a
+# vendor everywhere:
+# : "${RALPH_CRON_DRIVER_DEFAULT:=opencode-z}"
+#
+# WHY THIS IS A KNOB, AND WHO OWNS IT: a loop pass is mechanical mid-tier throughput —
+# read labels, dispatch the harness, run the Manager's acceptance verbatim, file a PR.
+# Left hardcoded in a cron line, the driver is invisible and inherited: it silently
+# burns a frontier-priced pool doing clerical work. So the ORCHESTRATOR owns this
+# choice (see ORCHESTRATOR.md) and revisits it when conditions change — a credential
+# pool near saturation, a cheaper model shipping, a free tier opening. Favour the
+# CHEAPEST COMPETENT driver, and keep it on a pool the builder/reviewer are not
+# already saturating; it need not be the model of the session that configured it.
 # 7) Per-provider pricing table (USD per million tokens, for `ralph report`)
 # ---------------------------------------------------------------------------
 # The default pricing table ships at .agents/ralph/pricing.json. To override

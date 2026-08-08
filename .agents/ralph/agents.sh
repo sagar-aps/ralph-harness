@@ -352,3 +352,58 @@ ralph_resolve_role_agents() {
 # NOTE: the loops (batch-loop.sh / review-loop.sh) call ralph_resolve_role_agents
 # AFTER sourcing config.local.sh, so the operator's specs are in scope. Do NOT call
 # it here at source time — agents.sh is sourced before config.local.sh.
+
+# ---------------------------------------------------------------------------
+# Cron / orchestrator loop DRIVER selection (issue #52).
+#
+# The driver is the agent that wakes on the recurring cadence, reads ORCHESTRATOR.md
+# and runs one loop pass. It is a THIRD role, independent of builder/reviewer: this
+# resolver never reads or writes BUILDER/REVIEWER, and role selection never reads
+# RALPH_CRON_DRIVER. The convention itself (and its default) is documented in
+# config.sh; a driver script/cron entry calls ralph_resolve_cron_driver to turn it
+# into a command.
+#
+# Accepted spellings, in precedence order:
+#   1. RALPH_CRON_DRIVER_PROVIDER (+ _MODEL / _EFFORT) — a normalized spec composed
+#      by the same ralph_provider_cmd adapter the roles use, exposed as the
+#      synthetic backend name "ralph-cron" (AGENT_RALPH_CRON_CMD).
+#   2. RALPH_CRON_DRIVER — a backend NAME resolved by resolve_backend_cmd.
+#   3. Neither set — RALPH_CRON_DRIVER_DEFAULT (config.sh), which itself defaults to
+#      $DEFAULT_AGENT. No vendor is hardcoded: repoint either variable and every
+#      unset caller follows.
+#
+# The driver is composed in `build` (writable) mode — unlike the reviewer it has to
+# act: dispatch the harness, deploy dev, file PRs.
+#
+# The printed command is self-contained, so `cmd="$(ralph_resolve_cron_driver)"` is a
+# valid call. It ALSO sets RALPH_CRON_DRIVER_BACKEND / RALPH_CRON_DRIVER_CMD (and
+# AGENT_RALPH_CRON_CMD for a normalized spec) in the calling shell — a caller that
+# wants those must invoke it directly (redirect its stdout) rather than inside
+# `$(...)`, which would discard them with the subshell.
+ralph_resolve_cron_driver() {  # -> runnable command template on stdout
+  local provider model effort name cmd var
+  provider="${RALPH_CRON_DRIVER_PROVIDER:-}"
+  model="${RALPH_CRON_DRIVER_MODEL:-}"
+  effort="${RALPH_CRON_DRIVER_EFFORT:-}"
+  name="${RALPH_CRON_DRIVER:-}"
+  if [[ -n "$provider$model$effort" ]]; then
+    # A model/effort with no provider still needs one: the name spelling (or the
+    # documented default) names it.
+    [[ -n "$provider" ]] || provider="${name:-${RALPH_CRON_DRIVER_DEFAULT:-${DEFAULT_AGENT:-codex}}}"
+    cmd="$(ralph_provider_cmd build "$provider" "$model" "$effort")" || return 1
+    AGENT_RALPH_CRON_CMD="$cmd"
+    export AGENT_RALPH_CRON_CMD
+    name="ralph-cron"
+  fi
+  [[ -n "$name" ]] || name="${RALPH_CRON_DRIVER_DEFAULT:-${DEFAULT_AGENT:-codex}}"
+  cmd="$(resolve_backend_cmd "$name")" || return 1
+  if [[ -z "$cmd" ]]; then
+    var="AGENT_$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')_CMD"
+    echo "ralph: cron driver '$name' has no command; define $var (see .agents/ralph/config.local.sh.example)" >&2
+    return 1
+  fi
+  RALPH_CRON_DRIVER_BACKEND="$name"
+  RALPH_CRON_DRIVER_CMD="$cmd"
+  export RALPH_CRON_DRIVER_BACKEND RALPH_CRON_DRIVER_CMD
+  printf '%s\n' "$cmd"
+}
