@@ -43,6 +43,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/config.sh"; }
 [[ -f "$SCRIPT_DIR/review-config.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/review-config.sh"; }
+[[ -f "$SCRIPT_DIR/efficiency.sh" ]] && { # shellcheck source=/dev/null
+  . "$SCRIPT_DIR/efficiency.sh"; }
 # Untracked local overrides (gitignored) — sourced LAST so they win. Copy
 # config.local.sh.example to config.local.sh to define/override backends & roles.
 # RALPH_NO_LOCAL_CONFIG=1 skips it — used by the test suite so a developer's machine
@@ -135,6 +137,19 @@ BUILDER_RESOLVED_MODEL="${BUILDER_RESOLVED_MODEL:-unknown}"
 REVIEWER_RESOLVED_MODEL="${REVIEWER_RESOLVED_MODEL:-unknown}"
 [[ -f "$BUILDER_PROMPT" ]] || die "Builder prompt not found: $BUILDER_PROMPT"
 [[ -f "$REVIEWER_PROMPT" ]] || die "Reviewer prompt not found: $REVIEWER_PROMPT"
+
+# ---- Efficiency mode (#59) — opt-in, GOVERNS NOTHING in this slice ----------
+# --efficiency / RALPH_EFFICIENCY only boot-validates the declarative profile and
+# reports its state. The selection resolved above is untouched: a missing or
+# rejected profile falls back to inert/off and the run proceeds on the normal
+# --builder/--reviewer path. Enforcement lands in a later slice (#54 step 4c).
+if declare -F ralph_efficiency_enabled >/dev/null 2>&1 && ralph_efficiency_enabled; then
+  if ralph_efficiency_boot_validate "$TARGET_REPO"; then
+    echo "efficiency mode: recognized, profile parsed — INERT in this slice (selection unchanged)."
+  else
+    echo "efficiency mode: recognized but INERT (selection unchanged)."
+  fi
+fi
 
 # ---- Discover PRD -----------------------------------------------------------
 if [[ -z "${PRD_PATH:-}" && -d "$TARGET_REPO/.agents/tasks" ]]; then

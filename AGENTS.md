@@ -44,6 +44,12 @@ Keep this file short. It is always loaded into context.
   `integrate`, `cleanup`, `init-target`, `install-agent-commands`. Run metadata:
   `<target>/.ralph/last-run.env`; artifacts: `<target>/.ralph/runs/<run-id>/` (review)
   or `<target>/.agent-run/batch-<ts>/` (batch).
+- Efficiency mode (opt-in, **governs nothing yet**): `.agents/ralph/efficiency.py` +
+  `efficiency.sh` parse/validate the declarative profile (`efficiency.json`, gitignored;
+  `efficiency.json.example` ships the policy). `--efficiency`/`RALPH_EFFICIENCY` only
+  boot-validates — an invalid profile is rejected to inert/off, never fatal — and
+  `ralph explain --complexity <tier>` reports which rung WOULD be chosen. Selection and
+  dispatch are unchanged; wiring them is a later slice.
 
 ## Token economics (read before reasoning about cost or caching)
 

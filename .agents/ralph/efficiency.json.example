@@ -1,0 +1,64 @@
+{
+  "_note": "Ralph efficiency profile — the OPERATOR policy for which rung (builder/reviewer pairing) each complexity tier may use, and when a credential pool stops being eligible. Copy to .agents/ralph/efficiency.json (gitignored, like config.local.sh) and edit. As of #59 this profile GOVERNS NOTHING: `ralph explain` reads it, dispatch does not. Wiring it into selection is a later slice (#54 step 4c).",
+  "_schema": {
+    "rungs": "ladder, CHEAPEST FIRST. Each rung names the backend + credential pool for each role. `pool` is the credential pool (same concept as RALPH_BUILDER_CREDENTIAL_POOL / RALPH_REVIEWER_CREDENTIAL_POOL): several backends can share one plan's quota.",
+    "caps": "keyed by pool. Three shapes: {window_5h_pct, window_weekly_pct} = stop using the pool once that share of the rolling window is spent; {source: \"provider\"} = the provider meters it, the harness applies no local cap; {backstop: true} = uncapped last resort.",
+    "avoid_windows": "per rung. from/to are HH:MM in tz (UTC only), days like \"Mon-Fri\" / \"Sat,Sun\" / \"*\". While the current UTC time is inside the window the rung is not eligible.",
+    "reserves": "<pool>_weekly_pct = keep at least this much of the pool's weekly window unspent for higher-value work. near_weekly_reset_hours = relax the reserve when the weekly window resets within this many hours (unspent quota is about to expire anyway).",
+    "tiers": "which rungs each task complexity may use, in preference order."
+  },
+  "rungs": [
+    {
+      "name": "zlaude",
+      "builder": { "backend": "zlaude", "pool": "zai" },
+      "reviewer": { "backend": "zlaude", "pool": "zai" },
+      "caps": {
+        "zai": { "window_5h_pct": 70, "window_weekly_pct": 45 }
+      },
+      "avoid_windows": [
+        {
+          "from": "06:00",
+          "to": "10:00",
+          "tz": "UTC",
+          "days": "Mon-Fri",
+          "reason": "3x quota burn (Z.AI peak)"
+        }
+      ]
+    },
+    {
+      "name": "codex",
+      "builder": { "backend": "codex", "pool": "openai" },
+      "reviewer": { "backend": "codex-readonly", "pool": "openai" },
+      "caps": {
+        "openai": { "source": "provider" }
+      }
+    },
+    {
+      "name": "claude",
+      "builder": { "backend": "claude", "pool": "anthropic" },
+      "reviewer": { "backend": "claude", "pool": "anthropic" },
+      "caps": {
+        "anthropic": { "window_5h_pct": 80, "window_weekly_pct": 75 }
+      }
+    },
+    {
+      "name": "deepseek",
+      "builder": { "backend": "dlaude", "pool": "deepseek" },
+      "reviewer": { "backend": "dlaude", "pool": "deepseek" },
+      "caps": {
+        "deepseek": { "backstop": true }
+      }
+    }
+  ],
+  "reserves": {
+    "anthropic_weekly_pct": 25,
+    "zai_weekly_pct": 55,
+    "near_weekly_reset_hours": 5
+  },
+  "tiers": {
+    "trivial": ["deepseek", "zlaude"],
+    "small": ["zlaude", "codex"],
+    "medium": ["codex", "claude", "deepseek"],
+    "large": ["claude", "deepseek"]
+  }
+}

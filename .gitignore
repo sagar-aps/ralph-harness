@@ -20,6 +20,9 @@ pnpm-debug.log*
 .agents/ralph/config.local.sh
 # Operator-supplied identity wrapper (soft dependency; ambient gh auth is the fallback)
 .agents/ralph/identity.sh
+# Efficiency profile — OPERATOR policy (cost/quota posture), like config.local.sh.
+# Only the .example is tracked; the real profile stays local.
+.agents/ralph/efficiency.json
 
 # Temp
 .tmp/

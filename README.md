@@ -611,6 +611,45 @@ batch also writes `<target>/.ralph/last-run.env`, so `ralph status` / `ralph int
 / `ralph cleanup` work on the batch branch just like a single review run. Add it to
 your operator agent with `/ralph-batch` (installed by `ralph install-agent-commands`).
 
+### Efficiency profile + `ralph explain` (opt-in, governs nothing yet)
+
+An **efficiency profile** is the operator's declarative cost policy: a ladder of
+**rungs** (cheapest first), the **credential pool** each role draws on, the window
+caps / avoid-windows that make a pool ineligible, the reserves to keep for
+higher-value work, and which rungs each task complexity may use.
+
+Copy the shipped example and edit it:
+
+```bash
+cp .agents/ralph/efficiency.json.example .agents/ralph/efficiency.json
+```
+
+The real `efficiency.json` is **gitignored** (it is local operator policy, like
+`config.local.sh`); only the `.example` ships. Point elsewhere with
+`--efficiency-profile <path>` or `RALPH_EFFICIENCY_PROFILE`.
+
+Ask what the policy *would* do — read-only, dispatches nothing:
+
+```bash
+ralph explain --complexity medium [--repo <target>] [--profile <path>] [--json]
+```
+
+It prints the tier's allowed rungs in order, then per pool: the window caps, whether
+an avoid window is active *now* (compared against the current UTC time), the reserve,
+and any near-weekly-reset relaxation — then the rung it would choose and why.
+Per-pool usage comes from `<target>/.ralph/ledger.jsonl` when a record carries a
+`quota` block (`{pool, window_5h_pct, window_weekly_pct, weekly_reset_at}`); with no
+ledger, or a ledger without such observations, it assumes **0 % used** and says so.
+
+Validation is **reject-to-safe**: a malformed or invalid profile is rejected with a
+loud warning on stderr and efficiency mode falls back to inert/off — it never crashes
+or fails a run. A missing profile prints a clean "not configured" message.
+
+`--efficiency` (or `RALPH_EFFICIENCY=1`) on `ralph review` / `ralph batch` is
+recognized and boot-validates the profile, but **selection and dispatch are
+unchanged** in this slice: `--builder` / `--reviewer` still decide who runs.
+Wiring the profile into selection is a later slice.
+
 ## State files (.ralph/)
 
 - `progress.md` — append‑only progress log

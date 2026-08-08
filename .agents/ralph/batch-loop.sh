@@ -37,6 +37,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   . "$SCRIPT_DIR/config.sh"; }
 [[ -f "$SCRIPT_DIR/review-config.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/review-config.sh"; }
+[[ -f "$SCRIPT_DIR/efficiency.sh" ]] && { # shellcheck source=/dev/null
+  . "$SCRIPT_DIR/efficiency.sh"; }
 [[ -f "$SCRIPT_DIR/round-usage.sh" ]] && { # shellcheck source=/dev/null
   . "$SCRIPT_DIR/round-usage.sh"; }
 [[ -f "$SCRIPT_DIR/reported-model.sh" ]] && { # shellcheck source=/dev/null
@@ -296,6 +298,19 @@ require_backend() {
 }
 require_backend "builder ($BUILDER)" "$BUILDER_CMD"
 require_backend "reviewer ($REVIEWER)" "$REVIEWER_CMD"
+
+# ---- Efficiency mode (#59) — opt-in, GOVERNS NOTHING in this slice ----------
+# --efficiency / RALPH_EFFICIENCY only boot-validates the declarative profile and
+# reports its state. The selection resolved above is untouched: a missing or
+# rejected profile falls back to inert/off and the batch proceeds on the normal
+# --builder/--reviewer path. Enforcement lands in a later slice (#54 step 4c).
+if declare -F ralph_efficiency_enabled >/dev/null 2>&1 && ralph_efficiency_enabled; then
+  if ralph_efficiency_boot_validate "$TARGET_REPO"; then
+    echo "efficiency mode: recognized, profile parsed — INERT in this slice (selection unchanged)."
+  else
+    echo "efficiency mode: recognized but INERT (selection unchanged)."
+  fi
+fi
 
 # ---- Dirty check (ignore harness bookkeeping) ------------------------------
 if [[ "$ALLOW_DIRTY" != "true" ]]; then

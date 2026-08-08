@@ -58,6 +58,21 @@
 # cheapest free-tier/plan model that can still finish a pass end to end, which is
 # usually NOT the model of the session that configured it. Making and revising that
 # call is the orchestrator's remit — see ORCHESTRATOR.md.
+# ---------------------------------------------------------------------------
+# Efficiency mode (opt-in) — RALPH_EFFICIENCY / RALPH_EFFICIENCY_PROFILE
+# ---------------------------------------------------------------------------
+# RALPH_EFFICIENCY=1 (or --efficiency) makes review/batch boot-validate the
+# declarative efficiency profile and report its state. It GOVERNS NOTHING in this
+# slice: builder/reviewer selection and dispatch are unchanged, and no reserve is
+# enforced. An invalid profile is rejected to inert/off with a loud warning; it
+# never fails a run.
+#
+# The profile is operator policy and is gitignored (like config.local.sh). Copy
+# efficiency.json.example to efficiency.json to configure one, or point elsewhere:
+# RALPH_EFFICIENCY_PROFILE=".agents/ralph/efficiency.json"
+#
+# Read the policy back with: ralph explain --complexity <trivial|small|medium|large>
+
 # Per-provider pricing table (USD per million tokens) used by `ralph report`.
 # Defaults to pricing.json shipped next to this file. Override with a path to
 # your own pricing file (same JSON schema) — e.g. in config.local.sh.
