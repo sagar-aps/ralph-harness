@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Default agent command templates (used by loop.sh and CLI).
 
-AGENT_CODEX_CMD="codex exec --yolo --skip-git-repo-check -"
+# Keep external MCP servers and Codex app connectors out of builder/reviewer
+# runs. Their write paths bypass the gh/git PATH guard used by the orchestrator.
+CODEX_NO_MCP_ARGS="-c 'mcp_servers={}'"
+CODEX_NO_APPS_ARGS="--disable apps"
+CODEX_NO_CONNECTORS_ARGS="${CODEX_NO_MCP_ARGS} ${CODEX_NO_APPS_ARGS}"
+AGENT_CODEX_CMD="codex exec ${CODEX_NO_CONNECTORS_ARGS} --yolo --skip-git-repo-check -"
 AGENT_CODEX_INTERACTIVE_CMD="codex --yolo {prompt}"
 AGENT_CLAUDE_CMD="env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude -p --dangerously-skip-permissions"
 AGENT_CLAUDE_INTERACTIVE_CMD="claude --dangerously-skip-permissions {prompt}"
@@ -31,11 +36,11 @@ AGENT_OPENCODE_INTERACTIVE_CMD="opencode --prompt {prompt}"
 # whenever its CLI supports one. For other agents, define a backend using that
 # agent's equivalent read-only flag; agents without one remain valid reviewers.
 # Codex writable form (good default for a builder role):
-#   codex exec --sandbox workspace-write -
-[[ -n "${AGENT_CODEX_WRITE_CMD:-}" ]] || AGENT_CODEX_WRITE_CMD='codex exec --sandbox workspace-write -'
+#   codex exec -c 'mcp_servers={}' --disable apps --sandbox workspace-write -
+[[ -n "${AGENT_CODEX_WRITE_CMD:-}" ]] || AGENT_CODEX_WRITE_CMD="codex exec ${CODEX_NO_CONNECTORS_ARGS} --sandbox workspace-write -"
 # Codex read-only form (the codex-readonly backend, preferred for a reviewer):
-#   codex exec --sandbox read-only -
-[[ -n "${AGENT_CODEX_READONLY_CMD:-}" ]] || AGENT_CODEX_READONLY_CMD='codex exec --sandbox read-only -'
+#   codex exec -c 'mcp_servers={}' --disable apps --sandbox read-only -
+[[ -n "${AGENT_CODEX_READONLY_CMD:-}" ]] || AGENT_CODEX_READONLY_CMD="codex exec ${CODEX_NO_CONNECTORS_ARGS} --sandbox read-only -"
 
 DEFAULT_AGENT="codex"
 
@@ -89,6 +94,16 @@ ralph_validate_model_selectors() {  # <command label> <command>
   return 1
 }
 
+# cxb/cxr are commonly operator-defined Codex aliases. Harden them at resolution
+# as well, so an older local alias cannot restore MCP/app connector write paths.
+ralph_codex_disable_connectors() {  # <codex command>
+  local cmd="$1"
+  [[ "$cmd" == codex\ exec\ * ]] || { printf '%s' "$cmd"; return; }
+  [[ "$cmd" == *"mcp_servers={}"* ]] || cmd="${cmd/codex exec /codex exec ${CODEX_NO_MCP_ARGS} }"
+  [[ "$cmd" == *"--disable apps"* ]] || cmd="${cmd/codex exec /codex exec ${CODEX_NO_APPS_ARGS} }"
+  printf '%s' "$cmd"
+}
+
 # Resolve a backend NAME (e.g. "claude", "opencode-z", "codex-readonly") to its
 # command template. Unknown names fall back to AGENT_<UPPER_WITH_UNDERSCORES>_CMD
 # so new backends only need a variable defined here or in config.sh — no code
@@ -106,6 +121,8 @@ resolve_backend_cmd() {
     codex|"")        cmd="${AGENT_CODEX_CMD}" ;;
     codex-write)     cmd="${AGENT_CODEX_WRITE_CMD}" ;;
     codex-readonly)  cmd="${AGENT_CODEX_READONLY_CMD}" ;;
+    cxb)             cmd="$(ralph_codex_disable_connectors "${AGENT_CXB_CMD:-}")" ;;
+    cxr)             cmd="$(ralph_codex_disable_connectors "${AGENT_CXR_CMD:-}")" ;;
     *)
       # Generic fallback: foo-bar -> $AGENT_FOO_BAR_CMD
       local var
@@ -249,9 +266,9 @@ ralph_provider_cmd() {  # <mode: build|review> <provider> <model> <effort>
     codex)
       mflag=""; [[ -n "$model" ]] && mflag=" -m $model"
       if [[ "$mode" == "review" ]]; then
-        cmd="$(printf 'codex exec --sandbox read-only%s%s -' "$mflag" "$e")"
+        cmd="$(printf 'codex exec %s --sandbox read-only%s%s -' "$CODEX_NO_CONNECTORS_ARGS" "$mflag" "$e")"
       else
-        cmd="$(printf 'codex exec --yolo --skip-git-repo-check%s%s -' "$mflag" "$e")"
+        cmd="$(printf 'codex exec %s --yolo --skip-git-repo-check%s%s -' "$CODEX_NO_CONNECTORS_ARGS" "$mflag" "$e")"
       fi ;;
     claude)
       mflag=""; [[ -n "$model" ]] && mflag=" --model $model"
