@@ -87,7 +87,7 @@ console.log("1) unset -> the documented default resolves (no vendor hardcoded at
 console.log("2) a backend NAME resolves exactly like a role backend");
 {
   const named = resolveDriver({ RALPH_CRON_DRIVER: "codex-readonly" });
-  check(named.status === 0 && named.BACKEND === "codex-readonly" && named.CMD === "codex exec --sandbox read-only -",
+  check(named.status === 0 && named.BACKEND === "codex-readonly" && named.CMD === "codex exec -c 'mcp_servers={}' --disable apps --sandbox read-only -",
     "a shipped backend name resolves to that backend's command");
   check(named.CMD === named.VIA_BACKEND, "the resolved command equals resolve_backend_cmd(<backend>)");
 
@@ -109,11 +109,11 @@ console.log("3) a normalized {provider, model, effort} spec composes like a role
   check(z.CMD === z.VIA_BACKEND, "AGENT_RALPH_CRON_CMD is exported so resolve_backend_cmd finds it");
 
   const eff = resolveDriver({ RALPH_CRON_DRIVER_PROVIDER: "codex", RALPH_CRON_DRIVER_EFFORT: "low" });
-  check(eff.CMD === "codex exec --yolo --skip-git-repo-check -c model_reasoning_effort=low -",
+  check(eff.CMD === "codex exec -c 'mcp_servers={}' --disable apps --yolo --skip-git-repo-check -c model_reasoning_effort=low -",
     "effort maps through the same adapter, and the driver is composed writable (it files PRs)");
 
   const modelOnly = resolveDriver({ RALPH_CRON_DRIVER: "codex", RALPH_CRON_DRIVER_MODEL: "gpt-5-mini" });
-  check(modelOnly.status === 0 && modelOnly.CMD === "codex exec --yolo --skip-git-repo-check -m gpt-5-mini -",
+  check(modelOnly.status === 0 && modelOnly.CMD === "codex exec -c 'mcp_servers={}' --disable apps --yolo --skip-git-repo-check -m gpt-5-mini -",
     "a model with no provider uses the name spelling as the provider");
 }
 
@@ -124,7 +124,7 @@ console.log("4) the driver knob does not touch builder/reviewer selection");
     "a driver spec alone leaves BUILDER/REVIEWER and the role composer untouched");
 
   const both = resolveDriver({ RALPH_CRON_DRIVER: "claude", BUILDER_PROVIDER: "codex", BUILDER_EFFORT: "high" });
-  check(both.BUILDER === "ralph-build" && both.BUILD === "codex exec --yolo --skip-git-repo-check -c model_reasoning_effort=high -",
+  check(both.BUILDER === "ralph-build" && both.BUILD === "codex exec -c 'mcp_servers={}' --disable apps --yolo --skip-git-repo-check -c model_reasoning_effort=high -",
     "role selection is unaffected by a driver set alongside it");
   check(/(^| )claude -p/.test(both.CMD), "and the driver keeps its own separate command");
 }
