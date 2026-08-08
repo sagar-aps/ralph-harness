@@ -23,3 +23,8 @@
 # NO_COMMIT=false
 # MAX_ITERATIONS=25
 # STALE_SECONDS=0
+
+# Per-provider pricing table (USD per million tokens) used by `ralph report`.
+# Defaults to pricing.json shipped next to this file. Override with a path to
+# your own pricing file (same JSON schema) — e.g. in config.local.sh.
+# RALPH_PRICING_FILE=".agents/ralph/pricing.json"

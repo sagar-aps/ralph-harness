@@ -1,0 +1,36 @@
+{
+  "_note": "Per-provider pricing in USD per million tokens. Rates change — override via RALPH_PRICING_FILE env var or replace this file. These are operator-maintained defaults; the harness does not fetch live pricing.",
+  "providers": {
+    "anthropic": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75
+    },
+    "openai": {
+      "input": 2.50,
+      "output": 10.00,
+      "cache_read": 1.25,
+      "cache_write": 2.50
+    },
+    "zai": {
+      "input": 1.40,
+      "output": 5.60,
+      "cache_read": 0.26,
+      "cache_write": 0.26
+    },
+    "deepseek": {
+      "input": 0.27,
+      "output": 1.10,
+      "cache_read": 0.07,
+      "cache_write": 0.27
+    }
+  },
+  "aliases": {
+    "claude": "anthropic",
+    "codex": "openai",
+    "zlaude": "zai",
+    "opencode-z": "zai",
+    "dlaude": "deepseek"
+  }
+}

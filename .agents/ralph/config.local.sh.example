@@ -130,3 +130,30 @@
 # Per-run override without editing this file:
 #   RALPH_PROFILE=cheap ralph batch ...        BUILDER_EFFORT=high ralph batch ...
 #   ralph batch --profile max --reviewer-effort low ...
+
+# ---------------------------------------------------------------------------
+# 7) Per-provider pricing table (USD per million tokens, for `ralph report`)
+# ---------------------------------------------------------------------------
+# The default pricing table ships at .agents/ralph/pricing.json. To override
+# rates (they change), copy it, edit the copy, and point RALPH_PRICING_FILE at
+# your copy. Or set a custom path here:
+# : "${RALPH_PRICING_FILE:=/path/to/my-pricing.json}"
+#
+# Schema (pricing.json):
+#   {
+#     "providers": {
+#       "anthropic":  { "input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75 },
+#       "openai":     { "input": 2.50, "output": 10.00, "cache_read": 1.25, "cache_write": 2.50 },
+#       "zai":        { "input": 1.40, "output": 5.60,  "cache_read": 0.26, "cache_write": 0.26 },
+#       "deepseek":   { "input": 0.27, "output": 1.10,  "cache_read": 0.07, "cache_write": 0.27 }
+#     },
+#     "aliases": {
+#       "claude": "anthropic",
+#       "codex": "openai",
+#       "zlaude": "zai",
+#       "opencode-z": "zai",
+#       "dlaude": "deepseek"
+#     }
+#   }
+# All rates are USD per MILLION tokens. `cost_usd` = tokens × rate / 1_000_000.
+# Unknown providers (not in providers or aliases) -> cost_usd = "unknown".
