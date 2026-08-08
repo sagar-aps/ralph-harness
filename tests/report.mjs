@@ -1,5 +1,6 @@
-// Tests for the 'ralph report' subcommand (#56).
-// Seeds .ralph/ledger.jsonl with fixtures and asserts human + --json output.
+// Tests for the 'ralph report' subcommand (#56, extended for #57 pricing).
+// Seeds .ralph/ledger.jsonl with fixtures and asserts human + --json output
+// including per-provider cost computation (issue-57).
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +31,19 @@ function ralph(args, env = {}) {
 
 // Fixture: 2 runs x 2 tickets with known numbers.
 // task-001: 2 rounds total (1 per run), task-002: 2 rounds total (1 per run)
+//
+// Expected costs (issue-57, rates from pricing.json):
+//   Line 1 (claude→anthropic, input=5000 out=800 cached=200):
+//     5000/1M*3.00 + 800/1M*15.00 + 200/1M*0.30 = 0.027060
+//   Line 2 (claude→anthropic, input=3000 out=500 cached=100):
+//     3000/1M*3.00 + 500/1M*15.00 + 100/1M*0.30 = 0.016530
+//   Line 3 (codex→openai, input=7000 out=1200 cached=0):
+//     7000/1M*2.50 + 1200/1M*10.00 = 0.029500
+//   Line 4 (codex→openai, input=2000 out=300 cached=150):
+//     2000/1M*2.50 + 300/1M*10.00 + 150/1M*1.25 = 0.008188 (rounds from 0.0081875)
+//   task-001 total: 0.027060 + 0.029500 = 0.056560
+//   task-002 total: 0.016530 + 0.008188 = 0.024718
+//   grand total:    0.056560 + 0.024718 = 0.081278
 function seedLedger(target) {
   const lines = [
     // Run A, task-001
@@ -112,6 +126,9 @@ console.log("1) Human-readable report aggregates per-ticket across runs");
     check(/cached:\s*450\b/.test(out), "grand cached tokens = 450");
     check(/total:\s*20250\b/.test(out), "grand total tokens = 20250");
 
+    // Grand cost (issue-57: tokens × provider rates)
+    check(/\$0\.081278/.test(out), "grand cost_usd = $0.081278 (anthropic+openai rates)");
+
     // Per-ticket: task-001 (2 rounds across runs)
     check(/task-001:/.test(out), "report includes task-001 section");
     const t1Block = out.slice(out.indexOf("task-001:"), out.indexOf("task-002:"));
@@ -122,6 +139,7 @@ console.log("1) Human-readable report aggregates per-ticket across runs");
     check(/input:\s*12000\b/.test(t1Block), "task-001: input tokens = 12000");
     check(/claude:sonnet/.test(t1Block), "task-001: builder claude:sonnet seen");
     check(/codex:gpt-5/.test(t1Block), "task-001: builder codex:gpt-5 seen");
+    check(/\$0\.05656/.test(t1Block), "task-001: cost_usd = $0.056560");
 
     // Per-ticket: task-002
     const t2Block = out.slice(out.indexOf("task-002:"));
@@ -131,11 +149,15 @@ console.log("1) Human-readable report aggregates per-ticket across runs");
     check(/reviewer_attempts:\s*2\b/.test(t2Block), "task-002: reviewer_attempts = 2 (1+1)");
     check(/quota_rejected:\s*3\b/.test(t2Block), "task-002: quota_rejected = 3 (3+0)");
     check(/claude:haiku/.test(t2Block), "task-002: reviewer claude:haiku seen");
+    check(/\$0\.024718/.test(t2Block), "task-002: cost_usd = $0.024718");
+
+    // Cost providers reported
+    check(/cost providers:.*anthropic.*openai/.test(t1Block), "task-001: cost providers list includes anthropic and openai");
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
 // ── 2) --json output ──────────────────────────────────────────────────
-console.log("2) --json emits stable sorted-key JSON with correct aggregates");
+console.log("2) --json emits stable sorted-key JSON with correct aggregates (incl. cost)");
 {
   const target = seedLedger(makeTarget());
   try {
@@ -155,6 +177,7 @@ console.log("2) --json emits stable sorted-key JSON with correct aggregates");
     check(data.tokens.output === 2800, "JSON: tokens.output = 2800");
     check(data.tokens.cached === 450, "JSON: tokens.cached = 450");
     check(data.tokens.total === 20250, "JSON: tokens.total = 20250");
+    check(data.cost_usd === 0.081278, "JSON: grand cost_usd = 0.081278");
     check(Array.isArray(data.tickets) && data.tickets.length === 2, "JSON: 2 tickets");
 
     // Verify sorted keys in serialized form (top-level keys are sorted)
@@ -167,11 +190,15 @@ console.log("2) --json emits stable sorted-key JSON with correct aggregates");
     const t1 = data.tickets.find((t) => t.round === "task-001");
     check(t1 && t1.rounds === 2 && t1.builder_attempts === 5, "JSON: task-001 aggregates correctly");
     check(t1 && t1.tokens.cached === 200, "JSON: task-001 cached = 200");
+    check(t1 && t1.cost_usd === 0.05656, "JSON: task-001 cost_usd = 0.05656");
+    check(t1 && Array.isArray(t1.cost_providers) && t1.cost_providers.includes("anthropic") && t1.cost_providers.includes("openai"),
+      "JSON: task-001 cost_providers = [anthropic, openai]");
 
     // task-002
     const t2 = data.tickets.find((t) => t.round === "task-002");
     check(t2 && t2.rounds === 2 && t2.quota_rejected === 3, "JSON: task-002 aggregates correctly");
     check(t2 && t2.tokens.total === 6050, "JSON: task-002 total = 6050");
+    check(t2 && t2.cost_usd === 0.024718, "JSON: task-002 cost_usd = 0.024718");
 
     // Provider+model lists are sorted
     if (t1) {
@@ -273,6 +300,122 @@ console.log("8) --help lists the report subcommand");
   const r = ralph(["--help"]);
   check(r.status === 0, "--help exits 0");
   check(/report\s.*per-ticket/.test(`${r.stdout}`), "--help mentions report subcommand");
+}
+
+// ── 9) Unknown provider yields cost=unknown (issue-57) ────────────────
+// Sections sort alphabetically: task-dlaude, task-known, task-unknown.
+console.log("9) Unknown provider yields cost=unknown, tokens still reported");
+{
+  const target = makeTarget();
+  const lines = [
+    // Known provider (claude→anthropic)
+    {
+      run_id: "run-K",
+      target: target,
+      round: "task-known",
+      timestamp: "2026-01-01T00:00:00Z",
+      agents: {
+        builder: { provider: "claude", requested_model: "sonnet", reported_model: "claude-sonnet-4-20250514", model_match: "mismatch", role: "builder" },
+        reviewer: { provider: "claude", requested_model: "sonnet", reported_model: "claude-sonnet-4-20250514", model_match: "mismatch", role: "reviewer" },
+      },
+      invocations: { builder_attempts: 1, reviewer_attempts: 1, quota_rejected: 0 },
+      tokens: { input: 1000, output: 200, cached: 0, total: 1200 },
+    },
+    // Unknown provider (droid — not in pricing table)
+    {
+      run_id: "run-K",
+      target: target,
+      round: "task-unknown",
+      timestamp: "2026-01-01T01:00:00Z",
+      agents: {
+        builder: { provider: "droid", requested_model: "default", reported_model: "unknown", model_match: "unknown", role: "builder" },
+        reviewer: { provider: "droid", requested_model: "default", reported_model: "unknown", model_match: "unknown", role: "reviewer" },
+      },
+      invocations: { builder_attempts: 1, reviewer_attempts: 1, quota_rejected: 0 },
+      tokens: { input: 500, output: 100, cached: 0, total: 600 },
+    },
+    // Aliased provider (dlaude→deepseek)
+    {
+      run_id: "run-K",
+      target: target,
+      round: "task-dlaude",
+      timestamp: "2026-01-01T02:00:00Z",
+      agents: {
+        builder: { provider: "dlaude", requested_model: "default", reported_model: "unknown", model_match: "unknown", role: "builder" },
+        reviewer: { provider: "dlaude", requested_model: "default", reported_model: "unknown", model_match: "unknown", role: "reviewer" },
+      },
+      invocations: { builder_attempts: 1, reviewer_attempts: 1, quota_rejected: 0 },
+      tokens: { input: 25081, output: 2, cached: 0, total: 25083 },
+    },
+  ];
+  const ledger = path.join(target, ".ralph", "ledger.jsonl");
+  writeFileSync(ledger, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  try {
+    const r = ralph(["report", "--repo", target]);
+    const out = `${r.stdout}`;
+    check(r.status === 0, "unknown-provider report exits 0");
+
+    // Grand cost is "unknown" because task-unknown has an unconfigured provider
+    check(/cost_usd:\s+unknown/.test(out), "grand cost_usd = unknown (mixed known+unknown providers)");
+
+    // task-dlaude: should use deepseek rates (via alias) — comes first alphabetically
+    // 25081/1M*0.27 + 2/1M*1.10 = 0.00677187 + 0.0000022 = 0.00677407 → $0.006774
+    check(/task-dlaude/.test(out), "task-dlaude section present");
+    const dlaudeBlock = out.slice(out.indexOf("task-dlaude"), out.indexOf("task-known"));
+    check(/\$0\.006774/.test(dlaudeBlock),
+      "task-dlaude: cost = $0.006774 (deepseek rates via dlaude alias)");
+    check(/cost providers:.*deepseek/.test(dlaudeBlock), "task-dlaude: cost provider = deepseek (via alias)");
+
+    // task-known: should show a dollar cost (claude→anthropic)
+    // 1000/1M*3.00 + 200/1M*15.00 = 0.003 + 0.003 = $0.006000
+    check(/task-known/.test(out), "task-known section present");
+    const knownBlock = out.slice(out.indexOf("task-known"), out.indexOf("task-unknown"));
+    check(/\$0\.006000/.test(knownBlock),
+      "task-known: cost = $0.006000 (1000*3.00 + 200*15.00)/1M");
+    check(/cost providers:.*anthropic/.test(knownBlock), "task-known: cost provider = anthropic");
+
+    // task-unknown: cost should be "unknown", tokens still reported — comes last alphabetically
+    check(/task-unknown/.test(out), "task-unknown section present");
+    const unknownBlock = out.slice(out.indexOf("task-unknown"));
+    check(/cost_usd:\s+unknown/.test(unknownBlock), "task-unknown: cost_usd = unknown (droid is not in pricing)");
+    check(/input:\s*500\b/.test(unknownBlock), "task-unknown: input tokens still shown (500)");
+    check(/output:\s*100\b/.test(unknownBlock), "task-unknown: output tokens still shown (100)");
+  } finally { rmSync(target, { recursive: true, force: true }); }
+}
+
+// ── 10) JSON output for unknown/mixed providers (issue-57) ────────────
+console.log("10) JSON output: unknown provider → cost_usd = 'unknown' string, known aliases resolved");
+{
+  const target = makeTarget();
+  const lines = [
+    {
+      run_id: "run-X",
+      target: target,
+      round: "task-mix",
+      timestamp: "2026-01-01T00:00:00Z",
+      agents: {
+        builder: { provider: "rlaude", requested_model: "default", reported_model: "unknown", model_match: "unknown", role: "builder" },
+        reviewer: { provider: "rlaude", requested_model: "default", reported_model: "unknown", model_match: "unknown", role: "reviewer" },
+      },
+      invocations: { builder_attempts: 1, reviewer_attempts: 1, quota_rejected: 0 },
+      tokens: { input: 100, output: 50, cached: 0, total: 150 },
+    },
+  ];
+  const ledger = path.join(target, ".ralph", "ledger.jsonl");
+  writeFileSync(ledger, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  try {
+    const r = ralph(["report", "--repo", target, "--json"]);
+    const out = `${r.stdout}`.trim();
+    check(r.status === 0, "JSON unknown-provider report exits 0");
+
+    const data = JSON.parse(out);
+    check(data.cost_usd === "unknown", "JSON: grand cost_usd = 'unknown' (all unknown providers)");
+    const t = data.tickets[0];
+    check(t && t.cost_usd === "unknown", "JSON: ticket cost_usd = 'unknown' string");
+    check(t && t.tokens.input === 100, "JSON: tokens still reported despite unknown cost");
+    check(t && Array.isArray(t.cost_providers) && t.cost_providers.length === 0,
+      "JSON: cost_providers is empty array for unknown providers");
+  } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
 console.log(`\nreport: ${failures ? failures + " failed" : "all passed"}`);

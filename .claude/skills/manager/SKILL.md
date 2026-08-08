@@ -15,7 +15,27 @@ Completed-round usage is recorded at `.ralph/ledger.jsonl`. This is the canonica
 
 Structure of this file: everything down to (and including) "First run in a new repo" is the **portable charter** — it is seeded from the ralph harness template and should stay project-agnostic. Improvements worth generalizing go upstream as a PR against the harness template (`.agents/ralph/target-templates/manager-SKILL.md`); installed copies are expected to drift from the template, and that is deliberate. **Dual-write rule:** when a portable-charter change is a generalizable rule or round step (not a repo-specific tweak), apply the same edit to this template in the *same* change, so newly-initialized repos inherit it by default — a generalizable charter change that lands in only one place is not done. The final "Project facts" section is **non-portable** and is filled in per repo on first run.
 
-Identity: the Manager acts under its own identity (GitHub App / machine account, once provisioned) — distinct from the owner and from the orchestrator/builder. The orchestrator/builder identity must never approve, merge, push to main, or deploy prod, even if a token accidentally permits it (the orchestrator deploys **dev only**); the Manager enforces this at review time. Note that with GitHub Apps the token *does* permit it — `Pull requests: write` is all-or-nothing, granting approve and merge alongside open-and-comment — so this floor is **charter-enforced, not token-enforced**; back it with branch protection where the repo allows. Resolve the per-command identity wrapper in this order: `$RALPH_IDENTITY_WRAPPER` when it names an executable file → executable `.agents/ralph/identity.sh` → the owner's ambient `gh auth`. Invoke the default as `.agents/ralph/identity.sh manager <command…>` (or the override as `"$RALPH_IDENTITY_WRAPPER" manager <command…>`). Treat it as a **soft dependency**: when it is absent, fails, or cannot mint credentials, the Manager works in fallback mode (below). In **Project facts → Identities**, record identity-specific facts and deviations from this default convention, rather than requiring a separate wrapper location.
+Identity: the Manager acts under its own identity (GitHub App / machine account, once provisioned) — distinct from the owner and from the orchestrator/builder. The orchestrator/builder identity must never approve, merge, push to main, or deploy prod, even if a token accidentally permits it (the orchestrator deploys **dev only**); the Manager enforces this at review time. Note that with GitHub Apps the token *does* permit it — `Pull requests: write` is all-or-nothing, granting approve and merge alongside open-and-comment — so this floor is **charter-enforced, not token-enforced**; back it with branch protection where the repo allows.
+
+Resolve the per-command identity wrapper in this order:
+
+1. **ralph.target.json identity marker** (if `identity.enabled=true`) — the declarative
+   repo-level configuration. When present and enabled, resolution stops here — if the
+   wrapper fails, the orchestrator enters **DEGRADED mode** (loud warnings in PRs).
+2. **`$RALPH_IDENTITY_WRAPPER` environment variable** — when set and names an executable file.
+3. **`.agents/ralph/identity.sh`** — the default wrapper in the target repo.
+4. **Owner's ambient `gh auth`** — final fallback.
+
+Invoke the default as `.agents/ralph/identity.sh manager <command…>` (or the override as
+`"$RALPH_IDENTITY_WRAPPER" manager <command…>`). Treat it as a **soft dependency**: when it
+is absent, fails, or cannot mint credentials, the Manager works in fallback mode (below).
+
+**DEGRADED mode**: When the ralph.target.json marker says `identity.enabled=true` but no
+wrapper resolves, the orchestrator flags this loudly in PR bodies and to the Manager.
+Absent the marker, silent fallback to ambient `gh auth` is correct (no degraded warning).
+
+In **Project facts → Identities**, record identity-specific facts and deviations from this
+default convention, rather than requiring a separate wrapper location.
 
 ## Authorities (owner-granted)
 

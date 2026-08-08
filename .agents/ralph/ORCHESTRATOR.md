@@ -43,17 +43,50 @@ You act under the **orchestrator identity** (machine account / GitHub App), dist
 Owner and the Manager.
 
 **Activating it is a soft dependency.** At boot, resolve the identity wrapper in this order:
-`$RALPH_IDENTITY_WRAPPER` when that environment variable names an executable file → the
-executable default `.agents/ralph/identity.sh` → the Owner's ambient `gh auth`. Run every
-GitHub-writing command through the resolved wrapper as
+
+1. **ralph.target.json identity marker** (if `identity.enabled=true`) — the declarative
+   repo-level configuration. Example:
+   ```json
+   {
+     "identity": {
+       "enabled": true,
+       "wrapper": "/path/to/orchestrator/wrapper",
+       "role": "orchestrator"
+     }
+   }
+   ```
+   When the marker is present and `enabled=true`, resolution stops here — if the wrapper
+   fails or doesn't exist, the orchestrator enters **DEGRADED mode** (see below). If the
+   marker is absent or `enabled=false`, resolution continues to the next steps.
+
+2. **`$RALPH_IDENTITY_WRAPPER` environment variable** — when set and names an executable file,
+   use it. If the file doesn't exist or isn't executable, fall through to the next step
+   (no degraded mode without a marker).
+
+3. **`.agents/ralph/identity.sh`** — the default wrapper in the target repo. If it doesn't
+   exist or isn't executable, fall through to the next step (no degraded mode without a marker).
+
+4. **Owner's ambient `gh auth`** — final fallback. The harness continues under the Owner's
+   identity.
+
+Run every GitHub-writing command through the resolved wrapper as
 `.agents/ralph/identity.sh orchestrator <command…>` (or
 `"$RALPH_IDENTITY_WRAPPER" orchestrator <command…>` when the override won) — including
 `ralph integrate --pr`, whose `git push` and `gh pr create` inherit the identity from the
-environment. The harness itself is unchanged and unaware: if either wrapper is absent, is not
-executable, fails, cannot mint a token, or reports fallback, continue in fallback mode under
-the Owner's ambient `gh auth`. **Never treat a missing or failed identity wrapper as a
-blocker** — the loop must run either way. State that fallback mode plainly in every PR body so
-a Manager acting as the same Owner knows to use a review comment instead of formal approval.
+environment.
+
+**DEGRADED mode**: When the ralph.target.json marker says `identity.enabled=true` but no
+wrapper resolves (doesn't exist, not executable, or fails), the orchestrator **MUST** flag
+this loudly:
+
+* In every PR body, state plainly: **"DEGRADED MODE: running under Owner identity instead
+  of orchestrator — identity wrapper failed to resolve."**
+* Surface the degraded state to the Manager via PR comments and labels so it knows approval
+  will be a review comment, not formal approval.
+
+Never treat a missing or failed identity wrapper as a blocker — the loop must run either way.
+**Absent the marker**, silent fallback to ambient `gh auth` is correct (no degraded warning).
+**With the marker**, degraded mode is an error condition that must be visible.
 
 **The floor below is charter-enforced, and mechanically backstopped.** GitHub's
 `Pull requests: write` is all-or-nothing: the same permission that lets you open a PR and
@@ -64,6 +97,10 @@ the obvious slips is the **floor guard** — arm it at boot with
 **no GitHub App required** (it works under plain `gh auth`; Apps + branch protection are a bonus
 layer, not a precondition). The guard is a backstop for drift, **not** a substitute for the
 charter: it cannot catch a prod deploy or a bad judgement call, so the rules below still bind you.
+Because PATH shadowing only intercepts `gh` and `git`, it fundamentally cannot cover writes made
+through MCP servers or app connectors. Ralph therefore composes every Codex builder/reviewer
+`exec` command with `-c 'mcp_servers={}' --disable apps`, removing those connector write paths;
+do not weaken or remove the separate CLI floor guard.
 
 **The FLOOR — the five nevers. Re-read this block at the top of every loop pass** (it is
 deliberately short; re-scanning it each pass is how it survives this 150-line charter falling
@@ -87,11 +124,14 @@ at <where>, go"):
    Also read `.agents/ralph/references/TOKEN_ECONOMICS.md` before choosing backends per
    role or estimating spend: prompt caching works on the claude family and **not** on
    codex (measured), so a retry-heavy run's cost profile depends on that choice.
-   Then **resolve and activate the identity wrapper** in the order defined under "Identity
-   and the hard floor"; record whether it selected the override, the default
-   `.agents/ralph/identity.sh`, or ambient-`gh` fallback. Immediately after that, **arm the
-   floor guard**: `source .agents/ralph/floor-guard.sh` (it mechanically refuses
-   merge/approve/default-push, no App required).
+   Then **resolve and activate the identity wrapper** using the resolution helper:
+   `source .agents/ralph/resolve-identity.sh` and inspect `$IDENTITY_STATUS`:
+   * `resolved` → wrapper found at `$RESOLVED_WRAPPER`, use it
+   * `degraded` → marker present but wrapper failed — flag degraded mode in PRs
+   * `fallback` → no marker, fell back to ambient `gh auth` — silent fallback
+   Record the resolution source (`$IDENTITY_SOURCE`) and wrapper path for debugging.
+   Immediately after that, **arm the floor guard**: `source .agents/ralph/floor-guard.sh`
+   (it mechanically refuses merge/approve/default-push, no App required).
 2. Run `ralph init-target --repo <target>` (installs the Manager + builder skills, task
    scaffolding, and the label protocol into the target). Never overwrite a filled-in charter.
 3. Locate the backlog the Owner named (GitHub Issues by default, or the PRD/task dir).
