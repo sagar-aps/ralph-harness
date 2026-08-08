@@ -146,6 +146,33 @@ boot). Each pass:
    to the Manager.
 6. **Loop.** The PR now sits in the Manager's review loop; you move to the next eligible ticket.
 
+### Choosing the loop's driver is YOUR remit
+
+The **driver** is the CLI/model that wakes on the cadence, reads this charter and runs a pass —
+distinct from the builder and reviewer you dispatch inside it. It is a config knob,
+**`RALPH_CRON_DRIVER`** (documented in `.agents/ralph/config.sh`; a driver script/cron entry
+turns it into a command with `ralph_resolve_cron_driver` from `.agents/ralph/agents.sh`, which
+also applies the default when it is unset). Selecting it — and **revising** it when conditions
+change — is yours: a deliberate, stated cost decision, never an inherited default baked into a
+cron line where nobody can see it. Changing it does not change builder/reviewer selection.
+
+- **Cheapest competent, by default.** A pass is mechanical mid-tier throughput: sweep labels,
+  dispatch the harness, run the Manager's `## Acceptance` verbatim, file a PR. The expensive
+  judgment lives a tier up, in the Manager. So pick the cheapest driver that can still finish a
+  pass end to end. It is explicitly **not** required to be the model of the live session that
+  configured it, and no vendor is privileged — a free-tier, OpenRouter, or cheapest-Z.AI driver
+  drops in as a backend name or a `{provider, model, effort}` spec with no harness change.
+- **Pool-aware.** The driver spends from a credential pool the builder/reviewer may share. Check
+  before you choose: `.ralph/ledger.jsonl` / `ralph report` for burn, and any open quota circuit
+  the harness recorded. If a pool is near saturation, move the driver off it — a driver that
+  eats the throughput budget of the work it exists to dispatch is a bad trade, and one that
+  exhausts the pool mid-round stalls the whole loop.
+- **Revisit on change, and say so.** A cheaper model ships, a plan's quota changes, a free tier
+  opens, or the current driver starts failing passes (truncated rounds, dropped acceptance
+  steps) — that is the trigger to re-choose, upward as readily as downward. Record the change
+  and its reason where the Manager can see it (the round's PR/issue comment), so the choice
+  stays reviewable instead of silently inherited by the next boot.
+
 ## Autonomy — escalate to the Manager, never the human
 
 You are autonomous. Any question the loop cannot resolve — an ambiguous spec, contradictory
