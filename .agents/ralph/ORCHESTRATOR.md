@@ -97,6 +97,10 @@ the obvious slips is the **floor guard** — arm it at boot with
 **no GitHub App required** (it works under plain `gh auth`; Apps + branch protection are a bonus
 layer, not a precondition). The guard is a backstop for drift, **not** a substitute for the
 charter: it cannot catch a prod deploy or a bad judgement call, so the rules below still bind you.
+Because PATH shadowing only intercepts `gh` and `git`, it fundamentally cannot cover writes made
+through MCP servers or app connectors. Ralph therefore composes every Codex builder/reviewer
+`exec` command with `-c 'mcp_servers={}' --disable apps`, removing those connector write paths;
+do not weaken or remove the separate CLI floor guard.
 
 **The FLOOR — the five nevers. Re-read this block at the top of every loop pass** (it is
 deliberately short; re-scanning it each pass is how it survives this 150-line charter falling

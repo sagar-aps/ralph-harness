@@ -31,26 +31,50 @@ function resolve(env) {
     echo "REVIEW=\${AGENT_RALPH_REVIEW_CMD:-<unset>}"
     echo "REVIEW_STRIPPED=$(printf '%s' "\${AGENT_RALPH_REVIEW_CMD:-}" | strip_autoapprove)"
     echo "BUILDER_RESOLVED=$(resolve_backend_cmd "\${BUILDER:-}")"
+    echo "REVIEWER_RESOLVED=$(resolve_backend_cmd "\${REVIEWER:-}")"
+    echo "CODEX=\${AGENT_CODEX_CMD}"
+    echo "CODEX_WRITE=\${AGENT_CODEX_WRITE_CMD}"
+    echo "CODEX_READONLY=\${AGENT_CODEX_READONLY_CMD}"
     echo "CLAUDE=\${AGENT_CLAUDE_CMD}"
     echo "OPENCODE=\${AGENT_OPENCODE_CMD}"
   `;
   const r = spawnSync("bash", ["-c", script], { encoding: "utf-8", env: { ...process.env, ...env } });
   const out = `${r.stdout}${r.stderr}`;
   const get = (k) => (out.match(new RegExp(`^${k}=(.*)$`, "m")) || [])[1] ?? "";
-  return { status: Number(get("STATUS")), BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), BUILDER_RESOLVED: get("BUILDER_RESOLVED"), CLAUDE: get("CLAUDE"), OPENCODE: get("OPENCODE"), raw: out };
+  return { status: Number(get("STATUS")), BUILDER: get("BUILDER"), REVIEWER: get("REVIEWER"), BUILD: get("BUILD"), REVIEW: get("REVIEW"), REVIEW_STRIPPED: get("REVIEW_STRIPPED"), BUILDER_RESOLVED: get("BUILDER_RESOLVED"), REVIEWER_RESOLVED: get("REVIEWER_RESOLVED"), CODEX: get("CODEX"), CODEX_WRITE: get("CODEX_WRITE"), CODEX_READONLY: get("CODEX_READONLY"), CLAUDE: get("CLAUDE"), OPENCODE: get("OPENCODE"), raw: out };
 }
 
 const claudeEnvUnsetPrefix = "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_OPUS_MODEL claude";
+const codexNoConnectors = "-c 'mcp_servers={}' --disable apps";
 
 console.log("1) resolution (no quota): presets and explicit knobs compose the right commands");
 {
   const cheap = resolve({ RALPH_PROFILE: "cheap", BUILDER_PROVIDER: "", REVIEWER_PROVIDER: "", BUILDER_MODEL: "", REVIEWER_MODEL: "", BUILDER_EFFORT: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
   check(cheap.BUILDER === "ralph-build" && cheap.REVIEWER === "ralph-review", "profile points roles at synthetic backends");
-  check(cheap.BUILD === "codex exec --yolo --skip-git-repo-check -c model_reasoning_effort=low -", "cheap builder = codex low, stdin '-'");
-  check(cheap.REVIEW === "codex exec --sandbox read-only -c model_reasoning_effort=low -", "cheap reviewer = codex read-only low");
+  check(cheap.BUILD === `codex exec ${codexNoConnectors} --yolo --skip-git-repo-check -c model_reasoning_effort=low -`, "cheap builder = codex low, stdin '-', with connectors disabled");
+  check(cheap.REVIEW === `codex exec ${codexNoConnectors} --sandbox read-only -c model_reasoning_effort=low -`, "cheap reviewer = codex read-only low with connectors disabled");
 
   const hi = resolve({ BUILDER_PROVIDER: "codex", BUILDER_EFFORT: "high", REVIEWER_PROVIDER: "", REVIEWER_EFFORT: "", RALPH_PROFILE: "", BUILDER_MODEL: "", REVIEWER_MODEL: "", BUILDER: "", REVIEWER: "" });
-  check(hi.BUILD === "codex exec --yolo --skip-git-repo-check -c model_reasoning_effort=high -", "explicit codex/high builder");
+  check(hi.BUILD === `codex exec ${codexNoConnectors} --yolo --skip-git-repo-check -c model_reasoning_effort=high -`, "explicit codex/high builder has connectors disabled");
+  check(hi.CODEX === `codex exec ${codexNoConnectors} --yolo --skip-git-repo-check -`, "legacy codex builder template disables connectors");
+  check(hi.CODEX_WRITE === `codex exec ${codexNoConnectors} --sandbox workspace-write -`, "codex-write builder template disables connectors");
+  check(hi.CODEX_READONLY === `codex exec ${codexNoConnectors} --sandbox read-only -`, "codex-readonly reviewer template disables connectors");
+
+  const aliases = resolve({
+    BUILDER: "cxb", REVIEWER: "cxr", BUILDER_PROVIDER: "", REVIEWER_PROVIDER: "", BUILDER_MODEL: "", REVIEWER_MODEL: "", BUILDER_EFFORT: "", REVIEWER_EFFORT: "", RALPH_PROFILE: "",
+    AGENT_CXB_CMD: "codex exec --yolo --skip-git-repo-check -c model_reasoning_effort=medium -",
+    AGENT_CXR_CMD: "codex exec --sandbox read-only -c model_reasoning_effort=low -",
+  });
+  check(aliases.BUILDER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --yolo --skip-git-repo-check -c model_reasoning_effort=medium -`, "cxb operator alias is hardened without losing its effort flag");
+  check(aliases.REVIEWER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --sandbox read-only -c model_reasoning_effort=low -`, "cxr operator alias is hardened without losing read-only or effort flags");
+
+  const overriddenRoleCommands = resolve({
+    BUILDER: "codex-write", REVIEWER: "codex-readonly", BUILDER_PROVIDER: "", REVIEWER_PROVIDER: "", BUILDER_MODEL: "", REVIEWER_MODEL: "", BUILDER_EFFORT: "", REVIEWER_EFFORT: "", RALPH_PROFILE: "",
+    AGENT_CODEX_WRITE_CMD: "codex exec --sandbox workspace-write -c model_reasoning_effort=medium -",
+    AGENT_CODEX_READONLY_CMD: "codex exec --sandbox read-only -c model_reasoning_effort=low -",
+  });
+  check(overriddenRoleCommands.BUILDER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --sandbox workspace-write -c model_reasoning_effort=medium -`, "overridden codex-write builder command is hardened at resolution");
+  check(overriddenRoleCommands.REVIEWER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --sandbox read-only -c model_reasoning_effort=low -`, "overridden codex-readonly reviewer command is hardened at resolution");
 
   const cl = resolve({ BUILDER_PROVIDER: "claude", BUILDER_MODEL: "sonnet", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
   check(cl.BUILD === `${claudeEnvUnsetPrefix} --model sonnet -p --dangerously-skip-permissions`, "claude builder clears inherited provider env and uses --model + stdin");
@@ -228,7 +252,7 @@ console.log("7) dry run end-to-end: RALPH_PROFILE + --profile resolve through `r
     // `--json` may sit between `exec` and the sandbox flag when usage capture is on
     // (the default — see RALPH_USAGE in batch-loop.sh). The property under test is that
     // the reviewer is composed READ-ONLY, which the optional flag does not affect.
-    check(/reviewer:\s+ralph-review .*->\s+codex exec (?:--json )?--sandbox read-only/.test(out), "reviewer composed read-only from the preset");
+    check(/reviewer:\s+ralph-review .*->\s+codex exec (?:--json )?-c 'mcp_servers=\{\}' --disable apps --sandbox read-only/.test(out), "reviewer composed read-only with connectors disabled from the preset");
   } finally {
     try { rmSync(wt, { recursive: true, force: true }); } catch {}
     rmSync(target, { recursive: true, force: true });
