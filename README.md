@@ -637,9 +637,38 @@ ralph explain --complexity medium [--repo <target>] [--profile <path>] [--json]
 It prints the tier's allowed rungs in order, then per pool: the window caps, whether
 an avoid window is active *now* (compared against the current UTC time), the reserve,
 and any near-weekly-reset relaxation — then the rung it would choose and why.
-Per-pool usage comes from `<target>/.ralph/ledger.jsonl` when a record carries a
-`quota` block (`{pool, window_5h_pct, window_weekly_pct, weekly_reset_at}`); with no
-ledger, or a ledger without such observations, it assumes **0 % used** and says so.
+
+#### Where the per-pool usage numbers come from
+
+`.agents/ralph/usage-state.sh` (and the `usage-state.py` behind it) is the read-only
+reader that feeds `explain`. It is a **local estimate** — it calls no provider usage
+API, it only sums what the harness itself wrote to `<target>/.ralph/ledger.jsonl`:
+
+```bash
+.agents/ralph/usage-state.sh --repo <target> [--profile <path>] [--json]
+```
+
+For every pool the rungs reference it reports, per window (rolling 5 h and the
+current week), a normalized record: `{pool, window, used_tokens, budget_tokens,
+pct, reset_at, in_avoid_window, source}`.
+
+- **pct only with a budget.** Add `window_5h_budget_tokens` /
+  `window_weekly_budget_tokens` to a pool's cap block and the token sums become a
+  percentage. Without one there is no denominator, so `pct` is `unknown` and only
+  the raw token count is reported — a percentage is never invented (the hard
+  quota circuit remains the real backstop).
+- **Reset proximity.** The 5 h reset is when the oldest in-window record ages out.
+  The weekly window (and its reset, and `near_weekly_reset` vs
+  `reserves.near_weekly_reset_hours`) needs `weekly_reset_anchor` — an ISO-8601 UTC
+  instant the week repeats from. Without it the week is a rolling 7 d and the reset
+  is `unknown`.
+- A `quota` block on a ledger record
+  (`{pool, window_5h_pct, window_weekly_pct, weekly_reset_at}`) still wins over the
+  local estimate for that pool. With no ledger, no budget and no quota block,
+  `explain` assumes **0 % used** and says so.
+
+The reader writes nothing: the ledger, the profile and dispatch are untouched, and
+it enforces no cap or reserve.
 
 Validation is **reject-to-safe**: a malformed or invalid profile is rejected with a
 loud warning on stderr and efficiency mode falls back to inert/off — it never crashes

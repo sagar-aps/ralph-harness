@@ -10,6 +10,10 @@ This slice GOVERNS NOTHING. It parses, validates and explains — it never selec
 a backend, never enforces a reserve and never dispatches. Wiring it into
 builder/reviewer selection is a later slice (#54 step 4c).
 
+The per-pool usage numbers `explain` reports come from the read-only reader in
+usage-state.py (#60): ledger token sums per window, turned into a percentage only
+when the profile configures a token budget for that pool + window.
+
 Usage:
   python3 efficiency.py validate [--profile PATH] [--repo DIR] [--json]
   python3 efficiency.py explain --complexity <trivial|small|medium|large>
@@ -30,12 +34,53 @@ import os
 import sys
 
 TIERS = ("trivial", "small", "medium", "large")
-DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-ALL_DAYS_WORDS = ("*", "all", "any", "daily", "everyday")
 
 STATUS_VALID = "valid"
 STATUS_NOT_CONFIGURED = "not_configured"
 STATUS_REJECTED = "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Sibling helpers
+# ---------------------------------------------------------------------------
+def _load_sibling_module(filename, modname):
+    """Import a sibling script by path. Returns None when it cannot be loaded."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    if not os.path.isfile(path):
+        return None
+    try:
+        import importlib.util
+        # Loading a script by path must not leave a __pycache__ behind in the
+        # template dir — that would dirty a target repo working tree.
+        sys.dont_write_bytecode = True
+        spec = importlib.util.spec_from_file_location(modname, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:  # a broken sibling must not take this module down
+        return None
+
+
+# The per-pool usage reader (#60). It owns the clock/window primitives this
+# module delegates to below, so if it is missing every window parse fails and a
+# profile using avoid windows is REJECTED to inert — the safe direction, and
+# main() says so loudly.
+USAGE_STATE = _load_sibling_module("usage-state.py", "ralph_usage_state")
+
+# Optional per-pool cap keys (#60). usage-state.py names them because it is what
+# consumes them; the literal fallbacks keep validation able to name them even when
+# that helper is missing.
+BUDGET_5H_KEY = getattr(USAGE_STATE, "BUDGET_5H_KEY", "window_5h_budget_tokens")
+BUDGET_WEEKLY_KEY = getattr(USAGE_STATE, "BUDGET_WEEKLY_KEY", "window_weekly_budget_tokens")
+WEEKLY_ANCHOR_KEY = getattr(USAGE_STATE, "WEEKLY_ANCHOR_KEY", "weekly_reset_anchor")
+OPTIONAL_CAP_KEYS = (BUDGET_5H_KEY, BUDGET_WEEKLY_KEY, WEEKLY_ANCHOR_KEY)
+
+USAGE_STATE_MISSING = (
+    "⚠⚠ ralph: usage-state.py not found next to efficiency.py — per-pool usage, "
+    "avoid-window evaluation and window budgets are unavailable; efficiency mode "
+    "is OFF (inert).")
 
 
 # ---------------------------------------------------------------------------
@@ -91,59 +136,21 @@ def _nonempty_str(val):
 
 
 def parse_hhmm(val):
-    """Parse "HH:MM" into minutes-since-midnight, or None if malformed."""
-    if not isinstance(val, str):
-        return None
-    parts = val.strip().split(":")
-    if len(parts) != 2:
-        return None
-    try:
-        hour = int(parts[0])
-        minute = int(parts[1])
-    except ValueError:
-        return None
-    if not (0 <= hour <= 24 and 0 <= minute <= 59):
-        return None
-    if hour == 24 and minute != 0:
-        return None
-    return hour * 60 + minute
+    """Parse "HH:MM" into minutes-since-midnight, or None if malformed.
+
+    Implemented in usage-state.py so the reader and the validator agree on what
+    a window means; None (i.e. "malformed") when that helper is unavailable.
+    """
+    return USAGE_STATE.parse_hhmm(val) if USAGE_STATE else None
 
 
 def parse_days(spec):
     """Parse a days spec into a set of weekday indexes (Mon=0), or None.
 
     Accepts "Mon-Fri", "Sat,Sun", "Mon-Wed,Sat", "*"/"all"/"daily".
-    Ranges wrap around the week ("Sat-Mon" = Sat, Sun, Mon).
+    See parse_hhmm for where this lives and why.
     """
-    if not _nonempty_str(spec):
-        return None
-    text = spec.strip().lower()
-    if text in ALL_DAYS_WORDS:
-        return set(range(7))
-    days = set()
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            return None
-        if "-" in part:
-            start_name, _, end_name = part.partition("-")
-            start_name = start_name.strip()[:3]
-            end_name = end_name.strip()[:3]
-            if start_name not in DAY_NAMES or end_name not in DAY_NAMES:
-                return None
-            start = DAY_NAMES.index(start_name)
-            end = DAY_NAMES.index(end_name)
-            idx = start
-            days.add(idx)
-            while idx != end:
-                idx = (idx + 1) % 7
-                days.add(idx)
-        else:
-            name = part[:3]
-            if name not in DAY_NAMES:
-                return None
-            days.add(DAY_NAMES.index(name))
-    return days or None
+    return USAGE_STATE.parse_days(spec) if USAGE_STATE else None
 
 
 def _validate_cap(cap, where, errors):
@@ -151,7 +158,18 @@ def _validate_cap(cap, where, errors):
     if not isinstance(cap, dict):
         errors.append("{}: must be an object".format(where))
         return None
-    keys = set(cap.keys())
+    # #60's optional window budgets / weekly reset anchor may sit on ANY cap
+    # shape: they are what turns raw ledger tokens into a percentage and a reset
+    # time. They never replace the cap shape itself.
+    for field in (BUDGET_5H_KEY, BUDGET_WEEKLY_KEY):
+        if field in cap and not (_is_number(cap[field]) and cap[field] > 0):
+            errors.append("{}.{}: must be a number > 0 (tokens) (got {!r})".format(
+                where, field, cap[field]))
+    if WEEKLY_ANCHOR_KEY in cap and _parse_iso_utc(cap[WEEKLY_ANCHOR_KEY]) is None:
+        errors.append(
+            "{}.{}: must be an ISO-8601 UTC timestamp like \"2026-08-05T09:00:00Z\" "
+            "(got {!r})".format(where, WEEKLY_ANCHOR_KEY, cap[WEEKLY_ANCHOR_KEY]))
+    keys = set(cap.keys()) - set(OPTIONAL_CAP_KEYS)
     if keys == {"source"}:
         if cap.get("source") != "provider":
             errors.append("{}.source: only \"provider\" is supported (got {!r})".format(
@@ -174,7 +192,8 @@ def _validate_cap(cap, where, errors):
     errors.append(
         "{}: unknown cap shape {} — expected "
         "{{window_5h_pct, window_weekly_pct}} or {{source: \"provider\"}} "
-        "or {{backstop: true}}".format(where, sorted(keys)))
+        "or {{backstop: true}}, plus any of the optional {}".format(
+            where, sorted(keys), ", ".join(OPTIONAL_CAP_KEYS)))
     return None
 
 
@@ -309,48 +328,19 @@ def validate_profile(raw):
 # ---------------------------------------------------------------------------
 def _parse_iso_utc(text):
     """Parse an ISO-8601 timestamp into an aware UTC datetime, or None."""
-    if not _nonempty_str(text):
-        return None
-    value = text.strip()
-    if value.endswith("Z") or value.endswith("z"):
-        value = value[:-1] + "+00:00"
-    try:
-        parsed = datetime.datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
+    return USAGE_STATE.parse_iso_utc(text) if USAGE_STATE else None
 
 
 def now_utc():
     """Current UTC time, overridable with RALPH_EFFICIENCY_NOW (tests/ops)."""
-    override = os.environ.get("RALPH_EFFICIENCY_NOW", "")
-    if override.strip():
-        parsed = _parse_iso_utc(override)
-        if parsed is not None:
-            return parsed
-        print("ralph: ignoring unparseable RALPH_EFFICIENCY_NOW={!r}".format(override),
-              file=sys.stderr)
+    if USAGE_STATE:
+        return USAGE_STATE.now_utc()
     return datetime.datetime.now(datetime.timezone.utc)
 
 
 def window_active(win, now):
     """True when `now` (aware UTC) falls inside an avoid window."""
-    start = parse_hhmm(win.get("from"))
-    end = parse_hhmm(win.get("to"))
-    days = parse_days(win.get("days"))
-    if start is None or end is None or days is None or start == end:
-        return False
-    minutes = now.hour * 60 + now.minute
-    weekday = now.weekday()
-    if start < end:
-        return weekday in days and start <= minutes < end
-    # Overnight window: [from, midnight) on a matching day, then [midnight, to)
-    # on the day after a matching day.
-    if weekday in days and minutes >= start:
-        return True
-    return ((weekday - 1) % 7) in days and minutes < end
+    return USAGE_STATE.window_active(win, now) if USAGE_STATE else False
 
 
 # ---------------------------------------------------------------------------
@@ -358,61 +348,63 @@ def window_active(win, now):
 # ---------------------------------------------------------------------------
 def _load_report_module():
     """Import the sibling report.py so we reuse its pricing/aggregation helpers."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.py")
-    if not os.path.isfile(path):
-        return None
-    try:
-        import importlib.util
-        # Loading report.py by path must not leave a __pycache__ behind in the
-        # template dir — that would dirty a target repo working tree.
-        sys.dont_write_bytecode = True
-        spec = importlib.util.spec_from_file_location("ralph_report", path)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    except Exception:  # a broken report.py must not take explain down
-        return None
+    return _load_sibling_module("report.py", "ralph_report")
 
 
-def read_ledger_usage(repo, now):
+def _empty_pool_usage():
+    """One pool's usage slot. `*_source` records where a percentage came from."""
+    return {
+        "window_5h_pct": None,
+        "window_weekly_pct": None,
+        "window_5h_source": None,
+        "window_weekly_source": None,
+        "weekly_reset_at": None,
+        "weekly_reset_source": None,
+        "observed_5h": {"records": 0, "tokens": 0, "cost_usd": 0.0},
+        "observed_weekly": {"records": 0, "tokens": 0, "cost_usd": 0.0},
+        "local_5h": None,
+        "local_weekly": None,
+    }
+
+
+def read_ledger_usage(repo, now, profile=None):
     """Per-pool usage read from <repo>/.ralph/ledger.jsonl.
 
-    Two things come out of the ledger, and they are NOT the same thing:
+    Three things come out of the ledger, and they are NOT the same thing:
 
       * observed spend — records/tokens/cost per pool inside the 5h and weekly
         windows, aggregated exactly like `ralph report` does (same pricing table,
         same provider->pool alias resolution).
+      * LOCAL window percentages (#60) — the per-pool token sums usage-state.py
+        computes for the 5h and weekly windows, divided by the per-pool token
+        budget the profile configures for that window. With no budget there is no
+        denominator, so the percentage stays unknown and only raw tokens are
+        reported. A percentage is never fabricated.
       * quota percentages — only if a record carries a "quota" block
-        {pool, window_5h_pct, window_weekly_pct, weekly_reset_at}. The ledger has
-        no quota denominator of its own, so without such a block the percentage
-        is UNKNOWN and the caller assumes 0% (and says so).
+        {pool, window_5h_pct, window_weekly_pct, weekly_reset_at}. This is the
+        closest thing to a provider-reported number the ledger can hold, so it
+        WINS over the local estimate for the same pool + window.
 
-    Returns {"ledger": path|None, "pools": {pool: {...}}, "notes": [...]}.
+    When no source yields a percentage the caller assumes 0% (and says so).
+
+    Returns {"ledger": path|None, "pools": {pool: {...}}, "state": {...}|None,
+    "notes": [...]}.
     """
     ledger = os.path.join(os.path.abspath(repo), ".ralph", "ledger.jsonl")
-    result = {"ledger": None, "pools": {}, "notes": []}
+    result = {"ledger": None, "pools": {}, "state": None, "notes": []}
     if not os.path.isfile(ledger):
         result["notes"].append(
             "no ledger at {} — assuming 0% used for every pool".format(ledger))
         return result
 
     result["ledger"] = ledger
-    records = []
-    try:
-        with open(ledger, "r", encoding="utf-8") as fh:
-            for raw in fh:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if isinstance(rec, dict):
-                    records.append(rec)
-    except OSError:
+    if USAGE_STATE is None:
+        result["notes"].append(
+            "usage-state.py is unavailable — the ledger cannot be read; "
+            "assuming 0% used for every pool")
+        return result
+    records, status = USAGE_STATE.read_ledger_records(ledger)
+    if status != USAGE_STATE.SOURCE_LEDGER:
         result["notes"].append(
             "ledger {} is not readable — assuming 0% used for every pool".format(ledger))
         return result
@@ -431,13 +423,7 @@ def read_ledger_usage(repo, now):
     week_ago = now - datetime.timedelta(days=7)
 
     def bucket(pool):
-        return result["pools"].setdefault(pool, {
-            "window_5h_pct": None,
-            "window_weekly_pct": None,
-            "weekly_reset_at": None,
-            "observed_5h": {"records": 0, "tokens": 0, "cost_usd": 0.0},
-            "observed_weekly": {"records": 0, "tokens": 0, "cost_usd": 0.0},
-        })
+        return result["pools"].setdefault(pool, _empty_pool_usage())
 
     quota_seen = False
     for rec in records:
@@ -480,17 +466,45 @@ def read_ledger_usage(repo, now):
         for field in ("window_5h_pct", "window_weekly_pct"):
             if _is_pct(quota.get(field)):
                 entry[field] = float(quota[field])
+                entry[field + "_source"] = "quota"
                 quota_seen = True
         if _nonempty_str(quota.get("weekly_reset_at")):
             entry["weekly_reset_at"] = quota["weekly_reset_at"].strip()
+            entry["weekly_reset_source"] = "quota"
             quota_seen = True
 
     for entry in result["pools"].values():
         entry.pop("_observed_at", None)
 
+    # #60: the local, budget-derived view of the same windows. It fills in only
+    # what the quota blocks did NOT provide — a provider-reported percentage
+    # always beats a locally computed one.
+    local_seen = False
+    if profile is not None:
+        state = USAGE_STATE.compute_usage_state(profile, repo, now)
+        result["state"] = state
+        result["notes"].extend(state["notes"])
+        for rec in state["records"]:
+            entry = bucket(rec["pool"])
+            entry["local_{}".format(rec["window"])] = rec
+            field = "window_{}_pct".format(rec["window"])
+            if rec["pct"] != USAGE_STATE.UNKNOWN and entry[field] is None:
+                entry[field] = float(rec["pct"])
+                entry[field + "_source"] = "budget"
+                local_seen = True
+            if (rec["window"] == "weekly" and entry["weekly_reset_at"] is None
+                    and rec["reset_at"] != USAGE_STATE.UNKNOWN
+                    and rec["reset_basis"] == "weekly_anchor"):
+                entry["weekly_reset_at"] = rec["reset_at"]
+                entry["weekly_reset_source"] = "anchor"
+
     if quota_seen:
         result["notes"].append(
             "per-pool quota usage read from the ledger {}".format(ledger))
+    elif local_seen:
+        result["notes"].append(
+            "window usage below is the LOCAL estimate: ledger tokens vs the profile's "
+            "per-pool token budget (no provider usage API was called)")
     else:
         result["notes"].append(
             "ledger {} has observed spend but no quota observations "
@@ -501,15 +515,7 @@ def read_ledger_usage(repo, now):
 
 def _pool_usage(usage, pool):
     entry = usage["pools"].get(pool)
-    if entry is None:
-        return {
-            "window_5h_pct": None,
-            "window_weekly_pct": None,
-            "weekly_reset_at": None,
-            "observed_5h": {"records": 0, "tokens": 0, "cost_usd": 0.0},
-            "observed_weekly": {"records": 0, "tokens": 0, "cost_usd": 0.0},
-        }
-    return entry
+    return _empty_pool_usage() if entry is None else entry
 
 
 def _hours_to_reset(reset_at, now):
@@ -522,6 +528,21 @@ def _hours_to_reset(reset_at, now):
 # ---------------------------------------------------------------------------
 # Explain
 # ---------------------------------------------------------------------------
+def _pct_provenance(pool_usage, field):
+    """Suffix naming where a window percentage came from.
+
+    A quota observation is reported bare (it is the closest thing to a
+    provider-reported number). A locally computed one says so, and an absent one
+    is flagged as the assumption it is.
+    """
+    source = pool_usage.get(field + "_source")
+    if source == "budget":
+        return " (local: ledger tokens vs budget)"
+    if pool_usage.get(field) is None:
+        return " (assumed, no observation)"
+    return ""
+
+
 def evaluate(profile, complexity, usage, now):
     """Evaluate every rung of a tier and pick the first fully eligible one."""
     rungs = {r["name"]: r for r in profile["rungs"]}
@@ -561,7 +582,6 @@ def evaluate(profile, complexity, usage, now):
             pool_usage = _pool_usage(usage, pool)
             used_5h = pool_usage["window_5h_pct"]
             used_weekly = pool_usage["window_weekly_pct"]
-            assumed = " (assumed, no observation)"
             used_5h_val = used_5h if used_5h is not None else 0.0
             used_weekly_val = used_weekly if used_weekly is not None else 0.0
 
@@ -587,8 +607,7 @@ def evaluate(profile, complexity, usage, now):
                     checks.append({
                         "kind": "cap", "pool": pool, "ok": not over,
                         "detail": "pool {}: {} window {:.1f}%{} vs cap {}% — {}".format(
-                            pool, used_label, value,
-                            "" if used is not None else assumed,
+                            pool, used_label, value, _pct_provenance(pool_usage, field),
                             limit, "OVER CAP" if over else "under cap"),
                     })
                     if over:
@@ -620,7 +639,7 @@ def evaluate(profile, complexity, usage, now):
                 else:
                     detail = "pool {}: {:.1f}% of the weekly window left{} vs reserve {}% — {}".format(
                         pool, remaining,
-                        "" if used_weekly is not None else assumed,
+                        _pct_provenance(pool_usage, "window_weekly_pct"),
                         reserve, "BELOW RESERVE" if breached else "above reserve")
                     if hours is None:
                         detail += "; weekly reset time unknown, no relaxation"
@@ -737,10 +756,42 @@ def cmd_validate(loaded, as_json):
 
 def _cap_label(cap):
     if "backstop" in cap:
-        return "backstop"
-    if "source" in cap:
-        return "provider"
-    return "{}%/5h {}%/week".format(cap["window_5h_pct"], cap["window_weekly_pct"])
+        label = "backstop"
+    elif "source" in cap:
+        label = "provider"
+    else:
+        label = "{}%/5h {}%/week".format(cap["window_5h_pct"], cap["window_weekly_pct"])
+    extras = []
+    if BUDGET_5H_KEY in cap:
+        extras.append("{} tok/5h".format(cap[BUDGET_5H_KEY]))
+    if BUDGET_WEEKLY_KEY in cap:
+        extras.append("{} tok/week".format(cap[BUDGET_WEEKLY_KEY]))
+    if WEEKLY_ANCHOR_KEY in cap:
+        extras.append("weekly reset anchored at {}".format(cap[WEEKLY_ANCHOR_KEY]))
+    return "{} budget[{}]".format(label, " ".join(extras)) if extras else label
+
+
+def _local_window_line(record):
+    """One line for a normalized per-pool usage record (#60)."""
+    if record["budget_tokens"] is None:
+        share = "no budget configured -> pct unknown"
+    else:
+        share = "{:.1f}% of the {}-token budget".format(
+            record["pct"], record["budget_tokens"])
+    line = "pool {} {} window: {} token(s) over {} record(s), {}".format(
+        record["pool"], record["window"], record["used_tokens"],
+        record["records"], share)
+    if record["reset_at"] != "unknown":
+        line += "; resets {} ({})".format(record["reset_at"], record["reset_basis"])
+    else:
+        line += "; reset unknown ({})".format(record["reset_basis"])
+    if record["window"] == "weekly":
+        line += "; near_weekly_reset={}".format(
+            USAGE_STATE.shown_flag(record["near_weekly_reset"]) if USAGE_STATE
+            else record["near_weekly_reset"])
+    if record["in_avoid_window"]:
+        line += "; a rung using this pool is inside an avoid window now"
+    return line
 
 
 def cmd_explain(loaded, complexity, repo, as_json):
@@ -766,7 +817,7 @@ def cmd_explain(loaded, complexity, repo, as_json):
         return 0
 
     profile = loaded["profile"]
-    usage = read_ledger_usage(repo, now)
+    usage = read_ledger_usage(repo, now, profile)
     result = evaluate(profile, complexity, usage, now)
 
     if as_json:
@@ -775,7 +826,9 @@ def cmd_explain(loaded, complexity, repo, as_json):
         payload["profile_path"] = loaded["path"]
         payload["now_utc"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         payload["usage"] = {"ledger": usage["ledger"], "notes": usage["notes"],
-                            "pools": usage["pools"]}
+                            "pools": usage["pools"],
+                            # The normalized per-pool records (#60), verbatim.
+                            "state": usage["state"]}
         payload["enforced"] = False
         json.dump(payload, sys.stdout, indent=2, sort_keys=True, default=str)
         sys.stdout.write("\n")
@@ -796,11 +849,16 @@ def cmd_explain(loaded, complexity, repo, as_json):
         for check in rung["checks"]:
             print("     [{}] {}".format("ok" if check["ok"] else "no", check["detail"]))
         for pool in rung["pools"]:
-            observed = _pool_usage(usage, pool)["observed_weekly"]
+            pool_usage = _pool_usage(usage, pool)
+            observed = pool_usage["observed_weekly"]
             if observed["records"]:
                 print("     [--] pool {}: ledger shows {} record(s), {} token(s), "
                       "${:.6f} in the last 7d".format(
                           pool, observed["records"], observed["tokens"], observed["cost_usd"]))
+            for window in ("5h", "weekly"):
+                local = pool_usage.get("local_{}".format(window))
+                if local:
+                    print("     [--] {}".format(_local_window_line(local)))
         print("     => {}".format("ELIGIBLE" if rung["eligible"] else "NOT ELIGIBLE"))
         print("")
     print("CHOSEN: {}".format(result["chosen"] or "none"))
@@ -862,6 +920,13 @@ def main(argv):
             print(USAGE, file=sys.stderr)
             return 2
         i += 1
+
+    if USAGE_STATE is None:
+        # The reader owns the clock/window primitives; without it nothing here can
+        # be evaluated honestly, so fall back to inert exactly like a rejection.
+        print(USAGE_STATE_MISSING, file=sys.stderr)
+        print(INERT_LINE)
+        return 0
 
     path = resolve_profile_path(profile_arg, repo)
     loaded = load_profile(path)

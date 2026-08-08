@@ -49,7 +49,11 @@ Keep this file short. It is always loaded into context.
   `efficiency.json.example` ships the policy). `--efficiency`/`RALPH_EFFICIENCY` only
   boot-validates — an invalid profile is rejected to inert/off, never fatal — and
   `ralph explain --complexity <tier>` reports which rung WOULD be chosen. Selection and
-  dispatch are unchanged; wiring them is a later slice.
+  dispatch are unchanged; wiring them is a later slice. Per-pool usage comes from the
+  read-only reader `usage-state.sh`/`usage-state.py` (#60): 5h + weekly token sums from
+  `.ralph/ledger.jsonl`, converted to a pct ONLY when the profile sets that pool's
+  `window_*_budget_tokens` (else pct=unknown, raw tokens still shown), plus reset
+  proximity and avoid-window-now. Local estimate only — no provider usage API.
 
 ## Token economics (read before reasoning about cost or caching)
 
