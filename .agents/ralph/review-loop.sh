@@ -86,6 +86,11 @@ emit("cfg_e2e", p.get("e2e"))
 emit("cfg_keep_pass", p.get("keepOnPass"))
 emit("cfg_keep_fail", p.get("keepOnFail"))
 emit("cfg_host", p.get("host"))
+# Identity marker (issue-53): declarative identity configuration
+i = d.get("identity", {}) if isinstance(d, dict) else {}
+emit("cfg_identity_enabled", i.get("enabled"))
+emit("cfg_identity_wrapper", i.get("wrapper"))
+emit("cfg_identity_role", i.get("role"))
 PY
 )"
 fi
