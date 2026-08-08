@@ -68,6 +68,14 @@ console.log("1) resolution (no quota): presets and explicit knobs compose the ri
   check(aliases.BUILDER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --yolo --skip-git-repo-check -c model_reasoning_effort=medium -`, "cxb operator alias is hardened without losing its effort flag");
   check(aliases.REVIEWER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --sandbox read-only -c model_reasoning_effort=low -`, "cxr operator alias is hardened without losing read-only or effort flags");
 
+  const overriddenRoleCommands = resolve({
+    BUILDER: "codex-write", REVIEWER: "codex-readonly", BUILDER_PROVIDER: "", REVIEWER_PROVIDER: "", BUILDER_MODEL: "", REVIEWER_MODEL: "", BUILDER_EFFORT: "", REVIEWER_EFFORT: "", RALPH_PROFILE: "",
+    AGENT_CODEX_WRITE_CMD: "codex exec --sandbox workspace-write -c model_reasoning_effort=medium -",
+    AGENT_CODEX_READONLY_CMD: "codex exec --sandbox read-only -c model_reasoning_effort=low -",
+  });
+  check(overriddenRoleCommands.BUILDER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --sandbox workspace-write -c model_reasoning_effort=medium -`, "overridden codex-write builder command is hardened at resolution");
+  check(overriddenRoleCommands.REVIEWER_RESOLVED === `codex exec --disable apps -c 'mcp_servers={}' --sandbox read-only -c model_reasoning_effort=low -`, "overridden codex-readonly reviewer command is hardened at resolution");
+
   const cl = resolve({ BUILDER_PROVIDER: "claude", BUILDER_MODEL: "sonnet", RALPH_PROFILE: "", REVIEWER_PROVIDER: "", BUILDER_EFFORT: "", REVIEWER_MODEL: "", REVIEWER_EFFORT: "", BUILDER: "", REVIEWER: "" });
   check(cl.BUILD === `${claudeEnvUnsetPrefix} --model sonnet -p --dangerously-skip-permissions`, "claude builder clears inherited provider env and uses --model + stdin");
 

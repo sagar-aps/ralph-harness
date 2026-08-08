@@ -94,8 +94,8 @@ ralph_validate_model_selectors() {  # <command label> <command>
   return 1
 }
 
-# cxb/cxr are commonly operator-defined Codex aliases. Harden them at resolution
-# as well, so an older local alias cannot restore MCP/app connector write paths.
+# Harden Codex exec commands at resolution, including operator overrides, so an
+# older local template cannot restore MCP/app connector write paths.
 ralph_codex_disable_connectors() {  # <codex command>
   local cmd="$1"
   [[ "$cmd" == codex\ exec\ * ]] || { printf '%s' "$cmd"; return; }
@@ -118,9 +118,9 @@ resolve_backend_cmd() {
     droid)           cmd="${AGENT_DROID_CMD}" ;;
     opencode)        cmd="${AGENT_OPENCODE_CMD}" ;;
     opencode-z)      cmd="${AGENT_OPENCODE_Z_CMD}" ;;
-    codex|"")        cmd="${AGENT_CODEX_CMD}" ;;
-    codex-write)     cmd="${AGENT_CODEX_WRITE_CMD}" ;;
-    codex-readonly)  cmd="${AGENT_CODEX_READONLY_CMD}" ;;
+    codex|"")        cmd="$(ralph_codex_disable_connectors "${AGENT_CODEX_CMD}")" ;;
+    codex-write)     cmd="$(ralph_codex_disable_connectors "${AGENT_CODEX_WRITE_CMD}")" ;;
+    codex-readonly)  cmd="$(ralph_codex_disable_connectors "${AGENT_CODEX_READONLY_CMD}")" ;;
     cxb)             cmd="$(ralph_codex_disable_connectors "${AGENT_CXB_CMD:-}")" ;;
     cxr)             cmd="$(ralph_codex_disable_connectors "${AGENT_CXR_CMD:-}")" ;;
     *)
