@@ -353,6 +353,59 @@ const budgetAgents = {
   AGENT_BUDGETR_CMD: budgetReviewer,
 };
 
+console.log("8b) durable target ledger appends one enriched usage record per round across runs");
+{
+  const { target } = makeTarget();
+  const plan = twoTaskPlan();
+  const args = [
+    "batch", "--repo", target, "--plan", plan, "--builder", "budgetb", "--reviewer", "budgetr",
+    "--auto-approve-builder",
+  ];
+  const env = { ...budgetAgents, RALPH_WORKTREE_DIR: wtBase(target) };
+  try {
+    const first = ralph(args, env);
+    const ledger = path.join(target, ".ralph", "ledger.jsonl");
+    check(first.status === 0, "first fixture batch exits 0");
+    check(existsSync(ledger), "batch creates the canonical target ledger");
+    const firstBytes = readFileSync(ledger, "utf-8");
+    const firstRecords = firstBytes.trim().split("\n").map(JSON.parse);
+    const perRunRecords = readFileSync(path.join(batchRunDir(target), "round-usage.jsonl"), "utf-8")
+      .trim().split("\n").map(JSON.parse);
+    check(firstRecords.length === 2, "two-task batch appends exactly two ledger lines");
+    check(perRunRecords.length === 2
+      && perRunRecords.every((record) => !("run_id" in record) && !("target" in record)),
+    "the existing per-run artifact remains separate and unenriched");
+    check(firstRecords.every((record) =>
+      /^batch-/.test(record.run_id)
+      && record.target === target
+      && /^task-00[12]$/.test(record.round)
+      && record.agents.builder.provider === "budgetb"
+      && record.agents.reviewer.provider === "budgetr"
+      && record.invocations.builder_attempts === 1
+      && record.invocations.reviewer_attempts === 1
+      && record.invocations.quota_rejected === 0
+      && record.tokens.input === 40
+      && record.tokens.output === 20
+      && record.tokens.cached === 0
+      && record.tokens.total === 60
+      && typeof record.timestamp === "string"
+    ), "ledger records include run, target, agents, invocations, timestamp, and numeric token totals");
+
+    const second = ralph(args, env);
+    const secondBytes = readFileSync(ledger, "utf-8");
+    const allRecords = secondBytes.trim().split("\n").map(JSON.parse);
+    check(second.status === 0, "second fixture batch exits 0");
+    check(secondBytes.startsWith(firstBytes), "second run leaves the first run bytes intact and appends");
+    check(allRecords.length === 4, "second two-task batch grows the ledger from two lines to four");
+    check(allRecords[0].run_id === allRecords[1].run_id
+      && allRecords[2].run_id === allRecords[3].run_id
+      && allRecords[0].run_id !== allRecords[2].run_id,
+    "each batch has one run id and the second batch uses a new run id");
+  } finally {
+    cleanup(target);
+  }
+}
+
 console.log("9) reviewer ERROR (non-zero exit) -> REVIEWER_UNAVAILABLE, no builder attempt consumed");
 {
   const { target, mainHead } = makeTarget();

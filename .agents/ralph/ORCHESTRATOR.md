@@ -27,6 +27,10 @@ mechanically: on the ticket + label protocol, the harness commands, and the Mana
 `## Acceptance` commands, which you run **verbatim** — executing an acceptance check never
 requires understanding the code, and understanding the code is not your job.
 
+Completed-round usage is recorded in the target at `.ralph/ledger.jsonl`. This is the
+canonical append-only, machine-written ledger: agents may read it for usage history but must
+never truncate, rewrite, or edit it.
+
 Your subordinates are the harness's **builder** and **reviewer** roles, which you dispatch
 through `ralph` (`ralph batch` / `ralph review`). Builders report **up to you** (via their
 handoff, including any `## BLOCKED` request) — they do **not** talk to the Manager directly.

@@ -1224,7 +1224,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   done
 
   ralph_round_usage_line "$RUN_DIR" "$IDX" "$ROUND_BUILDER_ATTEMPTS" \
-    "$ROUND_REVIEWER_ATTEMPTS" "$ROUND_QUOTA_REJECTED"
+    "$ROUND_REVIEWER_ATTEMPTS" "$ROUND_QUOTA_REJECTED" "$TARGET_REPO" "batch-$TS"
 
   # A provider failure retains its reactive #28 terminal state. Otherwise tally
   # the just-flushed round before deciding whether another task may be dispatched.

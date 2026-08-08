@@ -3,8 +3,9 @@
 # Token values come only from extract_usage sidecars. A missing sidecar or field
 # makes the corresponding round aggregate unknown rather than a partial estimate.
 
-ralph_round_usage_line() {  # <run-dir> <round> <builder-count> <reviewer-count> <quota-count>
+ralph_round_usage_line() {  # <run-dir> <round> <builder-count> <reviewer-count> <quota-count> <target-repo> <run-id>
   local run_dir="$1" round="$2" builder_count="$3" reviewer_count="$4" quota_count="$5"
+  local target_repo="$6" run_id="$7"
   local timestamp builder_provider reviewer_provider builder_model reviewer_model
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   builder_provider="${BUILDER_PROVIDER:-${BUILDER:-unknown}}"
@@ -14,7 +15,7 @@ ralph_round_usage_line() {  # <run-dir> <round> <builder-count> <reviewer-count>
 
   python3 - "$run_dir" "$round" "$timestamp" \
     "$builder_provider" "$builder_model" "$reviewer_provider" "$reviewer_model" \
-    "$builder_count" "$reviewer_count" "$quota_count" <<'PY'
+    "$builder_count" "$reviewer_count" "$quota_count" "$target_repo" "$run_id" <<'PY'
 import glob
 import json
 import os
@@ -23,7 +24,7 @@ import sys
 
 (run_dir, round_id, timestamp, builder_provider, builder_model,
  reviewer_provider, reviewer_model, builder_count, reviewer_count,
- quota_count) = sys.argv[1:]
+ quota_count, target_repo, run_id) = sys.argv[1:]
 builder_count = int(builder_count)
 reviewer_count = int(reviewer_count)
 quota_count = int(quota_count)
@@ -144,6 +145,14 @@ record = {
 artifact = os.path.join(run_dir, "round-usage.jsonl")
 with open(artifact, "a", encoding="utf-8") as handle:
     handle.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+
+ledger_dir = os.path.join(target_repo, ".ralph")
+os.makedirs(ledger_dir, exist_ok=True)
+ledger_record = dict(record)
+ledger_record["run_id"] = run_id
+ledger_record["target"] = target_repo
+with open(os.path.join(ledger_dir, "ledger.jsonl"), "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(ledger_record, separators=(",", ":"), sort_keys=True) + "\n")
 
 def shown(value):
     return str(value)
