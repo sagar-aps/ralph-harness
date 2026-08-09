@@ -93,7 +93,16 @@ change a flag.
   Per-pool usage comes from the read-only reader `usage-state.sh`/`usage-state.py` (#60): 5h + weekly token sums from
   `.ralph/ledger.jsonl`, converted to a pct ONLY when the profile sets that pool's
   `window_*_budget_tokens` (else pct=unknown, raw tokens still shown), plus reset
-  proximity and avoid-window-now. Local estimate only — no provider usage API.
+  proximity and avoid-window-now. Local estimate only — no provider usage API. A pool
+  whose provider publishes usage as a PERCENTAGE and sells no token budget (Anthropic
+  Pro/Max — the manager's pool) instead declares `{source: "provider_pct",
+  usage_provider: "<script>"}` (#68): the reader RUNS that adapter and takes the
+  `{window_5h_pct, window_weekly_pct, weekly_reset_at}` it prints as the pct, so that
+  pool's cap and reserves bind with no budget; add `window_*_pct` to the same block for a
+  local cap too. A failing/unparseable/slow (>20s, `RALPH_USAGE_PROVIDER_TIMEOUT`) adapter
+  FAILS OPEN (pct=unknown, #28 circuit is the gate) and never crashes. Contract + working
+  implementation:
+  `usage_provider.example.sh`.
 
 ## Token economics (read before reasoning about cost or caching)
 

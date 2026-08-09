@@ -426,5 +426,336 @@ console.log("10) usage-state.sh works sourced and executed");
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
+// ── 11) provider_pct: a pool whose provider publishes only percentages (#68) ─
+//
+// An Anthropic Pro/Max plan sells no token budget, so the ledger path can never
+// give it a percentage and its cap + the manager reserve fail open forever. A cap
+// of {source: "provider_pct", usage_provider: "<script>"} points at an adapter whose
+// printed JSON IS the percentage — used exactly as a budget-derived one is, with no
+// ledger and no budget anywhere in the fixture.
+console.log("11) a provider_pct pool binds its cap and its reserve from the adapter's %");
+{
+  // The manager's 25% weekly reserve sits on the anthropic pool; nothing maps the
+  // cron driver to a fixture pool, so no orchestrator reserve stacks on top.
+  const roleEnv = {
+    RALPH_MANAGER_POOL: "anthropic",
+    RALPH_CRON_DRIVER: "", RALPH_CRON_DRIVER_DEFAULT: "", RALPH_CRON_DRIVER_PROVIDER: "",
+    RALPH_QUOTA_OPEN_CIRCUITS: "",
+  };
+  const RESET = "2026-08-14T09:00:00Z";        // 70h after NOW: no relaxation
+  const NEAR_RESET = "2026-08-14T06:00:00Z";   // 3h before it: inside the relaxation
+  const STUB = "usage_provider_stub.sh";
+
+  const stubPrinting = (payload) =>
+    `#!/usr/bin/env bash\ncat <<'JSON'\n${JSON.stringify(payload)}\nJSON\n`;
+
+  // caps 80%/5h and 90%/week, so the 25% weekly reserve (which bites at 75% used)
+  // is a gate distinct from the weekly cap.
+  const providerCap = (over = {}) => ({
+    source: "provider_pct", usage_provider: STUB,
+    window_5h_pct: 80, window_weekly_pct: 90, ...over,
+  });
+
+  function ppTarget(cap, { stub = null, ledger = null } = {}) {
+    const target = makeTarget({
+      rungs: [
+        {
+          name: "claude",
+          builder: { backend: "claude", pool: "anthropic" },
+          reviewer: { backend: "claude", pool: "anthropic" },
+          caps: { anthropic: cap },
+        },
+        {
+          name: "deepseek",
+          builder: { backend: "dlaude", pool: "deepseek" },
+          reviewer: { backend: "dlaude", pool: "deepseek" },
+          caps: { deepseek: { backstop: true } },
+        },
+      ],
+      reserves: { manager_pct: 25, orchestrator_pct: 50, near_weekly_reset_hours: 5 },
+      tiers: {
+        trivial: ["claude"], small: ["claude"], medium: ["claude"], large: ["claude"],
+      },
+    }, ledger);
+    if (stub !== null) writeFileSync(path.join(target, STUB), stub, { mode: 0o755 });
+    return target;
+  }
+  const ppExplain = (target, env = {}) =>
+    ralph(["explain", "--repo", target, "--complexity", "large"],
+      { RALPH_EFFICIENCY_NOW: NOW, ...roleEnv, ...env });
+
+  // (a) The adapter's numbers land in the normalized records, with no budget and no
+  //     ledger anywhere.
+  {
+    const target = ppTarget(providerCap(), {
+      stub: stubPrinting({ window_5h_pct: 30, window_weekly_pct: 40, weekly_reset_at: RESET }),
+    });
+    try {
+      const state = usageStateJson(target, { RALPH_EFFICIENCY_NOW: NOW, ...roleEnv });
+      const week = recordFor(state, "anthropic", "weekly");
+      const fiveH = recordFor(state, "anthropic", "5h");
+      check(fiveH.pct === 30 && week.pct === 40,
+        "the adapter's window_5h_pct/window_weekly_pct are used verbatim");
+      check(fiveH.pct_source === "provider_pct" && week.pct_source === "provider_pct",
+        "the records name provider_pct as the source of the pct");
+      check(fiveH.budget_tokens === null && week.budget_tokens === null,
+        "no token budget is needed (or configured) for either window");
+      check(week.reset_at === RESET && week.reset_basis === "usage_provider",
+        "the adapter's weekly_reset_at is the weekly reset");
+      check(week.near_weekly_reset === false, "70h from that reset is not 'near'");
+      check(state.notes.some((n) => new RegExp(`pool anthropic: window percentage\\(s\\) reported by the usage provider ${STUB}`).test(n)),
+        "the notes name the adapter each percentage came from");
+      check(!state.notes.some((n) => /no window token budget configured for: .*anthropic/.test(n)),
+        "a provider_pct pool is not reported as missing a token budget");
+
+      const out = `${ppExplain(target).stdout}`;
+      check(/pool anthropic: 5h window 30\.0% \(provider-reported via the pool's usage_provider\) vs cap 80% — under cap/.test(out),
+        "explain caps the adapter's 5h percentage and says where it came from");
+      check(/pool anthropic: 60\.0% of the weekly window left .* vs reserve 25% \(manager 25%.*\) — above reserve/.test(out),
+        "the manager reserve is measured against the adapter's weekly percentage");
+      check(/^CHOSEN: claude$/m.test(out), "under cap and above reserve, the pool is eligible");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // (b) THE POINT OF #68: the anthropic manager reserve now fires.
+  {
+    const target = ppTarget(providerCap(), {
+      stub: stubPrinting({ window_5h_pct: 30, window_weekly_pct: 80, weekly_reset_at: RESET }),
+    });
+    try {
+      const out = `${ppExplain(target).stdout}`;
+      check(/pool anthropic: weekly window 80\.0% .* vs cap 90% — under cap/.test(out),
+        "80% weekly is under the 90% weekly cap");
+      check(/pool anthropic: 20\.0% of the weekly window left .* vs reserve 25% .* — BELOW RESERVE/.test(out),
+        "…but it breaches the manager's 25% weekly reserve, which now BINDS");
+      check(/^CHOSEN: deepseek$/m.test(out),
+        "the reserve makes the provider_pct rung ineligible, falling back to the backstop");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // (c) …and so does the cap itself.
+  {
+    const target = ppTarget(providerCap(), {
+      stub: stubPrinting({ window_5h_pct: 95, window_weekly_pct: 10, weekly_reset_at: RESET }),
+    });
+    try {
+      const out = `${ppExplain(target).stdout}`;
+      check(/pool anthropic: 5h window 95\.0% .* vs cap 80% — OVER CAP/.test(out),
+        "the 5h cap binds on the adapter's percentage");
+      check(/^CHOSEN: deepseek$/m.test(out), "an over-cap provider_pct pool is skipped");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // (d) The adapter's weekly_reset_at drives the near-weekly-reset relaxation.
+  {
+    const target = ppTarget(providerCap(), {
+      stub: stubPrinting({ window_5h_pct: 30, window_weekly_pct: 80, weekly_reset_at: RESET }),
+    });
+    try {
+      const out = `${ppExplain(target, { RALPH_EFFICIENCY_NOW: NEAR_RESET }).stdout}`;
+      check(/reserve 25% RELAXED — weekly quota resets in 3\.0h/.test(out),
+        "3h before the adapter's reset, the weekly reserve is relaxed");
+      check(/^CHOSEN: claude$/m.test(out), "the relaxed rung is eligible again");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // (e) A cap of exactly the shape the issue names — no window percentages — still
+  //     supplies the pct, so the reserve binds while the harness applies no cap.
+  {
+    const target = ppTarget({ source: "provider_pct", usage_provider: STUB }, {
+      stub: stubPrinting({ window_5h_pct: 99, window_weekly_pct: 80, weekly_reset_at: RESET }),
+    });
+    try {
+      const r = ppExplain(target);
+      const out = `${r.stdout}`;
+      check(!/REJECTED/.test(`${r.stderr}`),
+        "{source: provider_pct, usage_provider} on its own is a valid cap shape");
+      check(/pool anthropic: cap source=provider_pct — the provider enforces its own limit, the harness applies none/.test(out),
+        "with no window percentages declared, the harness applies no cap of its own");
+      check(/pool anthropic: 20\.0% of the weekly window left .* — BELOW RESERVE/.test(out),
+        "…while the reserve still binds on the adapter's percentage");
+      check(/^CHOSEN: deepseek$/m.test(out), "so the pool is still held back for the manager");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+}
+
+// ── 12) A broken adapter FAILS OPEN, and the ledger path is still the fallback ─
+console.log("12) a failing usage_provider fails open (never crashes) and falls back");
+{
+  const roleEnv = {
+    RALPH_MANAGER_POOL: "anthropic",
+    RALPH_CRON_DRIVER: "", RALPH_CRON_DRIVER_DEFAULT: "", RALPH_CRON_DRIVER_PROVIDER: "",
+    RALPH_QUOTA_OPEN_CIRCUITS: "",
+  };
+  const STUB = "usage_provider_stub.sh";
+  const anthropicProfile = (cap) => ({
+    rungs: [
+      {
+        name: "claude",
+        builder: { backend: "claude", pool: "anthropic" },
+        reviewer: { backend: "claude", pool: "anthropic" },
+        caps: { anthropic: cap },
+      },
+      {
+        name: "deepseek",
+        builder: { backend: "dlaude", pool: "deepseek" },
+        reviewer: { backend: "dlaude", pool: "deepseek" },
+        caps: { deepseek: { backstop: true } },
+      },
+    ],
+    reserves: { manager_pct: 25, orchestrator_pct: 50, near_weekly_reset_hours: 5 },
+    tiers: { trivial: ["claude"], small: ["claude"], medium: ["claude"], large: ["claude"] },
+  });
+  const cap = { source: "provider_pct", usage_provider: STUB, window_5h_pct: 80, window_weekly_pct: 90 };
+
+  const broken = [
+    ["a non-zero exit", "#!/usr/bin/env bash\necho 'quota page unreachable' >&2\nexit 3\n", /exited 3: quota page unreachable/],
+    ["unparseable output", "#!/usr/bin/env bash\necho 'usage: 80 percent'\n", /printed unparseable output/],
+    ["a percentage outside 0-100", "#!/usr/bin/env bash\necho '{\"window_weekly_pct\": 900}'\n", /reported no usable percentage/],
+    ["no output at all", "#!/usr/bin/env bash\nexit 0\n", /printed unparseable output/],
+  ];
+
+  for (const [label, stub, noteRe] of broken) {
+    const target = makeTarget(anthropicProfile(cap), null);
+    try {
+      writeFileSync(path.join(target, STUB), stub, { mode: 0o755 });
+      const r = ralph(["explain", "--repo", target, "--complexity", "large"],
+        { RALPH_EFFICIENCY_NOW: NOW, ...roleEnv });
+      const out = `${r.stdout}`;
+      check(r.status === 0, `${label}: exits 0 — a broken adapter never crashes the harness`);
+      const state = usageStateJson(target, { RALPH_EFFICIENCY_NOW: NOW, ...roleEnv });
+      check(state.records.filter((x) => x.pool === "anthropic")
+        .every((x) => x.pct === "unknown" && x.pct_source === null),
+        `${label}: pct stays unknown — no percentage is invented`);
+      check(state.notes.some((n) => noteRe.test(n) && /FAILED OPEN/.test(n)),
+        `${label}: the note says it FAILED OPEN and why`);
+      check(/pool anthropic: reserve 25% .* weekly usage unknown, FAIL-OPEN/.test(out),
+        `${label}: the reserve fails open and defers to the #28 circuit`);
+      check(/^CHOSEN: claude$/m.test(out),
+        `${label}: the pool stays eligible (fail-open, never a frozen ladder)`);
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // An adapter that hangs is killed — with anything it spawned, or a grandchild
+  // holding the pipe open would make the "timeout" unbounded — and fails open.
+  {
+    const target = makeTarget(anthropicProfile(cap), null);
+    try {
+      writeFileSync(path.join(target, STUB), "#!/usr/bin/env bash\nsleep 60\n", { mode: 0o755 });
+      const started = Date.now();
+      const state = usageStateJson(target, {
+        RALPH_EFFICIENCY_NOW: NOW, ...roleEnv, RALPH_USAGE_PROVIDER_TIMEOUT: "1",
+      });
+      const elapsed = (Date.now() - started) / 1000;
+      check(state.notes.some((n) => /usage provider .* FAILED OPEN — timed out after 1s/.test(n)),
+        "a hanging adapter is timed out and reported");
+      check(elapsed < 20, `…and the reader returns at the timeout, not later (${elapsed.toFixed(1)}s)`);
+      check(recordFor(state, "anthropic", "weekly").pct === "unknown",
+        "…with no percentage invented");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // A usage_provider path that does not exist: same fail-open, named as such.
+  {
+    const target = makeTarget(anthropicProfile(cap), null);
+    try {
+      const state = usageStateJson(target, { RALPH_EFFICIENCY_NOW: NOW, ...roleEnv });
+      check(state.notes.some((n) => /usage provider .* FAILED OPEN — no such script/.test(n)),
+        "a missing adapter script is reported and fails open");
+      check(recordFor(state, "anthropic", "weekly").pct === "unknown",
+        "…with no percentage invented");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // The ledger/token-budget path is UNCHANGED as the fallback: with the adapter
+  // broken but a budget configured, the pct comes from the ledger again.
+  {
+    const budgeted = { ...cap, window_weekly_budget_tokens: 10000, weekly_reset_anchor: ANCHOR };
+    const ledger = JSON.stringify({
+      run_id: "run-C", round: "task-003", timestamp: "2026-08-10T10:00:00Z",
+      agents: { builder: { provider: "claude" }, reviewer: { provider: "claude" } },
+      tokens: { input: 4000, output: 0, cached: 0, total: 4000 },
+    }) + "\n";
+    const target = makeTarget(anthropicProfile(budgeted), ledger);
+    try {
+      writeFileSync(path.join(target, STUB), "#!/usr/bin/env bash\nexit 1\n", { mode: 0o755 });
+      const week = recordFor(usageStateJson(target, { RALPH_EFFICIENCY_NOW: NOW, ...roleEnv }),
+        "anthropic", "weekly");
+      check(week.pct === 40 && week.pct_source === "budget" && week.budget_tokens === 10000,
+        "with the adapter broken, the ledger vs budget path still yields 40%");
+      check(week.reset_at === "2026-08-12T09:00:00Z" && week.reset_basis === "weekly_anchor",
+        "…and the weekly_reset_anchor still supplies the reset");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+
+  // A provider_pct cap with no usage_provider is malformed -> REJECTED to inert.
+  {
+    const target = makeTarget(anthropicProfile({ source: "provider_pct" }), null);
+    try {
+      const r = ralph(["explain", "--repo", target, "--complexity", "large"],
+        { RALPH_EFFICIENCY_NOW: NOW, ...roleEnv });
+      check(r.status === 0, "a provider_pct cap without usage_provider exits 0");
+      check(/source "provider_pct" requires usage_provider/.test(`${r.stderr}`),
+        "…is REJECTED with a message naming the missing key");
+      check(/efficiency mode: OFF \(inert\)/.test(`${r.stdout}`), "…and falls back to inert");
+    } finally { rmSync(target, { recursive: true, force: true }); }
+  }
+}
+
+// ── 13) The shipped example adapter documents the contract and works ───────
+console.log("13) usage_provider.example.sh ships, documents the contract and works");
+{
+  const examplePath = path.join(templateDir, "usage_provider.example.sh");
+  check(existsSync(examplePath), ".agents/ralph/usage_provider.example.sh ships");
+  const body = readFileSync(examplePath, "utf-8");
+  for (const field of ["window_5h_pct", "window_weekly_pct", "weekly_reset_at"]) {
+    check(body.includes(field), `the example documents ${field}`);
+  }
+  check(/FAIL OPEN|fails open|fail open/i.test(body),
+    "the example documents that a failure FAILS OPEN rather than guessing");
+  const syntax = spawnSync("bash", ["-n", examplePath], { encoding: "utf-8" });
+  check(syntax.status === 0, "the example is valid bash");
+
+  // Used as a real adapter, driven by its documented env override.
+  const target = makeTarget({
+    rungs: [
+      {
+        name: "claude",
+        builder: { backend: "claude", pool: "anthropic" },
+        reviewer: { backend: "claude", pool: "anthropic" },
+        caps: {
+          anthropic: {
+            source: "provider_pct", usage_provider: examplePath,
+            window_5h_pct: 80, window_weekly_pct: 90,
+          },
+        },
+      },
+      {
+        name: "deepseek",
+        builder: { backend: "dlaude", pool: "deepseek" },
+        reviewer: { backend: "dlaude", pool: "deepseek" },
+        caps: { deepseek: { backstop: true } },
+      },
+    ],
+    reserves: { manager_pct: 25, orchestrator_pct: 50, near_weekly_reset_hours: 5 },
+    tiers: { trivial: ["claude"], small: ["claude"], medium: ["claude"], large: ["claude"] },
+  }, null);
+  try {
+    const env = {
+      RALPH_EFFICIENCY_NOW: NOW, RALPH_MANAGER_POOL: "anthropic",
+      RALPH_CRON_DRIVER: "", RALPH_CRON_DRIVER_DEFAULT: "", RALPH_CRON_DRIVER_PROVIDER: "",
+      RALPH_QUOTA_OPEN_CIRCUITS: "",
+      RALPH_USAGE_5H_PCT: "41", RALPH_USAGE_WEEKLY_PCT: "80",
+      RALPH_USAGE_WEEKLY_RESET_AT: "2026-08-14T09:00:00Z",
+    };
+    const week = recordFor(usageStateJson(target, env), "anthropic", "weekly");
+    check(week.pct === 80 && week.pct_source === "provider_pct",
+      "the example adapter reports the percentages the operator gave it");
+    const out = `${ralph(["explain", "--repo", target, "--complexity", "large"], env).stdout}`;
+    check(/pool anthropic: 20\.0% of the weekly window left .* — BELOW RESERVE/.test(out),
+      "…and those percentages bind the manager reserve");
+  } finally { rmSync(target, { recursive: true, force: true }); }
+}
+
 console.log(`\nusage-state: ${failures ? failures + " failed" : "all passed"}`);
 process.exit(failures ? 1 : 0);
