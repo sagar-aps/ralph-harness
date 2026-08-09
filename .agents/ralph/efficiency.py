@@ -28,7 +28,12 @@ Usage:
                                 [--profile PATH] [--repo DIR] [--json]
   python3 efficiency.py select  --complexity <trivial|small|medium|large>
                                 [--profile PATH] [--repo DIR] [--json|--shell]
-                                [--exhausted-pool POOL]...
+                                [--exhausted-pool POOL]... [--after-rung NAME]
+
+--after-rung (#64) turns `select` into an ESCALATION: only rungs above NAME in the
+tier order are considered, so a promotion is always upwards and always bounded.
+When nothing stronger is eligible the status is "exhausted" (exit 5) rather than
+the bounded pause — waiting cannot add a rung to the ladder.
 
 Boot-validation contract: a malformed or invalid profile is REJECTED to a SAFE
 inert state — loud warning on stderr, "efficiency mode: OFF" on stdout, exit 0.
@@ -607,6 +612,10 @@ def _pct_provenance(pool_usage, field):
 SELECT_SELECTED = "selected"
 SELECT_PAUSED = "paused"
 SELECT_INERT = "inert"
+# Escalation only (#64): asked for a rung STRONGER than the one named by
+# --after-rung, there is none left. Distinct from a PAUSE because waiting cannot
+# help — the ladder itself has run out, so the caller must stop for good.
+SELECT_EXHAUSTED = "exhausted"
 
 # The share of the weekly window each control-plane ROLE keeps unspent, enforced by
 # CODE when the profile does not name it. The finalized policy (#54, re-keyed by
@@ -984,19 +993,35 @@ def _pause_signal(evaluated, now):
     }
 
 
-def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None):
+def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None,
+                after_rung=None):
     """Pick the (builder, reviewer) rung for one complexity tier.
 
     Returns {status, rung_name, builder, reviewer, reason, ...}: status is
-    "selected" (rung_name/builder/reviewer are set) or "paused" (they are None and
-    `pause` carries the bounded retry hint). Pure and read-only — it inspects the
-    already-loaded profile plus the usage read by #60 and decides nothing else.
+    "selected" (rung_name/builder/reviewer are set), "paused" (they are None and
+    `pause` carries the bounded retry hint) or, in escalation mode only,
+    "exhausted". Pure and read-only — it inspects the already-loaded profile plus
+    the usage read by #60 and decides nothing else.
 
     `roles` overrides the resolved control-plane role -> pool map (tests/ops); by
     default it is resolved from RALPH_CRON_DRIVER / RALPH_MANAGER_POOL.
+
+    ESCALATION (#64): `after_rung` names the rung that just failed, and restricts
+    the search to the rungs ABOVE it in the tier order — the promotion is strictly
+    upwards, so a run can only ever climb the ladder and the number of promotions
+    is bounded by the tier's length. Eligibility is unchanged (avoid windows, the
+    #28 circuit, caps and reserves all still bind), and the backstop is still the
+    last resort unless it has already been used. When nothing stronger is left the
+    status is "exhausted", NOT "paused": waiting does not grow the ladder.
     """
     rungs = {r["name"]: r for r in profile["rungs"]}
-    order = list(profile["tiers"][complexity])
+    tier_order = list(profile["tiers"][complexity])
+    escalating = after_rung is not None
+    # Everything at or below the failed rung: already tried, or cheaper than what
+    # just failed. Either way it is not a promotion.
+    below = tier_order[:tier_order.index(after_rung) + 1] if (
+        escalating and after_rung in tier_order) else (tier_order if escalating else [])
+    order = tier_order[len(below):] if escalating else tier_order
     reserves = profile.get("reserves", {})
     exhausted = set(exhausted_pools or ())
 
@@ -1016,10 +1041,13 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None)
             chosen = entry
 
     # Nothing in the tier: fall back to the always-on backstop, even when the tier
-    # does not list it.
+    # does not list it. While escalating it is off the table once it has been used
+    # or passed — promoting to the rung that just failed would be a loop.
     backstop_name = backstop_rung_name(profile)
     backstop_used = False
-    if chosen is None and backstop_name:
+    backstop_available = backstop_name is not None and not (
+        escalating and (backstop_name == after_rung or backstop_name in below))
+    if chosen is None and backstop_available:
         entry = None
         for candidate in evaluated:
             if candidate["name"] == backstop_name:
@@ -1041,6 +1069,8 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None)
         "backstop_rung": backstop_name,
         "pause": None,
         "enforced": False,
+        # #64: the rung this selection had to beat (None outside escalation).
+        "after_rung": after_rung,
         # Which role sits on which pool, and the reserve each pool therefore carries.
         "reserves": {
             "roles": roles,
@@ -1051,7 +1081,32 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None)
         },
     }
 
-    if chosen is None:
+    if chosen is None and escalating:
+        # The ladder, not the clock, is what ran out: report a terminal EXHAUSTED so
+        # the caller stops with a status naming the rungs it tried. Bounded by
+        # construction — `order` shrinks with every promotion.
+        if after_rung not in rungs:
+            detail = "it is not a rung in this profile, so nothing can be above it"
+        elif not order and not backstop_available:
+            detail = "there is no rung above it in tier '{}'".format(complexity)
+            if backstop_name is not None:
+                detail += " and the '{}' backstop rung has already been used".format(
+                    backstop_name)
+        else:
+            blocked = "; ".join(
+                "{} ({})".format(entry["name"], _blocking_reasons(entry))
+                for entry in evaluated if not entry["eligible"])
+            detail = ("every stronger rung in tier '{}' is ineligible right now: {}".format(
+                complexity, blocked or "none evaluated"))
+        result.update({
+            "status": SELECT_EXHAUSTED,
+            "rung_name": None,
+            "builder": None,
+            "reviewer": None,
+            "reason": ("cannot promote above rung '{}': {} — the ladder is "
+                       "EXHAUSTED".format(after_rung, detail)),
+        })
+    elif chosen is None:
         pause = _pause_signal(evaluated, now)
         if backstop_name is None:
             unavailable = "the profile configures no backstop rung"
@@ -1070,17 +1125,21 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None)
                            complexity, unavailable, pause["seconds"], pause["until"])),
         })
     else:
+        where = ("above '{}' in tier '{}'".format(after_rung, complexity)
+                 if escalating else "in tier '{}'".format(complexity))
         if backstop_used:
-            reason = ("no rung in tier '{}' is eligible right now — falling back to the "
+            reason = ("no rung {} is eligible right now — falling back to the "
                       "'{}' backstop rung (uncapped last resort)".format(
-                          complexity, chosen["name"]))
+                          where, chosen["name"]))
         else:
             blocked = [e["name"] for e in evaluated[:evaluated.index(chosen)] if not e["eligible"]]
             if blocked:
-                reason = ("first eligible rung in tier '{}' — {} {} skipped (see above)".format(
-                    complexity, ", ".join(blocked), "was" if len(blocked) == 1 else "were"))
+                reason = ("first eligible rung {} — {} {} skipped (see above)".format(
+                    where, ", ".join(blocked), "was" if len(blocked) == 1 else "were"))
+            elif escalating:
+                reason = "next rung {} and every check passed".format(where)
             else:
-                reason = "cheapest rung in tier '{}' and every check passed".format(complexity)
+                reason = "cheapest rung {} and every check passed".format(where)
             if chosen["relaxed"]:
                 reason += (" — its weekly gate(s) only pass because the weekly window "
                            "resets soon (near-weekly-reset relaxation)")
@@ -1320,6 +1379,9 @@ def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
 # ---------------------------------------------------------------------------
 EXIT_PAUSED = 3
 EXIT_INERT = 4
+# #64: --after-rung was asked for a promotion and the ladder has nothing stronger
+# left. Terminal for the caller — unlike a PAUSE, retrying later changes nothing.
+EXIT_EXHAUSTED = 5
 
 SELECT_GOVERNS_NOTHING = (
     "note: this CLI seam only reports the decision — nothing was dispatched here. "
@@ -1348,6 +1410,7 @@ def _select_shell_payload(result, loaded, now):
         ("RALPH_EFFICIENCY_SELECT_REVIEWER_POOL",
          (result.get("reviewer") or {}).get("pool")),
         ("RALPH_EFFICIENCY_SELECT_BACKSTOP", "1" if result.get("backstop") else ""),
+        ("RALPH_EFFICIENCY_SELECT_AFTER_RUNG", result.get("after_rung")),
         ("RALPH_EFFICIENCY_SELECT_PAUSE_SECONDS",
          (result.get("pause") or {}).get("seconds")),
         ("RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL", (result.get("pause") or {}).get("until")),
@@ -1357,7 +1420,7 @@ def _select_shell_payload(result, loaded, now):
     ]
 
 
-def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted):
+def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted, after_rung=None):
     now = now_utc()
 
     if loaded["status"] != STATUS_VALID:
@@ -1390,8 +1453,10 @@ def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted):
         return EXIT_INERT
 
     usage = read_ledger_usage(repo, now, loaded["profile"])
-    result = select_rung(loaded["profile"], complexity, usage, now, exhausted)
-    code = 0 if result["status"] == SELECT_SELECTED else EXIT_PAUSED
+    result = select_rung(loaded["profile"], complexity, usage, now, exhausted,
+                         after_rung=after_rung)
+    code = {SELECT_SELECTED: 0, SELECT_EXHAUSTED: EXIT_EXHAUSTED}.get(
+        result["status"], EXIT_PAUSED)
 
     if as_shell:
         _shell_assignments(_select_shell_payload(result, loaded, now))
@@ -1408,7 +1473,9 @@ def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted):
         sys.stdout.write("\n")
         return code
 
-    print("efficiency select — complexity: {}".format(complexity))
+    print("efficiency select — complexity: {}{}".format(
+        complexity, "" if after_rung is None else
+        " (escalating above rung '{}')".format(after_rung)))
     print("  profile: {} (VALID)".format(loaded["path"]))
     print("  now (UTC): {}".format(now.strftime("%Y-%m-%dT%H:%M:%SZ")))
     for line in _reserve_summary_lines(result["reserves"]):
@@ -1418,6 +1485,8 @@ def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted):
     if result["status"] == SELECT_PAUSED:
         print("PAUSE: bounded — retry in {}s (at {})".format(
             result["pause"]["seconds"], result["pause"]["until"]))
+    elif result["status"] == SELECT_EXHAUSTED:
+        print("EXHAUSTED: no rung stronger than '{}' is available".format(after_rung))
     else:
         print("SELECTED: {}{}".format(
             result["rung_name"], " (backstop)" if result["backstop"] else ""))
@@ -1439,7 +1508,8 @@ USAGE = (
     "[--profile PATH] [--repo DIR] [--json]\n"
     "       efficiency.py select --complexity <{tiers}> "
     "[--profile PATH] [--repo DIR] [--json|--shell]\n"
-    "                            [--exhausted-pool POOL]...".format(tiers="|".join(TIERS))
+    "                            [--exhausted-pool POOL]... [--after-rung NAME]".format(
+        tiers="|".join(TIERS))
 )
 
 
@@ -1461,6 +1531,8 @@ def main(argv):
     # Pools whose #28 circuit the CALLER found open. agents.sh owns that decision
     # (ralph_quota_pool_is_exhausted); this module never re-derives it.
     exhausted = []
+    # #64: the rung a failed run is escalating ABOVE. None = ordinary selection.
+    after_rung = None
     rest = argv[1:]
     i = 0
     while i < len(rest):
@@ -1469,7 +1541,8 @@ def main(argv):
             as_json = True
         elif arg == "--shell":
             as_shell = True
-        elif arg in ("--profile", "--repo", "--complexity", "--exhausted-pool"):
+        elif arg in ("--profile", "--repo", "--complexity", "--exhausted-pool",
+                     "--after-rung"):
             if i + 1 >= len(rest):
                 print("ralph: {} needs a value".format(arg), file=sys.stderr)
                 return 2
@@ -1481,6 +1554,8 @@ def main(argv):
                 repo = value
             elif arg == "--exhausted-pool":
                 exhausted.append(value)
+            elif arg == "--after-rung":
+                after_rung = value
             else:
                 complexity = value
         elif arg.startswith("--profile="):
@@ -1491,6 +1566,8 @@ def main(argv):
             complexity = arg.split("=", 1)[1]
         elif arg.startswith("--exhausted-pool="):
             exhausted.append(arg.split("=", 1)[1])
+        elif arg.startswith("--after-rung="):
+            after_rung = arg.split("=", 1)[1]
         else:
             print("ralph: unknown efficiency option {!r}".format(arg), file=sys.stderr)
             print(USAGE, file=sys.stderr)
@@ -1523,7 +1600,11 @@ def main(argv):
             complexity, ", ".join(TIERS)), file=sys.stderr)
         return 2
     if command == "select":
-        return cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted)
+        return cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted,
+                          after_rung)
+    if after_rung is not None:
+        print("ralph: --after-rung applies to `select` only", file=sys.stderr)
+        return 2
     return cmd_explain(loaded, complexity, repo, as_json, exhausted)
 
 

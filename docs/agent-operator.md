@@ -147,6 +147,21 @@ It ends in one of two states:
 - **`FAILED_MAX_ITERATIONS`** — it could not reach a passing state in the allotted
   iterations. Inspect the artifacts, adjust, and re-run.
 
+With `--auto-escalate` (opt-in, default OFF) there is a third ending. Instead of
+stopping at `FAILED_MAX_ITERATIONS`, a rung that spends its per-rung budget
+(`--escalate-iterations`, default 3) is promoted to the next **stronger eligible**
+rung of the efficiency ladder and retried with a fresh budget, carrying the
+reviewer's must-fix feedback forward:
+
+- **`FAILED_ESCALATION_EXHAUSTED`** — every rung up to the strongest eligible one
+  (or the backstop) was tried and none passed. The banner, `final_status.md` and
+  `last-run.env` name the rungs in the order they were tried; each promotion is
+  also recorded in `<run>/escalations.jsonl` and `<target>/.ralph/ledger.jsonl`.
+
+Escalation needs the `--efficiency` rung ladder (the story must carry a
+`complexity:<tier>`). Without one, `--auto-escalate` is a no-op with a note and the
+run ends at `FAILED_MAX_ITERATIONS` exactly as it does today.
+
 ## Running a batch (many tasks, one shared worktree)
 
 For a backlog of tasks in one unattended run, use `ralph batch`. It creates ONE

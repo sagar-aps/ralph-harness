@@ -29,7 +29,8 @@ Steps:
      human to apply. Re-run only after the contract is green.
 3. When it finishes, read `<target>/.ralph/last-run.env` and the run's
    `final_status.md` and summarize for the human:
-   - outcome (READY_FOR_HUMAN_REVIEW or FAILED_MAX_ITERATIONS)
+   - outcome (READY_FOR_HUMAN_REVIEW, FAILED_MAX_ITERATIONS, or — under
+     `--auto-escalate` — FAILED_ESCALATION_EXHAUSTED)
    - branch, worktree, artifacts dir
    - preview URL if present
    - the most important reviewer findings
@@ -38,6 +39,10 @@ Steps:
    until the human approves.
 5. If FAILED_MAX_ITERATIONS: summarize why it failed and suggest next steps
    (e.g. raise `--max-iterations`, fix the PRD, or run again). Do not integrate.
+6. If FAILED_ESCALATION_EXHAUSTED: the run climbed the efficiency ladder and every
+   rung failed. Report the rungs it tried (`ESCALATION_RUNGS` in `last-run.env`)
+   and the reason it could go no further — a stronger model is not the fix here,
+   so suggest fixing the PRD/task instead. Do not integrate.
 
 Never merge to main. Never bypass the harness to implement the task directly
 unless the user explicitly asks you to.

@@ -69,6 +69,18 @@ Keep this file short. It is always loaded into context.
   sacred** — with the flag unset none of that code runs and dispatch is byte-for-byte
   today's `--builder`/`--reviewer` path (regression-tested). No tier / bad profile =>
   inert + loud warning; PAUSE => clean stop, `EFFICIENCY_PAUSED`, exit 5, artifacts kept.
+  Auto-escalate (#64, **opt-in, DEFAULT OFF**, `ralph review` only): with
+  `--auto-escalate`/`RALPH_AUTO_ESCALATE` each rung gets its own budget
+  (`--escalate-iterations`, default 3) and a rung that spends it without a PASS is
+  PROMOTED to the next stronger ELIGIBLE rung (`ralph_efficiency_escalate_select` ->
+  `efficiency.py select --after-rung`, which only looks ABOVE the failed rung, so the
+  ladder strictly shrinks and the loop is bounded) and retried with a fresh budget and
+  the reviewer feedback carried forward. Exhausting the ladder ends the run on
+  `FAILED_ESCALATION_EXHAUSTED` (exit 2) naming every rung tried; each promotion is
+  recorded in `<run>/escalations.jsonl`, in the ledger as an `event` record (skipped by
+  `ralph report`) and in the banner/`final_status.md`/`last-run.env`. Without the flag a
+  spent budget is byte-for-byte today's `FAILED_MAX_ITERATIONS`; with the flag but no
+  rung ladder it is a no-op plus a note.
   Per-pool usage comes from the read-only reader `usage-state.sh`/`usage-state.py` (#60): 5h + weekly token sums from
   `.ralph/ledger.jsonl`, converted to a pct ONLY when the profile sets that pool's
   `window_*_budget_tokens` (else pct=unknown, raw tokens still shown), plus reset

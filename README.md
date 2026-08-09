@@ -745,6 +745,37 @@ Three ways it steps aside rather than surprising you:
   already completed stay committed with their usage flushed, and `--resume` picks up
   from there; in a review nothing has been created yet, so the target repo is untouched.
 
+#### Climbing the ladder: `--auto-escalate` (default OFF)
+
+`ralph review --efficiency --auto-escalate` (or `RALPH_AUTO_ESCALATE=1`) changes what
+"the iterations ran out" means. Each rung gets its own budget —
+`--escalate-iterations`, default **3** — and a rung that spends it without a `VERDICT:
+PASS` is **promoted** to the next stronger *eligible* rung of the tier ladder and
+retried with a fresh budget. The reviewer's must-fix feedback is carried across the
+promotion, so the stronger builder starts from what the cheaper one learned.
+
+Eligibility is not relaxed to make a promotion possible: the same avoid windows, caps,
+`#28` quota circuits and role reserves that `ralph_efficiency_select` enforces still
+apply, so an ineligible rung is skipped over rather than used.
+
+It is **bounded by construction** — a promotion only ever looks *above* the rung that
+just failed, so the ladder strictly shrinks:
+
+- a PASS at any rung ends the run normally (`READY_FOR_HUMAN_REVIEW`);
+- when the strongest eligible rung (or the deepseek backstop) has been tried and still
+  fails, the run ends on `FAILED_ESCALATION_EXHAUSTED` (exit **2**) naming every rung
+  in the order it was tried: `cheap -> mid -> strong -> backstop (all failed)`.
+
+Each promotion (`from -> to`, reason, the iteration it happened after) is recorded in
+`<run>/escalations.jsonl`, in `<target>/.ralph/ledger.jsonl` as an `event` record — which
+`ralph report` skips, since it is not a usage round — and in the run banner,
+`final_status.md` (the PR/handoff body) and `last-run.env`.
+
+**Default OFF is the contract here too.** Without `--auto-escalate` a spent budget is
+still `FAILED_MAX_ITERATIONS`, byte-for-byte. And with the flag but no rung ladder
+(efficiency off/inert, or a story with no `complexity:<tier>`) there is nothing to climb,
+so it degrades to a **no-op with a note** — `tests/auto-escalate.mjs` pins both.
+
 ## State files (.ralph/)
 
 - `progress.md` — append‑only progress log

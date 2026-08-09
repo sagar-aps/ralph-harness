@@ -133,9 +133,16 @@ EOF
 # the mode on. The loops reach it only through ralph_efficiency_dispatch_select
 # below, which does check the opt-in (#62).
 #
+# A third argument (#64) makes this an ESCALATION: only rungs ABOVE that one in the
+# tier order are considered, and "nothing stronger left" comes back as rc 5
+# (exhausted) instead of a pause. Ordinary selection passes nothing and is unchanged.
+#
+#   5 = escalation exhausted (only reachable with <after-rung>)
+#
 # NEVER exits; a caller under `set -e` must use it in a conditional.
-ralph_efficiency_select() {  # <complexity> [target-repo]
-  local complexity="${1:-}" repo="${2:-$PWD}" script profile pool rc=0 assignments=""
+ralph_efficiency_select() {  # <complexity> [target-repo] [after-rung]
+  local complexity="${1:-}" repo="${2:-$PWD}" after="${3:-}" script profile pool rc=0
+  local assignments="" after_args=""
   local pool_args="" open_pools=""
   RALPH_EFFICIENCY_SELECT_STATUS="inert"
   RALPH_EFFICIENCY_SELECT_COMPLEXITY="$complexity"
@@ -150,6 +157,8 @@ ralph_efficiency_select() {  # <complexity> [target-repo]
   RALPH_EFFICIENCY_SELECT_REASON=""
   RALPH_EFFICIENCY_SELECT_PROFILE=""
   RALPH_EFFICIENCY_SELECT_NOW=""
+  RALPH_EFFICIENCY_SELECT_AFTER_RUNG=""
+  [[ -n "$after" ]] && after_args="--after-rung $after"
 
   if [[ -z "$complexity" ]]; then
     RALPH_EFFICIENCY_SELECT_REASON="ralph_efficiency_select needs a complexity tier"
@@ -174,10 +183,18 @@ $open_pools
 EOF
 
   # --shell prints sourceable KEY=value assignments; a non-zero rc is a STATUS
-  # (paused/inert), not a crash, so capture it rather than letting set -e fire.
-  # shellcheck disable=SC2086
-  assignments="$(python3 "$script" select --complexity "$complexity" --repo "$repo" \
-    --profile "$profile" --shell $pool_args)" || rc=$?
+  # (paused/inert/exhausted), not a crash, so capture it rather than letting set -e
+  # fire. The two calls differ only by --after-rung: passing the rung name through
+  # its own quoted argument keeps a name with a space from being word-split.
+  if [[ -n "$after" ]]; then
+    # shellcheck disable=SC2086
+    assignments="$(python3 "$script" select --complexity "$complexity" --repo "$repo" \
+      --profile "$profile" --shell --after-rung "$after" $pool_args)" || rc=$?
+  else
+    # shellcheck disable=SC2086
+    assignments="$(python3 "$script" select --complexity "$complexity" --repo "$repo" \
+      --profile "$profile" --shell $pool_args)" || rc=$?
+  fi
   if [[ -z "$assignments" ]]; then
     RALPH_EFFICIENCY_SELECT_REASON="could not run $script (exit $rc)"
     echo "⚠⚠ ralph: $RALPH_EFFICIENCY_SELECT_REASON — efficiency mode OFF (inert)." >&2
@@ -190,7 +207,7 @@ EOF
     RALPH_EFFICIENCY_SELECT_REVIEWER_POOL RALPH_EFFICIENCY_SELECT_BACKSTOP \
     RALPH_EFFICIENCY_SELECT_PAUSE_SECONDS RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL \
     RALPH_EFFICIENCY_SELECT_REASON RALPH_EFFICIENCY_SELECT_PROFILE \
-    RALPH_EFFICIENCY_SELECT_NOW
+    RALPH_EFFICIENCY_SELECT_NOW RALPH_EFFICIENCY_SELECT_AFTER_RUNG
   return "$rc"
 }
 
@@ -338,5 +355,131 @@ record = {
 }
 with open(path, "a", encoding="utf-8") as handle:
     handle.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+PY
+}
+
+# --- Auto-escalate (#64) ----------------------------------------------------
+#
+# When a rung burns its whole iteration budget without a PASS, this is the seam
+# that promotes the ticket to the next STRONGER eligible rung and hands the loop a
+# fresh budget. It changes nothing about eligibility: the promotion goes through
+# ralph_efficiency_select, so avoid windows, the #28 circuit, caps and the #63
+# reserves all still bind, and the deepseek backstop is still the last resort.
+#
+# It is BOUNDED by construction: --after-rung only ever looks ABOVE the rung that
+# just failed, so each promotion shortens the remaining ladder and the run can
+# escalate at most (tier length) times before the answer is EXHAUSTED.
+
+# True when the operator opted in via --auto-escalate / RALPH_AUTO_ESCALATE.
+ralph_auto_escalate_enabled() {
+  local flag
+  flag="$(printf '%s' "${RALPH_AUTO_ESCALATE:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$flag" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Promote one ticket off the rung that just failed. Returns:
+#   0 = PROMOTED — the caller MUST rebind BUILDER/REVIEWER from
+#       RALPH_EFFICIENCY_SELECT_BUILDER/_REVIEWER and restart the iteration budget.
+#   4 = INERT    — auto-escalate is off, or there is no rung ladder to climb
+#                  (efficiency off/inert, or the current rung is unknown).
+#   5 = EXHAUSTED — the ladder has nothing stronger left; the caller must stop with
+#       a terminal status naming the rungs it tried. Never a crash, never a retry.
+# Sets RALPH_ESCALATE_STATE (off|inert|promoted|exhausted) plus _FROM / _TO /
+# _REASON for the run record, the ledger and the PR/handoff body.
+# NEVER exits; a caller under `set -e` must use it in a conditional.
+ralph_efficiency_escalate_select() {  # <complexity> <target-repo> <current-rung> [ticket]
+  local complexity="${1:-}" repo="${2:-$PWD}" current="${3:-}" ticket="${4:-ticket}" rc=0
+  RALPH_ESCALATE_STATE="off"
+  RALPH_ESCALATE_FROM="$current"
+  RALPH_ESCALATE_TO=""
+  RALPH_ESCALATE_REASON=""
+  export RALPH_ESCALATE_STATE RALPH_ESCALATE_FROM RALPH_ESCALATE_TO RALPH_ESCALATE_REASON
+
+  ralph_auto_escalate_enabled || return 4
+
+  # No ladder, nothing to climb: without a valid profile, a tier and the rung the
+  # run is standing on there is no next-stronger rung to name, so the caller keeps
+  # today's FAILED_MAX_ITERATIONS behavior.
+  if [[ "${RALPH_EFFICIENCY_STATE:-}" != "valid" || -z "$complexity" || -z "$current" ]]; then
+    RALPH_ESCALATE_STATE="inert"
+    RALPH_ESCALATE_REASON="no efficiency rung ladder for $ticket — nothing to escalate to"
+    return 4
+  fi
+
+  ralph_efficiency_select "$complexity" "$repo" "$current" || rc=$?
+  case "$rc" in
+    0)
+      RALPH_ESCALATE_STATE="promoted"
+      RALPH_ESCALATE_TO="$RALPH_EFFICIENCY_SELECT_RUNG"
+      RALPH_ESCALATE_REASON="$RALPH_EFFICIENCY_SELECT_REASON"
+      return 0
+      ;;
+    5)
+      RALPH_ESCALATE_STATE="exhausted"
+      RALPH_ESCALATE_REASON="$RALPH_EFFICIENCY_SELECT_REASON"
+      return 5
+      ;;
+    3)
+      # Escalation asks for a strictly stronger rung, so efficiency.py answers
+      # EXHAUSTED rather than PAUSED. Defensive: a pause here is still terminal for
+      # the escalation — the run has already spent its budget on this rung.
+      RALPH_ESCALATE_STATE="exhausted"
+      RALPH_ESCALATE_REASON="${RALPH_EFFICIENCY_SELECT_REASON:-no stronger rung is available}"
+      return 5
+      ;;
+    *)
+      RALPH_ESCALATE_STATE="inert"
+      RALPH_ESCALATE_REASON="escalation unusable (${RALPH_EFFICIENCY_SELECT_REASON:-no reason reported})"
+      echo "⚠⚠ ralph: could not escalate $ticket off rung $current — $RALPH_ESCALATE_REASON." >&2
+      return 4
+      ;;
+  esac
+}
+
+# Record ONE escalation, durably, in the two places an operator looks afterwards:
+# <run-dir>/escalations.jsonl (this run) and <target>/.ralph/ledger.jsonl (the
+# cross-run log). The ledger line is an EVENT record — it carries no token totals,
+# so `ralph report` skips it rather than inventing a ticket for it.
+ralph_efficiency_escalation_record() {  # <run-dir> <target-repo> <run-id> <ticket> <from> <to> <reason> <iteration>
+  local run_dir="${1:-}" repo="${2:-}" run_id="${3:-}" ticket="${4:-}"
+  local from="${5:-}" to="${6:-}" reason="${7:-}" iteration="${8:-}"
+  local stamp
+  stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  python3 - "$run_dir" "$repo" "$run_id" "$ticket" "$from" "$to" "$reason" \
+    "$iteration" "$stamp" "${RALPH_EFFICIENCY_DISPATCH_COMPLEXITY:-}" \
+    "${RALPH_EFFICIENCY_SELECT_BUILDER:-}" "${RALPH_EFFICIENCY_SELECT_BUILDER_POOL:-}" \
+    "${RALPH_EFFICIENCY_SELECT_REVIEWER:-}" "${RALPH_EFFICIENCY_SELECT_REVIEWER_POOL:-}" <<'PY'
+import json, os, sys
+(run_dir, repo, run_id, ticket, from_rung, to_rung, reason, iteration, stamp,
+ complexity, builder, builder_pool, reviewer, reviewer_pool) = sys.argv[1:15]
+record = {
+    "event": "efficiency_escalation",
+    "timestamp": stamp,
+    "ticket": ticket,
+    "complexity": complexity,
+    "from_rung": from_rung,
+    "to_rung": to_rung,
+    "reason": reason,
+    "after_iteration": iteration,
+    "builder": builder,
+    "builder_pool": builder_pool,
+    "reviewer": reviewer,
+    "reviewer_pool": reviewer_pool,
+}
+line = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
+if run_dir and os.path.isdir(run_dir):
+    with open(os.path.join(run_dir, "escalations.jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(line)
+if repo and os.path.isdir(repo):
+    ledger_record = dict(record)
+    ledger_record["run_id"] = run_id
+    ledger_record["target"] = repo
+    ledger_dir = os.path.join(repo, ".ralph")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "ledger.jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(ledger_record, separators=(",", ":"), sort_keys=True) + "\n")
 PY
 }

@@ -120,9 +120,17 @@ def main():
                 if not raw:
                     continue
                 try:
-                    lines.append(json.loads(raw))
+                    rec = json.loads(raw)
                 except (ValueError, json.JSONDecodeError):
                     bad += 1
+                    continue
+                # The ledger is an append-only log, and since #64 it also carries
+                # EVENT records (an escalation from one rung to another) that are
+                # not usage rounds: they have no token totals, so counting them
+                # would invent an "unknown" ticket with an unknown cost.
+                if isinstance(rec, dict) and rec.get("event"):
+                    continue
+                lines.append(rec)
     except OSError:
         print("no usage recorded yet")
         sys.exit(0)

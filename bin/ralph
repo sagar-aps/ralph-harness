@@ -65,6 +65,10 @@ const review = {
   efficiency: false,
   efficiencyProfile: null,
   complexity: null,
+  // auto-escalate (#64) — opt-in, DEFAULT OFF. Without it a review run that burns
+  // its iterations still ends at FAILED_MAX_ITERATIONS, exactly as it does today.
+  autoEscalate: false,
+  escalateIterations: null,
 };
 
 function exists(p) {
@@ -473,6 +477,16 @@ Efficiency mode (opt-in, DEFAULT OFF — without --efficiency dispatch is unchan
                                       bounded, clean pause (EFFICIENCY_PAUSED, exit 5).
   --efficiency-profile <path>         Profile path (also RALPH_EFFICIENCY_PROFILE).
                                       On explain, plain --profile means this path too.
+  --auto-escalate                     review: on a spent iteration budget, promote the story to
+                                      the next STRONGER eligible rung and retry with a fresh
+                                      budget, carrying the reviewer's must-fix feedback forward
+                                      (also RALPH_AUTO_ESCALATE=1). Needs the --efficiency rung
+                                      ladder; without one it is a no-op with a note. Bounded: it
+                                      stops at the strongest eligible rung / the backstop and
+                                      then ends on FAILED_ESCALATION_EXHAUSTED naming every rung
+                                      tried. Unset => a spent budget is FAILED_MAX_ITERATIONS.
+  --escalate-iterations <n>           Iterations per rung in auto-escalate mode (default 3, also
+                                      RALPH_ESCALATE_ITERATIONS).
   --complexity <level>                explain: trivial | small | medium | large
   --json                              explain/report: machine-readable output
 
@@ -606,6 +620,7 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     "--reviewer-effort": "reviewerEffort",
     "--complexity": "complexity",
     "--efficiency-profile": "efficiencyProfile",
+    "--escalate-iterations": "escalateIterations",
   };
   let matchedReviewFlag = false;
   for (const [flag, key] of Object.entries(reviewFlags)) {
@@ -688,6 +703,10 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--efficiency") {
     review.efficiency = true;
+    continue;
+  }
+  if (arg === "--auto-escalate") {
+    review.autoEscalate = true;
     continue;
   }
   if (arg === "--resume") {
@@ -839,6 +858,10 @@ async function main() {
     if (review.efficiencyProfile) {
       env.RALPH_EFFICIENCY_PROFILE = path.resolve(cwd, review.efficiencyProfile);
     }
+    // Auto-escalate (#64): opt-in flag only. Unset => a spent iteration budget is
+    // still FAILED_MAX_ITERATIONS, unchanged.
+    if (review.autoEscalate) env.RALPH_AUTO_ESCALATE = "1";
+    if (review.escalateIterations) env.RALPH_ESCALATE_ITERATIONS = review.escalateIterations;
     if (review.builderProvider) env.BUILDER_PROVIDER = review.builderProvider;
     if (review.builderModel) env.BUILDER_MODEL = review.builderModel;
     if (review.builderEffort) env.BUILDER_EFFORT = review.builderEffort;

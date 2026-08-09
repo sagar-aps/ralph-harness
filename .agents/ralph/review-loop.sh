@@ -352,16 +352,38 @@ if [[ "$EFFICIENCY_RC" -eq 3 ]]; then
   echo "  Artifacts preserved: $RUN_DIR (see efficiency-pause.md); nothing was dispatched."
   exit 5
 fi
-if [[ "$EFFICIENCY_RC" -eq 0 ]]; then
-  # The rung OWNS both roles now, so re-derive everything downstream reports from it:
-  # a --builder-provider/--builder-model pin aimed at the old backend would misattribute
-  # this run, and the pool is what the #28 quota circuit keys on.
-  BUILDER="$RALPH_EFFICIENCY_SELECT_BUILDER"
-  REVIEWER="$RALPH_EFFICIENCY_SELECT_REVIEWER"
-  BUILDER_CMD="$(resolve_backend_cmd "$BUILDER")"
-  REVIEWER_CMD="$(resolve_backend_cmd "$REVIEWER")"
-  [[ -n "$BUILDER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown builder backend: $BUILDER"
-  [[ -n "$REVIEWER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown reviewer backend: $REVIEWER"
+# Bind both roles to the rung currently held in RALPH_EFFICIENCY_SELECT_*. The rung
+# OWNS both roles, so everything downstream reports is re-derived from it: a
+# --builder-provider/--builder-model pin aimed at the old backend would misattribute
+# the run, and the pool is what the #28 quota circuit keys on. Returns non-zero with
+# the reason in BIND_ERROR instead of dying, so an ESCALATION (#64) onto an unusable
+# rung ends the run with a status rather than crashing mid-loop.
+BIND_ERROR=""
+bind_efficiency_rung() {
+  local new_builder="$RALPH_EFFICIENCY_SELECT_BUILDER"
+  local new_reviewer="$RALPH_EFFICIENCY_SELECT_REVIEWER"
+  local new_builder_cmd new_reviewer_cmd spec bin
+  BIND_ERROR=""
+  new_builder_cmd="$(resolve_backend_cmd "$new_builder")"
+  new_reviewer_cmd="$(resolve_backend_cmd "$new_reviewer")"
+  if [[ -z "$new_builder_cmd" ]]; then
+    BIND_ERROR="names an unknown builder backend: $new_builder"; return 1
+  fi
+  if [[ -z "$new_reviewer_cmd" ]]; then
+    BIND_ERROR="names an unknown reviewer backend: $new_reviewer"; return 1
+  fi
+  if [[ "$DRY_RUN" != "1" ]]; then
+    for spec in "$new_builder_cmd" "$new_reviewer_cmd"; do
+      bin="${spec%% *}"
+      if ! command -v "$bin" >/dev/null 2>&1; then
+        BIND_ERROR="backend not found on PATH: $bin"; return 1
+      fi
+    done
+  fi
+  BUILDER="$new_builder"
+  REVIEWER="$new_reviewer"
+  BUILDER_CMD="$new_builder_cmd"
+  REVIEWER_CMD="$new_reviewer_cmd"
   BUILDER_PROVIDER=""; REVIEWER_PROVIDER=""; BUILDER_MODEL=""; REVIEWER_MODEL=""
   BUILDER_RESOLVED_PROVIDER="$BUILDER"
   REVIEWER_RESOLVED_PROVIDER="$REVIEWER"
@@ -372,8 +394,12 @@ if [[ "$EFFICIENCY_RC" -eq 0 ]]; then
   RALPH_BUILDER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_BUILDER_POOL"
   RALPH_REVIEWER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_REVIEWER_POOL"
   export RALPH_BUILDER_CREDENTIAL_POOL RALPH_REVIEWER_CREDENTIAL_POOL
-  require_backend "builder ($BUILDER)" "$BUILDER_CMD"
-  require_backend "reviewer ($REVIEWER)" "$REVIEWER_CMD"
+  return 0
+}
+
+if [[ "$EFFICIENCY_RC" -eq 0 ]]; then
+  bind_efficiency_rung \
+    || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG $BIND_ERROR"
   echo "  $(ralph_efficiency_dispatch_summary)"
 fi
 # Empty unless efficiency mode did something, so every consumer below (config
@@ -382,6 +408,38 @@ fi
 EFFICIENCY_SUMMARY=""
 if declare -F ralph_efficiency_dispatch_summary >/dev/null 2>&1; then
   EFFICIENCY_SUMMARY="$(ralph_efficiency_dispatch_summary)"
+fi
+
+# ---- Auto-escalate (#64) — opt-in; OFF leaves FAILED_MAX_ITERATIONS alone ----
+# With --auto-escalate / RALPH_AUTO_ESCALATE the loop stops treating "the budget ran
+# out" as the end of the run: it promotes the story to the next STRONGER eligible
+# rung and retries with a FRESH budget, carrying the reviewer feedback forward. The
+# ladder comes from efficiency mode, so without a rung there is nothing to climb —
+# that degrades to a NO-OP with a note and today's behavior, unchanged.
+#
+# Every one of these stays inert when the flag is unset, so the default run keeps
+# exactly the output, the artifacts and the terminal status it has today.
+AUTO_ESCALATE="false"
+ESCALATE_ITERATIONS="${RALPH_ESCALATE_ITERATIONS:-3}"
+ITERATION_BUDGET="$MAX_ITERATIONS"
+CURRENT_RUNG=""
+RUNGS_TRIED=""
+ESCALATION_COUNT=0
+ESCALATION_REASON=""
+if declare -F ralph_auto_escalate_enabled >/dev/null 2>&1 && ralph_auto_escalate_enabled; then
+  if [[ ! "$ESCALATE_ITERATIONS" =~ ^[0-9]+$ || "$ESCALATE_ITERATIONS" -lt 1 ]]; then
+    echo "⚠⚠ ralph: --escalate-iterations must be a positive integer (got '$ESCALATE_ITERATIONS') — using 3." >&2
+    ESCALATE_ITERATIONS=3
+  fi
+  if [[ "$EFFICIENCY_RC" -eq 0 && -n "${RALPH_EFFICIENCY_SELECT_RUNG:-}" ]]; then
+    AUTO_ESCALATE="true"
+    ITERATION_BUDGET="$ESCALATE_ITERATIONS"
+    CURRENT_RUNG="$RALPH_EFFICIENCY_SELECT_RUNG"
+    RUNGS_TRIED="$CURRENT_RUNG"
+    echo "  auto-escalate: ON — starting on rung $CURRENT_RUNG with $ITERATION_BUDGET iteration(s) per rung; a rung that runs out is promoted to the next stronger eligible rung (bounded by the tier ladder)."
+  else
+    echo "⚠⚠ ralph: --auto-escalate needs the efficiency rung ladder, and this run has no rung (efficiency off, inert, or the story carries no complexity:<tier>) — auto-escalate is a NO-OP here; MAX_ITERATIONS=$MAX_ITERATIONS still ends the run with FAILED_MAX_ITERATIONS." >&2
+  fi
 fi
 
 # ---- Branch / worktree isolation -------------------------------------------
@@ -541,6 +599,12 @@ write_last_run() {
       ralph_env_assignment EFFICIENCY_RUNG "${RALPH_EFFICIENCY_SELECT_RUNG:-}"
       ralph_env_assignment EFFICIENCY_REASON "${RALPH_EFFICIENCY_SELECT_REASON:-}"
     fi
+    if [[ "$AUTO_ESCALATE" == "true" ]]; then
+      ralph_env_assignment ESCALATE_ITERATIONS "$ITERATION_BUDGET"
+      ralph_env_assignment ESCALATION_COUNT "$ESCALATION_COUNT"
+      ralph_env_assignment ESCALATION_RUNGS "$RUNGS_TRIED"
+      ralph_env_assignment ESCALATION_REASON "$ESCALATION_REASON"
+    fi
     ralph_env_assignment PROVIDER_QUOTA_PROVIDER "${RALPH_QUOTA_PROVIDER:-}"
     ralph_env_assignment PROVIDER_QUOTA_CREDENTIAL_POOL "${RALPH_QUOTA_CREDENTIAL_POOL:-}"
     ralph_env_assignment PROVIDER_QUOTA_SCOPE "${RALPH_QUOTA_SCOPE:-}"
@@ -564,7 +628,15 @@ write_final_status() {
     echo "- Builder backend: $BUILDER (provider: $BUILDER_RESOLVED_PROVIDER, model: $BUILDER_RESOLVED_MODEL)"
     echo "- Reviewer backend: $REVIEWER (provider: $REVIEWER_RESOLVED_PROVIDER, model: $REVIEWER_RESOLVED_MODEL)"
     [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "- $EFFICIENCY_SUMMARY"
-    echo "- Iterations run: $iters of $MAX_ITERATIONS"
+    if [[ "$AUTO_ESCALATE" == "true" ]]; then
+      # The escalation trail belongs in the PR/handoff body: it is the record of
+      # which rungs this story cost, in the order they were tried.
+      echo "- Iterations run: $iters ($ITERATION_BUDGET per rung, auto-escalate)"
+      echo "- Rungs tried: $RUNGS_TRIED ($ESCALATION_COUNT escalation(s))"
+      [[ -n "$ESCALATION_REASON" ]] && echo "- Escalation stopped: $ESCALATION_REASON"
+    else
+      echo "- Iterations run: $iters of $MAX_ITERATIONS"
+    fi
     echo "- Check command: $CHECK_CMD"
     echo "- Preview enabled: $PREVIEW_ENABLED"
     if [[ "$PREVIEW_ENABLED" == "true" ]]; then
@@ -600,6 +672,7 @@ write_final_status() {
   echo "REVIEWER_PROVIDER=$REVIEWER_RESOLVED_PROVIDER"
   echo "REVIEWER_MODEL=$REVIEWER_RESOLVED_MODEL"
   [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "EFFICIENCY=$EFFICIENCY_SUMMARY"
+  [[ "$AUTO_ESCALATE" == "true" ]] && echo "AUTO_ESCALATE=$CURRENT_RUNG (budget $ITERATION_BUDGET per rung)"
   echo "MAX_ITERATIONS=$MAX_ITERATIONS"
   echo "CHECK_CMD=$CHECK_CMD"
   echo "USE_WORKTREE=$USE_WORKTREE"
@@ -625,6 +698,7 @@ echo "  Ralph review loop"
 echo "  target=$TARGET_REPO"
 echo "  story=${STORY_ID}: ${STORY_TITLE}"
 echo "  builder=$BUILDER  reviewer=$REVIEWER  max=$MAX_ITERATIONS"
+[[ "$AUTO_ESCALATE" == "true" ]] && echo "  auto-escalate=on  rung=$CURRENT_RUNG  budget=$ITERATION_BUDGET/rung (max is per rung, not per run)"
 echo "  preview=$PREVIEW_ENABLED${RALPH_PREVIEW_URL:+  url=$RALPH_PREVIEW_URL}"
 echo "  artifacts=$RUN_DIR"
 echo "═══════════════════════════════════════════════════════"
@@ -640,10 +714,60 @@ PREVIEW_KEPT="false"
 QUOTA_ROLE=""
 LAST_PREVIEW_UP_LOG=""; LAST_E2E_LOG=""
 
-for i in $(seq 1 "$MAX_ITERATIONS"); do
+i=0
+RUNG_ATTEMPT=0
+while :; do
+  # The iteration budget. Without --auto-escalate ITERATION_BUDGET is MAX_ITERATIONS
+  # and this is exactly the old `for i in $(seq 1 "$MAX_ITERATIONS")`: it stops here
+  # with OUTCOME still FAILED_MAX_ITERATIONS. With it, a spent budget is a PROMOTION
+  # to the next stronger eligible rung plus a fresh budget — and when the ladder has
+  # nothing stronger left, a terminal status naming every rung that was tried.
+  if [[ "$RUNG_ATTEMPT" -ge "$ITERATION_BUDGET" ]]; then
+    [[ "$AUTO_ESCALATE" == "true" ]] || break
+    echo ""
+    echo "Rung $CURRENT_RUNG spent its $ITERATION_BUDGET-iteration budget without a PASS — escalating."
+    ESCALATE_RC=0
+    ralph_efficiency_escalate_select "$STORY_COMPLEXITY" "$TARGET_REPO" \
+      "$CURRENT_RUNG" "story ${STORY_ID:-?}" || ESCALATE_RC=$?
+    if [[ "$ESCALATE_RC" -ne 0 ]]; then
+      OUTCOME="FAILED_ESCALATION_EXHAUSTED"
+      ESCALATION_REASON="$RALPH_ESCALATE_REASON"
+      echo "  no stronger rung is available — $ESCALATION_REASON" >&2
+      break
+    fi
+    if ! bind_efficiency_rung; then
+      # The promotion named a backend this machine cannot run. Stop on the same
+      # terminal status instead of dying mid-run: the work so far is still on the
+      # branch, and the reason says exactly which rung could not be used.
+      OUTCOME="FAILED_ESCALATION_EXHAUSTED"
+      ESCALATION_REASON="rung $RALPH_EFFICIENCY_SELECT_RUNG is unusable here — $BIND_ERROR"
+      echo "  $ESCALATION_REASON" >&2
+      break
+    fi
+    ESCALATION_COUNT=$((ESCALATION_COUNT + 1))
+    RUNGS_TRIED="$RUNGS_TRIED -> $RALPH_ESCALATE_TO"
+    # The rung the run is ON changed, so the line every consumer prints (banner,
+    # final status, last-run.env) has to follow it — otherwise the run would be
+    # reported against a rung it stopped using.
+    EFFICIENCY_SUMMARY="$(ralph_efficiency_dispatch_summary)"
+    ralph_efficiency_escalation_record "$RUN_DIR" "$TARGET_REPO" "$RUN_ID" \
+      "story ${STORY_ID:-?}" "$CURRENT_RUNG" "$RALPH_ESCALATE_TO" \
+      "$RALPH_ESCALATE_REASON" "$i"
+    echo "  escalated: $CURRENT_RUNG -> $RALPH_ESCALATE_TO (builder $BUILDER, reviewer $REVIEWER) — $RALPH_ESCALATE_REASON"
+    echo "  the reviewer's must-fix feedback from $CURRENT_RUNG is carried forward to the new builder."
+    CURRENT_RUNG="$RALPH_ESCALATE_TO"
+    RUNG_ATTEMPT=0
+    continue
+  fi
+  RUNG_ATTEMPT=$((RUNG_ATTEMPT + 1))
+  i=$((i + 1))
   ITERS_RUN="$i"
   echo ""
-  echo "── Iteration $i of $MAX_ITERATIONS ──────────────────────"
+  if [[ "$AUTO_ESCALATE" == "true" ]]; then
+    echo "── Iteration $i (rung $CURRENT_RUNG, attempt $RUNG_ATTEMPT of $ITERATION_BUDGET) ──"
+  else
+    echo "── Iteration $i of $MAX_ITERATIONS ──────────────────────"
+  fi
 
   HANDOFF_PATH="$WORKDIR/.agent-handoff.md"
   BUILDER_PROMPT_R="$RUN_DIR/builder_prompt_$i.md"
@@ -805,10 +929,14 @@ if [[ "$OUTCOME" == "READY_FOR_HUMAN_REVIEW" ]]; then
   echo "  ✅ READY_FOR_HUMAN_REVIEW (after $ITERS_RUN iteration(s))"
   echo "  Agents: builder=$BUILDER (provider=$BUILDER_RESOLVED_PROVIDER, model=$BUILDER_RESOLVED_MODEL); reviewer=$REVIEWER (provider=$REVIEWER_RESOLVED_PROVIDER, model=$REVIEWER_RESOLVED_MODEL)"
   [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "  $EFFICIENCY_SUMMARY"
+  [[ "$ESCALATION_COUNT" -gt 0 ]] && echo "  Rungs tried: $RUNGS_TRIED ($ESCALATION_COUNT escalation(s))"
 elif [[ "$OUTCOME" == "BUILDER_UNAVAILABLE" ]]; then
   echo "  ❌ BUILDER_UNAVAILABLE — builder backend '$BUILDER' failed (exit ${BUILDER_RC:-?}); halted after $ITERS_RUN iteration(s)."
 elif [[ "$OUTCOME" == "PROVIDER_QUOTA_EXHAUSTED" ]]; then
   echo "  ⏸ PROVIDER_QUOTA_EXHAUSTED — $QUOTA_ROLE provider '$RALPH_QUOTA_PROVIDER' paused${RALPH_QUOTA_RESET_AT:+ until $RALPH_QUOTA_RESET_AT}."
+elif [[ "$OUTCOME" == "FAILED_ESCALATION_EXHAUSTED" ]]; then
+  echo "  ❌ FAILED_ESCALATION_EXHAUSTED — rungs tried: $RUNGS_TRIED (all failed) after $ITERS_RUN iteration(s)."
+  echo "  $ESCALATION_REASON"
 else
   echo "  ❌ $OUTCOME (after $ITERS_RUN iteration(s))"
 fi
