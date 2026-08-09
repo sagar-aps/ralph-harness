@@ -154,31 +154,35 @@ PY
   export IDENTITY_MARKER_ROLE="$marker_role"
 }
 
-# Run resolution if not sourced
-if [[ "${RALPH_TEST_IDENTITY_RESOLVE:-}" != "1" && "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+  # Executed directly (not sourced): print a summary and set an exit code, unless
+  # a caller is driving resolve_identity via the test harness (RALPH_TEST_IDENTITY_RESOLVE=1).
+  if [[ "${RALPH_TEST_IDENTITY_RESOLVE:-}" != "1" ]]; then
+    resolve_identity
+    case "$IDENTITY_STATUS" in
+      resolved)
+        echo "$RESOLVED_WRAPPER"
+        exit 0
+        ;;
+      degraded)
+        echo "DEGRADED"
+        exit 0
+        ;;
+      fallback)
+        echo "FALLBACK"
+        exit 0
+        ;;
+      *)
+        echo "ERROR: unexpected status $IDENTITY_STATUS" >&2
+        exit 1
+        ;;
+    esac
+  else
+    resolve_identity
+  fi
+else
+  # Sourced: this is the documented usage (`source .agents/ralph/resolve-identity.sh`
+  # then read $IDENTITY_STATUS etc.) — resolve unconditionally so the caller's shell
+  # actually gets populated vars instead of silently inheriting nothing.
   resolve_identity
-  case "$IDENTITY_STATUS" in
-    resolved)
-      echo "$RESOLVED_WRAPPER"
-      exit 0
-      ;;
-    degraded)
-      echo "DEGRADED"
-      exit 0
-      ;;
-    fallback)
-      echo "FALLBACK"
-      exit 0
-      ;;
-    *)
-      echo "ERROR: unexpected status $IDENTITY_STATUS" >&2
-      exit 1
-      ;;
-  esac
-fi
-
-# In test mode, just run resolution and export vars (for testing)
-if [[ "${RALPH_TEST_IDENTITY_RESOLVE:-}" == "1" ]]; then
-  resolve_identity
-  # Results are in exported vars
 fi
