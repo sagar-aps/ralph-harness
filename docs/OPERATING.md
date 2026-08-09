@@ -175,6 +175,96 @@ still wins over it. Set `RALPH_NO_LOCAL_CONFIG=1` to skip sourcing it (the test 
   a loud warning; `RALPH_DEFAULT_BRANCH` overrides the autodetected protected branch
   (falls back to `main`). PATH-scoped to that shell, so builders/reviewers are unaffected.
 
+### 4.1 Setting up the unattended loop (and the four pitfalls)
+
+`RALPH_CRON_DRIVER` says *which* agent wakes up; it does not schedule anything. The wiring
+around it — the wrapper script the scheduler runs, and the scheduler unit itself — is yours.
+**Do not hand-write it.** Two templates ship, both `.example` so you copy and fill them in
+(nothing machine-specific is committed):
+
+| Template | Copy to | What it is |
+|---|---|---|
+| `.agents/ralph/target-templates/unattended-loop.sh.example` | `<target>/scripts/unattended-loop.sh` (`chmod +x`) | the wrapper: resolves the driver, feeds it one pass |
+| `.agents/ralph/target-templates/unattended-loop.plist.example` | `~/Library/LaunchAgents/com.<you>.ralph-loop.plist` | the launchd unit (macOS) |
+
+Install and smoke-test in this order — run the wrapper **by hand** once before you hand it to
+a scheduler, because a scheduler failure looks like nothing happening at all:
+
+```sh
+cp .agents/ralph/target-templates/unattended-loop.sh.example <target>/scripts/unattended-loop.sh
+chmod +x <target>/scripts/unattended-loop.sh
+$EDITOR <target>/scripts/unattended-loop.sh          # fill the CONFIGURE block
+<target>/scripts/unattended-loop.sh                  # one pass, in your own terminal
+tail -f <target>/.ralph/loop-logs/loop-*.log         # what the scheduler will see
+```
+
+The wrapper exists because four traps come up every single time someone writes their own. Each
+is a real failure mode with a real fix, and the template already applies all four:
+
+1. **The inline-quoted prompt.** A pass prompt pasted into the wrapper as a quoted string dies
+   on the first apostrophe, `$` or backtick in it — usually *silently*, with the driver running
+   a truncated instruction (this is the same class of bug as #21, which `tests/shell-syntax.mjs`
+   was added for). **Fix:** the prompt lives in a **file** and is passed by *path* or on
+   *stdin*, never interpolated as text. The template does exactly what
+   `review-loop.sh:run_backend` does: substitute a `printf '%q'`-quoted path for `{prompt}` if
+   the backend takes one, else `eval "$cmd" < "$prompt_file"`. Prompt content is then inert.
+2. **Silent stderr.** Under launchd there is no terminal and no default log destination: a job
+   that fails before its own logging is up (empty `PATH`, missing `node`, a typo) leaves
+   *nothing at all*, and the loop just stops happening. **Fix:** the plist sets both
+   `StandardOutPath` **and** `StandardErrorPath` (create the directory yourself — launchd will
+   not, and a missing directory makes the job fail to spawn), and the wrapper additionally
+   `exec`s its own output to `<target>/.ralph/loop-logs/loop-<date>.log` and propagates the
+   driver's exit code instead of swallowing it.
+3. **Two identity paths.** `bin/ralph` prefers `$PWD/.agents/ralph` over the harness install
+   (`bin/ralph:1675`), so *cwd decides* which `config.local.sh` its loops read — while your
+   wrapper resolved the driver from a possibly different one. Worse, `config.local.sh` uses
+   `: "${VAR:=value}"`, which **sets but does not export**: the values are visible to the
+   wrapper and invisible to the `ralph` child process, so `ralph integrate --pr` cannot resolve
+   the identity wrapper (§12) and the PR is filed by whatever ambient `gh` account exists.
+   **Fix:** the wrapper `cd`s into the target *first*, sources **both** `config.local.sh` files
+   (harness, then target — target wins) inside `set -a` so everything is exported, then sources
+   `resolve-identity.sh` and exports `RALPH_IDENTITY_WRAPPER` once. Driver launch and ralph's
+   own identity path then agree by construction.
+4. **Plan artifacts in the repo root.** A PRD/story JSON written next to `package.json` makes
+   the tree dirty, and `ralph review`/`ralph batch` refuse a dirty target (`--allow-dirty`
+   aside) while `integrate` refuses to merge one. **Fix:** everything the loop generates is
+   staged under `<target>/.ralph/` — already gitignored by `ralph init-target`
+   (`bin/ralph:1156`) and explicitly filtered out of ralph's own dirty-check. The wrapper
+   creates `.ralph/plans/` and exports `RALPH_LOOP_PLAN_DIR`, and its pass prompt tells the
+   driver to write plans there and pass them in with `ralph review --prd "$RALPH_LOOP_PLAN_DIR/…"`.
+   (`RALPH_LOOP_PLAN_DIR` is the template's contract with its own prompt file; `bin/ralph` does
+   not read it.) It also pins `RALPH_WORKTREE_DIR` under `.ralph/` so run worktrees cannot land
+   in the tree either.
+
+**Not on macOS?** The plist is the only macOS-specific piece; the wrapper is portable and takes
+all its input from the environment. Use whichever scheduler you have, and keep pitfall 2 in
+mind — both must capture *both* streams:
+
+```sh
+# cron — hourly. Redirect explicitly; cron mails output by default, which on most boxes
+# means it is dropped. Cron gives you a near-empty PATH, so the wrapper sets its own.
+0 * * * * TARGET_REPO=/path/to/target RALPH_HOME=/path/to/ralph-harness \
+  /path/to/target/scripts/unattended-loop.sh >> /var/log/ralph-loop.log 2>&1
+```
+
+```ini
+# systemd --user: ralph-loop.service + ralph-loop.timer in ~/.config/systemd/user/.
+# journald captures both streams (journalctl --user -u ralph-loop), so this pitfall is
+# handled for you; Environment= replaces the plist's EnvironmentVariables dict.
+[Service]
+Type=oneshot
+Environment=TARGET_REPO=/path/to/target
+Environment=RALPH_HOME=/path/to/ralph-harness
+ExecStart=/path/to/target/scripts/unattended-loop.sh
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+```
+
+The wrapper takes a `mkdir`-based lock in `.ralph/loop.lock`, so a cadence shorter than one
+pass skips rather than stacking two drivers on the same worktree — on any scheduler.
+
 ---
 
 ## 5. Efficiency mode — `--efficiency` + `efficiency.json`

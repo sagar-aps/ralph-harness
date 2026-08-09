@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# unattended-loop.sh — TEMPLATE for the recurring orchestrator pass (#69).
+#
+#   cp .agents/ralph/target-templates/unattended-loop.sh.example \
+#      /path/to/your/target/repo/scripts/unattended-loop.sh
+#   chmod +x /path/to/your/target/repo/scripts/unattended-loop.sh
+#   # then fill in the CONFIGURE block below and dry-run it once by hand.
+#
+# WHAT THIS IS. The cadence (launchd / cron / systemd timer) wakes THIS script; this
+# script resolves the DRIVER (RALPH_CRON_DRIVER, §4 of docs/OPERATING.md) and feeds it
+# one pass prompt. The driver reads ORCHESTRATOR.md, dispatches `ralph review`/`ralph
+# batch`, and files a PR. Nothing here picks the builder or the reviewer — those stay
+# with the driver and its own config.
+#
+# WHY A TEMPLATE. Hand-written wrappers keep hitting the same four traps. This file
+# bakes in the fix for each; docs/OPERATING.md §4.1 explains them in prose.
+#
+#   1. INLINE-QUOTED PROMPT. A pass prompt pasted into the script as "...an operator's
+#      note..." breaks on the first apostrophe (or backtick, or $), usually silently —
+#      the shell eats the rest of the line and the driver runs a truncated instruction.
+#      FIX: the prompt is ALWAYS read from a FILE and piped on stdin. This script never
+#      builds a prompt string.
+#   2. SILENT FAILURES. Under a scheduler there is no terminal. FIX: every run appends
+#      to $LOG_FILE, and the plist template sets StandardOutPath + StandardErrorPath so
+#      even a crash before the first log line is captured.
+#   3. TWO IDENTITY PATHS. `ralph` picks its templates from $PWD/.agents/ralph when that
+#      exists, else from the harness install — so the driver launch and ralph's own
+#      identity/backends can resolve from DIFFERENT config.local.sh files. FIX: cd into
+#      the target FIRST, source BOTH config.local.sh files under `set -a` (so the values
+#      are exported, not just set), and resolve + export RALPH_IDENTITY_WRAPPER once so
+#      `ralph integrate --pr` and the driver agree on who is filing the PR.
+#   4. PLAN ARTIFACTS IN THE REPO ROOT. A PRD/story JSON written next to package.json
+#      makes the tree dirty, and ralph refuses to run (or to integrate) on a dirty
+#      target. FIX: plans are staged under $TARGET_REPO/.ralph/ (already gitignored, and
+#      explicitly filtered out of ralph's own dirty-check).
+#
+# Portability: this script is POSIX-ish bash and runs the same under launchd (macOS),
+# cron and systemd. Only the scheduler unit differs — see unattended-loop.plist.example
+# and the cron/systemd note in docs/OPERATING.md §4.1.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# CONFIGURE — the only lines you must edit
+# ---------------------------------------------------------------------------
+
+# Absolute path to the repo the loop works on.
+TARGET_REPO="${TARGET_REPO:-/absolute/path/to/target-repo}"
+
+# Absolute path to the ralph harness checkout (the dir containing bin/ralph).
+RALPH_HOME="${RALPH_HOME:-/absolute/path/to/ralph-harness}"
+
+# The pass prompt, AS A FILE. Never inline it. Keep it in the target repo so it is
+# reviewable; if it is missing, a default is written under .ralph/ (see below).
+PROMPT_FILE="${RALPH_LOOP_PROMPT:-$TARGET_REPO/.agents/ralph/loop-pass.prompt.md}"
+
+# Schedulers hand you a near-empty PATH. Add wherever node/gh/git and your agent CLIs
+# live (`command -v node gh codex` in your own shell prints the dirs to list here).
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+export PATH
+
+# ---------------------------------------------------------------------------
+# Derived paths — all run state stays inside .ralph/ (gitignored)
+# ---------------------------------------------------------------------------
+
+STATE_DIR="$TARGET_REPO/.ralph"
+LOG_DIR="$STATE_DIR/loop-logs"
+# PITFALL 4: plans are staged here, NOT in the repo root.
+PLAN_DIR="$STATE_DIR/plans"
+LOG_FILE="$LOG_DIR/loop-$(date +%Y%m%d).log"
+LOCK_FILE="$STATE_DIR/loop.lock"
+
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"; }
+
+# ---------------------------------------------------------------------------
+# Preconditions — fail loudly, never half-run
+# ---------------------------------------------------------------------------
+
+[[ -d "$TARGET_REPO" ]] || { echo "unattended-loop: TARGET_REPO not found: $TARGET_REPO" >&2; exit 1; }
+[[ -d "$RALPH_HOME/.agents/ralph" ]] || { echo "unattended-loop: RALPH_HOME has no .agents/ralph: $RALPH_HOME" >&2; exit 1; }
+
+mkdir -p "$LOG_DIR" "$PLAN_DIR"
+
+# Everything from here on is logged. The scheduler unit ALSO redirects stdout/stderr
+# (PITFALL 2), so anything that escapes this redirect still lands somewhere readable.
+exec >>"$LOG_FILE" 2>&1
+
+log "=== pass start (pid $$) target=$TARGET_REPO harness=$RALPH_HOME"
+
+# One pass at a time. A cadence shorter than a pass would otherwise stack drivers on
+# the same worktree. mkdir is the portable atomic test-and-set (no flock on macOS).
+if ! mkdir "$LOCK_FILE" 2>/dev/null; then
+  log "another pass holds $LOCK_FILE — exiting without running"
+  exit 0
+fi
+cleanup() { rmdir "$LOCK_FILE" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
+# PITFALL 3, part 1: be IN the target before anything resolves. `ralph` prefers
+# $PWD/.agents/ralph over the harness copy, so cwd decides which templates AND which
+# config.local.sh its loops read.
+cd "$TARGET_REPO"
+
+# ---------------------------------------------------------------------------
+# Config + identity (PITFALL 3, part 2)
+# ---------------------------------------------------------------------------
+
+# `set -a` matters: config.local.sh uses `: "${VAR:=value}"`, which SETS but does not
+# EXPORT. Without this the driver command resolves correctly here and then the `ralph`
+# child process — a separate shell — sees none of it.
+set -a
+# shellcheck source=/dev/null
+source "$RALPH_HOME/.agents/ralph/agents.sh"
+# shellcheck source=/dev/null
+. "$RALPH_HOME/.agents/ralph/config.sh"
+# The harness install's local config...
+if [[ -f "$RALPH_HOME/.agents/ralph/config.local.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "$RALPH_HOME/.agents/ralph/config.local.sh"
+  log "sourced harness config.local.sh"
+fi
+# ...then the TARGET's, which wins when the target vendors its own .agents/ralph. This
+# is the file `ralph` itself will source, so sourcing it here makes both paths agree.
+if [[ -f "$TARGET_REPO/.agents/ralph/config.local.sh" &&
+      "$TARGET_REPO/.agents/ralph" != "$RALPH_HOME/.agents/ralph" ]]; then
+  # shellcheck source=/dev/null
+  . "$TARGET_REPO/.agents/ralph/config.local.sh"
+  log "sourced target config.local.sh"
+fi
+set +a
+
+# Resolve the identity wrapper ONCE and export it, so the driver, its `gh` calls and
+# `ralph integrate --pr` all file the PR as the same actor. Sourcing resolve-identity.sh
+# runs the resolution and populates IDENTITY_STATUS / RESOLVED_WRAPPER.
+IDENTITY_SCRIPT="$RALPH_HOME/.agents/ralph/resolve-identity.sh"
+if [[ -f "$IDENTITY_SCRIPT" ]]; then
+  # shellcheck source=/dev/null
+  . "$IDENTITY_SCRIPT"
+  if [[ "${IDENTITY_STATUS:-}" == "resolved" && -n "${RESOLVED_WRAPPER:-}" ]]; then
+    export RALPH_IDENTITY_WRAPPER="$RESOLVED_WRAPPER"
+    log "identity: resolved via ${IDENTITY_SOURCE:-?} -> $RALPH_IDENTITY_WRAPPER"
+  else
+    log "identity: ${IDENTITY_STATUS:-unknown} (${IDENTITY_SOURCE:-?}) — falling back to ambient gh auth"
+  fi
+fi
+
+# Worktree base: keep run worktrees off the repo root too (default is already outside
+# it; set it explicitly so a stray CWD cannot move them into the tree).
+export RALPH_WORKTREE_DIR="${RALPH_WORKTREE_DIR:-$STATE_DIR/worktrees}"
+
+# Export the staging dir so the pass prompt can name one canonical place for plans.
+# This is THIS template's contract with its own prompt file — `bin/ralph` does not read
+# it; you pass a plan to ralph explicitly (`ralph review --prd "$RALPH_LOOP_PLAN_DIR/x.json"`).
+export RALPH_LOOP_PLAN_DIR="$PLAN_DIR"
+
+# ---------------------------------------------------------------------------
+# Resolve the driver (§4 of docs/OPERATING.md)
+# ---------------------------------------------------------------------------
+
+# Called directly with stdout redirected to a file — NOT as cmd="$(...)" — so the
+# RALPH_CRON_DRIVER_BACKEND / AGENT_RALPH_CRON_CMD exports survive the call.
+DRIVER_OUT="$(mktemp "${TMPDIR:-/tmp}/ralph-driver.XXXXXX")"
+if ! ralph_resolve_cron_driver >"$DRIVER_OUT"; then
+  log "FATAL: could not resolve RALPH_CRON_DRIVER (see the error above)"
+  rm -f "$DRIVER_OUT"
+  exit 1
+fi
+DRIVER_CMD="$(cat "$DRIVER_OUT")"
+rm -f "$DRIVER_OUT"
+log "driver: backend=${RALPH_CRON_DRIVER_BACKEND:-?} cmd=$DRIVER_CMD"
+
+# ---------------------------------------------------------------------------
+# The pass prompt — PITFALL 1: from a FILE, on stdin. Never an inline string.
+# ---------------------------------------------------------------------------
+
+if [[ ! -f "$PROMPT_FILE" ]]; then
+  # No prompt committed yet: write a default one into .ralph/ (gitignored, so this
+  # never dirties the tree) and use that. Editing the committed PROMPT_FILE above is
+  # the intended path; this only keeps an unattended pass from dying on a missing file.
+  PROMPT_FILE="$STATE_DIR/loop-pass.prompt.md"
+  cat >"$PROMPT_FILE" <<'PASS_PROMPT'
+Run exactly one orchestrator pass.
+
+1. Read .agents/ralph/ORCHESTRATOR.md in this repo (or in the ralph harness install if
+   the repo does not vendor one) and follow it verbatim. It is the charter.
+2. Pick ONE eligible ticket by label, per the charter.
+3. Dispatch the harness for it (ralph review / ralph batch). Do not build by hand.
+4. Stage any PRD/story JSON you generate in the directory named by
+   $RALPH_LOOP_PLAN_DIR. Never write plan artifacts to the repo root: the tree must
+   stay clean or ralph will refuse to run and to integrate.
+5. Open a PR with `ralph integrate --pr` and stop. Do not merge, do not push to the
+   default branch.
+6. If the pass cannot proceed, comment the blocker on the issue or PR, apply
+   blocked:manager, and exit. Never wait on a human.
+PASS_PROMPT
+  log "no prompt at the configured path — wrote a default pass prompt to $PROMPT_FILE"
+fi
+
+log "prompt file: $PROMPT_FILE ($(wc -c <"$PROMPT_FILE" | tr -d ' ') bytes)"
+
+# Some backends take the prompt on stdin, others substitute a quoted prompt-FILE PATH
+# for {prompt}. Both are file-based; neither interpolates prompt TEXT into the command,
+# so an apostrophe (or $, or a backtick) in the prompt is inert. This is the same
+# dispatch review-loop.sh:run_backend uses — keep it identical.
+STATUS=0
+if [[ "$DRIVER_CMD" == *"{prompt}"* ]]; then
+  PROMPT_ESC="$(printf '%q' "$PROMPT_FILE")"
+  log "invoking driver with the prompt-file path substituted for {prompt}"
+  eval "${DRIVER_CMD//\{prompt\}/$PROMPT_ESC}" || STATUS=$?
+else
+  log "invoking driver with the prompt on stdin"
+  eval "$DRIVER_CMD" <"$PROMPT_FILE" || STATUS=$?
+fi
+
+if [[ "$STATUS" -eq 0 ]]; then
+  log "=== pass end: ok"
+else
+  # Non-zero is reported, never swallowed — the scheduler and the log agree.
+  log "=== pass end: driver exited $STATUS"
+fi
+exit "$STATUS"

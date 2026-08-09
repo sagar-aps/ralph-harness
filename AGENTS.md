@@ -44,7 +44,10 @@ change a flag.
   `RALPH_CRON_DRIVER` (convention in `config.sh`, resolved by
   `ralph_resolve_cron_driver`), owned by the orchestrator per `ORCHESTRATOR.md`.
 - Target scaffolding templates: `.agents/ralph/target-templates/` (used by
-  `ralph init-target`). Operator commands: canonical set in `agent-commands/ralph/`,
+  `ralph init-target`). The two `unattended-loop.*.example` files there are the
+  exception: they need operator-specific paths, so they are copied and filled BY HAND
+  (not installed by `init-target`) — see docs/OPERATING.md §4.1 for the four pitfalls
+  they exist to prevent. Operator commands: canonical set in `agent-commands/ralph/`,
   adapted per agent (claude/codex/copilot) by `ralph install-agent-commands`.
 - Operator commands live in `bin/ralph`: `review`, `batch`, `preflight`, `status`,
   `integrate`, `cleanup`, `init-target`, `install-agent-commands`. Run metadata:

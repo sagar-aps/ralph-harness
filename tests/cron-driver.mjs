@@ -2,7 +2,7 @@
 // Hermetic: sources the shell config and resolves commands — no real agent runs.
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +11,10 @@ const agentsSh = path.join(repoRoot, ".agents", "ralph", "agents.sh");
 const configSh = path.join(repoRoot, ".agents", "ralph", "config.sh");
 const orchestratorMd = path.join(repoRoot, ".agents", "ralph", "ORCHESTRATOR.md");
 const configExample = path.join(repoRoot, ".agents", "ralph", "config.local.sh.example");
+const tplDir = path.join(repoRoot, ".agents", "ralph", "target-templates");
+const wrapperTpl = path.join(tplDir, "unattended-loop.sh.example");
+const plistTpl = path.join(tplDir, "unattended-loop.plist.example");
+const operatingMd = path.join(repoRoot, "docs", "OPERATING.md");
 
 let failures = 0;
 const check = (cond, msg) => {
@@ -169,6 +173,70 @@ console.log("6) the convention and its ownership are documented where operators 
     "ORCHESTRATOR.md claims driver selection as the orchestrator's remit");
   check(/cheapest/i.test(charter) && /ledger\.jsonl|pool/i.test(charter),
     "…with the cheapest-competent default and the pool-aware cost decision");
+}
+
+console.log("7) the shipped unattended-loop templates bake in the four known pitfalls (#69)");
+{
+  // The wrapper. Operators copy this verbatim, so the rails must be IN the file, not
+  // only in prose: prompt read from a file, config.local.sh sourced+exported for BOTH
+  // identity paths, plans staged under .ralph/. tests/shell-syntax.mjs parse-checks it.
+  const wrapper = readFileSync(wrapperTpl, "utf-8");
+  check(/\{prompt\}/.test(wrapper) && /eval "\$DRIVER_CMD" <"\$PROMPT_FILE"/.test(wrapper),
+    "pitfall 1: the prompt is passed by file path or on stdin, never interpolated as text");
+  check(!/^\s*(DRIVER_)?\w*(PROMPT|prompt)\w*=(["']).*\b(Run|read)\b/m.test(wrapper),
+    "…and the wrapper never assigns an inline prompt STRING");
+  check(/PROMPT_FILE=/.test(wrapper) && /-f "\$PROMPT_FILE"/.test(wrapper),
+    "…the prompt path is a configurable FILE the wrapper checks for");
+  check(/exec >>"\$LOG_FILE" 2>&1/.test(wrapper) && /exit "\$STATUS"/.test(wrapper),
+    "pitfall 2: the wrapper logs both streams and propagates the driver's exit code");
+  check(/set -a/.test(wrapper) && /set \+a/.test(wrapper),
+    "pitfall 3: config is sourced under `set -a` so `: \"${VAR:=v}\"` values are EXPORTED to ralph");
+  check((wrapper.match(/config\.local\.sh/g) || []).length >= 2 && /RALPH_HOME/.test(wrapper) && /TARGET_REPO/.test(wrapper),
+    "…both the harness and the target config.local.sh are sourced (the two identity paths)");
+  check(/^cd "\$TARGET_REPO"$/m.test(wrapper),
+    "…and it cds into the target first, since cwd decides which .agents/ralph ralph uses");
+  check(/resolve-identity\.sh/.test(wrapper) && /export RALPH_IDENTITY_WRAPPER=/.test(wrapper),
+    "…identity is resolved once and EXPORTED, so `ralph integrate --pr` resolves it too");
+  check(/STATE_DIR="\$TARGET_REPO\/\.ralph"/.test(wrapper) && /PLAN_DIR="\$STATE_DIR\/plans"/.test(wrapper),
+    "pitfall 4: plans are staged under .ralph/ (gitignored), not the repo root");
+  check(/export RALPH_WORKTREE_DIR=/.test(wrapper), "…and run worktrees are pinned outside the tree as well");
+  check(/ralph_resolve_cron_driver >"\$DRIVER_OUT"/.test(wrapper),
+    "the driver is resolved with ralph_resolve_cron_driver, redirected (not $(...)) so its exports survive");
+
+  // The launchd unit. A plist with no log paths is the reason failures go unnoticed.
+  const plist = readFileSync(plistTpl, "utf-8");
+  check(/<key>StandardOutPath<\/key>/.test(plist) && /<key>StandardErrorPath<\/key>/.test(plist),
+    "the launchd plist sets StandardOutPath AND StandardErrorPath (never silent)");
+  check(/<key>Label<\/key>/.test(plist) && /<key>ProgramArguments<\/key>/.test(plist) &&
+    /<key>StartInterval<\/key>|<key>StartCalendarInterval<\/key>/.test(plist),
+    "…and is a complete job: Label, ProgramArguments and a cadence");
+  check(/unattended-loop\.sh/.test(plist), "…pointing at the wrapper template, not an inline command");
+
+  // Nothing machine-specific: both templates are .example placeholders. Checked against
+  // THIS machine, so a template edited on a real setup and committed with its own paths
+  // baked in fails here rather than shipping someone's home directory to every operator.
+  const home = os.homedir();
+  const user = os.userInfo().username;
+  for (const [name, body] of [["wrapper", wrapper], ["plist", plist]]) {
+    check(/\/absolute\/path\/to\/|YOUR-USERNAME/.test(body), `the ${name} template ships fill-me-in placeholders`);
+    check(!body.includes(home) && !new RegExp(`/(Users|home)/${user}\\b`).test(body),
+      `…and no path from the machine that committed it (${name})`);
+  }
+
+  // The pitfalls are enumerated for operators, with the non-macOS equivalents.
+  const ops = readFileSync(operatingMd, "utf-8");
+  check(/unattended loop/i.test(ops), "docs/OPERATING.md has a 'setting up the unattended loop' section");
+  for (const [label, re] of [
+    ["inline-quoted prompt", /inline-quoted prompt/i],
+    ["silent stderr", /Silent stderr/i],
+    ["two identity paths", /Two identity paths/i],
+    ["plan staging", /Plan artifacts in the repo root/i],
+  ]) check(re.test(ops), `…enumerating pitfall: ${label}`);
+  check(/StandardOutPath/.test(ops) && /StandardErrorPath/.test(ops), "…with the plist log-path fix named");
+  check(/unattended-loop\.sh\.example/.test(ops) && /unattended-loop\.plist\.example/.test(ops),
+    "…and pointing at both shipped templates by path");
+  check(/\bcron\b/.test(ops) && /systemd/i.test(ops) && /OnCalendar/.test(ops),
+    "…plus a cron and systemd equivalent for non-macOS operators");
 }
 
 console.log(`\ncron-driver: ${failures ? failures + " failed" : "all passed"}`);

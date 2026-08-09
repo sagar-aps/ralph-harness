@@ -10,14 +10,17 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// All *.sh, plus the extensionless floor-guard shims (they have a bash shebang).
+// All *.sh, plus *.sh.example (shipped shell TEMPLATES an operator copies verbatim —
+// `.agents/ralph/target-templates/unattended-loop.sh.example`, `config.local.sh.example`.
+// They are real bash, so a parse error in one ships straight into an operator's cron and
+// fails there instead of here — #69), plus the extensionless floor-guard shims (bash shebang).
 function shellScripts(dir, acc = []) {
   for (const name of readdirSync(dir)) {
     if (name === ".git" || name === "node_modules") continue;
     const p = path.join(dir, name);
     const st = statSync(p);
     if (st.isDirectory()) shellScripts(p, acc);
-    else if (name.endsWith(".sh")) acc.push(p);
+    else if (name.endsWith(".sh") || name.endsWith(".sh.example")) acc.push(p);
     else if (path.basename(path.dirname(p)) === "floor-guard") {
       try { if (readFileSync(p, "utf8").startsWith("#!")) acc.push(p); } catch {}
     }

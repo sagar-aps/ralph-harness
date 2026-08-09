@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  unattended-loop.plist.example — launchd unit for the recurring orchestrator pass (#69).
+  macOS only. For cron/systemd see docs/OPERATING.md §4.1 (same wrapper, different unit).
+
+  Install:
+    cp .agents/ralph/target-templates/unattended-loop.plist.example \
+       ~/Library/LaunchAgents/com.example.ralph-loop.plist
+    # edit: Label, ProgramArguments path, WorkingDirectory, the two log paths, TARGET_REPO,
+    # RALPH_HOME and PATH — then
+    mkdir -p ~/Library/Logs/ralph
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.ralph-loop.plist
+    launchctl kickstart -p gui/$(id -u)/com.example.ralph-loop   # run one pass now
+
+  Uninstall / reload after an edit:
+    launchctl bootout gui/$(id -u)/com.example.ralph-loop
+
+  StandardOutPath and StandardErrorPath below are NOT optional. Without them launchd
+  discards the job output, so a wrapper that dies before its own logging is set up
+  (bad PATH, missing node, a syntax error) fails completely silently and the loop
+  simply stops happening with nothing to read. See pitfall 2 in docs/OPERATING.md §4.1.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Reverse-DNS and unique. This is the name every launchctl subcommand takes. -->
+    <key>Label</key>
+    <string>com.example.ralph-loop</string>
+
+    <!-- Absolute paths only: launchd does not use a login shell or your $PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/absolute/path/to/target-repo/scripts/unattended-loop.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/absolute/path/to/target-repo</string>
+
+    <!-- Cadence. StartInterval is seconds between runs; 3600 = hourly. Use
+         StartCalendarInterval instead for wall-clock times (e.g. Hour 9, Minute 0).
+         The wrapper takes its own lock, so an overrunning pass is skipped, not stacked. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- false: do not fire a pass the moment you log in / bootstrap the job. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- PITFALL 2 — capture BOTH streams. Create the directory first; launchd will not
+         mkdir for you, and a missing directory makes the job fail to spawn. -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR-USERNAME/Library/Logs/ralph/loop.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR-USERNAME/Library/Logs/ralph/loop.err.log</string>
+
+    <!-- launchd hands the job a minimal environment. Anything the wrapper or the agent
+         CLIs need must be listed here (or re-established inside the wrapper). Never put
+         API keys here: this file is world-readable — keep secrets in the gitignored
+         .agents/ralph/config.local.sh, which the wrapper sources. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARGET_REPO</key>
+        <string>/absolute/path/to/target-repo</string>
+        <key>RALPH_HOME</key>
+        <string>/absolute/path/to/ralph-harness</string>
+        <key>HOME</key>
+        <string>/Users/YOUR-USERNAME</string>
+    </dict>
+
+    <!-- Do not restart on exit: a pass that failed should wait for the next tick, not
+         hot-loop against a broken repo or an exhausted quota. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Background priority: the loop is never latency-critical. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>
