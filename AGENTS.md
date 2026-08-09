@@ -44,10 +44,10 @@ Keep this file short. It is always loaded into context.
   `integrate`, `cleanup`, `init-target`, `install-agent-commands`. Run metadata:
   `<target>/.ralph/last-run.env`; artifacts: `<target>/.ralph/runs/<run-id>/` (review)
   or `<target>/.agent-run/batch-<ts>/` (batch).
-- Efficiency mode (opt-in, **dispatches nothing yet**): `.agents/ralph/efficiency.py` +
+- Efficiency mode (**opt-in, DEFAULT OFF**): `.agents/ralph/efficiency.py` +
   `efficiency.sh` parse/validate the declarative profile (`efficiency.json`, gitignored;
-  `efficiency.json.example` ships the policy). `--efficiency`/`RALPH_EFFICIENCY` only
-  boot-validates — an invalid profile is rejected to inert/off, never fatal — and
+  `efficiency.json.example` ships the policy). `--efficiency`/`RALPH_EFFICIENCY`
+  boot-validates it — an invalid profile is rejected to inert/off, never fatal — and
   `ralph explain --complexity <tier>` reports which rung WOULD be chosen. The decision
   itself is `ralph_efficiency_select <tier> [repo]` (efficiency.sh) / `efficiency.py
   select` (#61): first eligible rung of the tier, where a pool is eligible unless an
@@ -57,9 +57,14 @@ Keep this file short. It is always loaded into context.
   only supplies the numbers), the near-WEEKLY-reset relaxation lifts the weekly cap +
   reserve, unknown usage FAILS OPEN, deepseek is the always-on backstop, and an
   unusable backstop returns a bounded PAUSE (rc 3; rc 4 = inert) instead of crashing.
-  Nothing there sets BUILDER/REVIEWER — dispatch is still a later slice (4d). Per-pool
-  usage comes from the
-  read-only reader `usage-state.sh`/`usage-state.py` (#60): 5h + weekly token sums from
+  Dispatch (#62) applies that decision per TICKET, and ONLY under the opt-in
+  (`ralph_efficiency_dispatch_select`): the ticket's `complexity:<tier>` (label or PRD
+  field) picks the rung, which overrides BUILDER/REVIEWER for that ticket and is recorded
+  in the run, `last-run.env`, the ledger and the PR/handoff body. **Default OFF is
+  sacred** — with the flag unset none of that code runs and dispatch is byte-for-byte
+  today's `--builder`/`--reviewer` path (regression-tested). No tier / bad profile =>
+  inert + loud warning; PAUSE => clean stop, `EFFICIENCY_PAUSED`, exit 5, artifacts kept.
+  Per-pool usage comes from the read-only reader `usage-state.sh`/`usage-state.py` (#60): 5h + weekly token sums from
   `.ralph/ledger.jsonl`, converted to a pct ONLY when the profile sets that pool's
   `window_*_budget_tokens` (else pct=unknown, raw tokens still shown), plus reset
   proximity and avoid-window-now. Local estimate only — no provider usage API.

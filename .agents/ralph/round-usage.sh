@@ -142,6 +142,20 @@ record = {
         "total": total_tokens,
     },
 }
+
+# Efficiency mode (#62): the rung this round was dispatched on, and why. The key is
+# added ONLY when efficiency mode actually decided something, so a default (opt-out)
+# run writes exactly the record it always has.
+efficiency_state = os.environ.get("RALPH_EFFICIENCY_DISPATCH_STATE", "")
+if efficiency_state and efficiency_state != "off":
+    record["efficiency"] = {
+        "state": efficiency_state,
+        "complexity": os.environ.get("RALPH_EFFICIENCY_DISPATCH_COMPLEXITY", ""),
+        "rung": os.environ.get("RALPH_EFFICIENCY_SELECT_RUNG", ""),
+        "builder_pool": os.environ.get("RALPH_EFFICIENCY_SELECT_BUILDER_POOL", ""),
+        "reviewer_pool": os.environ.get("RALPH_EFFICIENCY_SELECT_REVIEWER_POOL", ""),
+        "reason": os.environ.get("RALPH_EFFICIENCY_SELECT_REASON", ""),
+    }
 artifact = os.path.join(run_dir, "round-usage.jsonl")
 with open(artifact, "a", encoding="utf-8") as handle:
     handle.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")

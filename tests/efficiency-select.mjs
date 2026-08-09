@@ -426,8 +426,8 @@ console.log("9) selection is pure: no writes, no dispatch");
     check(snapshot(target) === before, "the target repo is byte-identical afterwards");
 
     const r = select(target, "small");
-    check(/governs nothing yet, nothing was dispatched/.test(`${r.stdout}`),
-      "the human output states that nothing was dispatched");
+    check(/nothing was dispatched here/.test(`${r.stdout}`),
+      "the human output states that the CLI seam itself dispatched nothing");
     check(/^SELECTED: codex$/m.test(`${r.stdout}`), "the human output names the selected rung");
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
@@ -484,8 +484,8 @@ console.log("10) ralph_efficiency_select (bash) reuses ralph_quota_pool_is_exhau
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
-// ── 11) Still governs nothing: dispatch is unchanged under --efficiency ──
-console.log("11) selection changes no dispatch (still opt-in and inert)");
+// ── 11) An UNSIZED story is dispatched exactly as it is today ────────────
+console.log("11) with no complexity on the story, --efficiency changes no dispatch");
 {
   const mkRepo = () => {
     const target = makeTarget();
@@ -531,7 +531,8 @@ console.log("11) selection changes no dispatch (still opt-in and inert)");
       "the resolved builder/reviewer are identical with and without --efficiency");
     check(a.status === b.status && /READY_FOR_HUMAN_REVIEW/.test(bOut),
       "the opt-in run reaches the same outcome");
-    check(!/SELECTED:/.test(bOut), "the loop selects no rung of its own (4d wires that)");
+    check(!/efficiency: rung /.test(bOut),
+      "no rung is applied: the story declares no complexity to right-size it by (#62)");
   } finally {
     for (const t of [plain, opted]) {
       rmSync(worktreeFor(t), { recursive: true, force: true });

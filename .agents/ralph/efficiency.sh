@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Efficiency mode (#59) — opt-in plumbing + boot validation + selection (#61).
+# Efficiency mode (#59) — opt-in plumbing + boot validation (#59), selection (#61),
+# dispatch wiring (#62).
 #
-# DISPATCHES NOTHING. Sourcing this file and calling ralph_efficiency_boot_validate
-# parses the profile and reports its state; ralph_efficiency_select computes which
-# rung a complexity tier WOULD use (enforcing the caps, avoid windows, the #28
-# circuit and the weekly reserves) and reports it in RALPH_EFFICIENCY_SELECT_*.
-# Neither touches BUILDER/REVIEWER or runs an agent — wiring the recommendation
-# into dispatch is a later slice (#54 step 4d).
+# ralph_efficiency_boot_validate parses the profile and reports its state;
+# ralph_efficiency_select computes which rung a complexity tier would use (enforcing
+# the caps, avoid windows, the #28 circuit and the weekly reserves) and reports it in
+# RALPH_EFFICIENCY_SELECT_*; ralph_efficiency_dispatch_select (#62) turns that
+# recommendation into an instruction for ONE ticket — but only under the opt-in.
+#
+# DEFAULT OFF IS SACRED: with --efficiency / RALPH_EFFICIENCY unset, every function
+# here returns before doing anything, so BUILDER/REVIEWER dispatch is exactly the
+# --builder/--reviewer path it has always been.
 #
 # Contract (why every path returns instead of dying): a bad profile must never take
 # the harness down. Boot validation REJECTS an invalid profile to an inert/off state
@@ -68,7 +72,7 @@ ralph_efficiency_boot_validate() {  # <target-repo>
   case "$status" in
     valid)
       RALPH_EFFICIENCY_STATE="valid"
-      echo "efficiency: profile $RALPH_EFFICIENCY_PROFILE_PATH is VALID (parsed only — governs nothing in this slice; run 'ralph explain --complexity <level>')."
+      echo "efficiency: profile $RALPH_EFFICIENCY_PROFILE_PATH is VALID — tickets carrying a complexity:<tier> label/field are right-sized from it (run 'ralph explain --complexity <level>' to read the policy)."
       return 0
       ;;
     not_configured)
@@ -126,7 +130,8 @@ EOF
 # The opt-in (--efficiency / RALPH_EFFICIENCY) decides whether a caller consults
 # this at all — check ralph_efficiency_enabled there. It is deliberately not checked
 # here, so `ralph explain` and the fixtures can inspect the decision without turning
-# the mode on. No caller consults it yet: nothing in the loops changed (#54 step 4d).
+# the mode on. The loops reach it only through ralph_efficiency_dispatch_select
+# below, which does check the opt-in (#62).
 #
 # NEVER exits; a caller under `set -e` must use it in a conditional.
 ralph_efficiency_select() {  # <complexity> [target-repo]
@@ -187,4 +192,151 @@ EOF
     RALPH_EFFICIENCY_SELECT_REASON RALPH_EFFICIENCY_SELECT_PROFILE \
     RALPH_EFFICIENCY_SELECT_NOW
   return "$rc"
+}
+
+# --- Dispatch (#62) ---------------------------------------------------------
+#
+# The seam where a recommendation becomes an assignment, for ONE ticket at a time.
+# It is the only thing in efficiency mode that can change who runs, and it refuses
+# to do so unless the operator opted in: ralph_efficiency_enabled is the first gate,
+# a VALID profile is the second, and a complexity tier on the ticket is the third.
+# Anything missing means INERT — the caller keeps the builder/reviewer it already
+# resolved and the run continues, loudly but normally.
+
+# The complexity tier a ticket declares, read out of its text: a `complexity:<tier>`
+# label (the Manager assigns exactly one per implementable issue — see LABELS.md) or
+# a `Complexity: <tier>` field. Prints the tier, or nothing when there is none.
+ralph_efficiency_complexity_from_text() {  # <text>
+  printf '%s\n' "${1:-}" | tr 'A-Z' 'a-z' \
+    | sed -n -E 's/.*complexity[[:space:]]*[:=][[:space:]]*[^a-z]*(trivial|small|medium|large).*/\1/p' \
+    | head -n1
+}
+
+# Decide what to do about one ticket. Returns:
+#   0 = APPLIED — the caller MUST set its BUILDER/REVIEWER from
+#       RALPH_EFFICIENCY_SELECT_BUILDER/_REVIEWER and re-resolve their commands.
+#   3 = PAUSED  — bounded PAUSE from #61: the caller must stop CLEANLY (flush what it
+#       has, keep artifacts, publish the reason). Never a crash.
+#   4 = INERT   — efficiency is off, unusable, or the ticket has no complexity tier:
+#       the caller changes nothing.
+# Sets RALPH_EFFICIENCY_DISPATCH_STATE (off|inert|no-complexity|applied|paused) plus
+# _NOTE / _TICKET / _COMPLEXITY for the run record, the ledger and the PR body.
+# NEVER exits; a caller under `set -e` must use it in a conditional.
+ralph_efficiency_dispatch_select() {  # <complexity> <target-repo> <ticket-label>
+  local complexity="${1:-}" repo="${2:-$PWD}" ticket="${3:-ticket}" rc=0
+  RALPH_EFFICIENCY_DISPATCH_STATE="off"
+  RALPH_EFFICIENCY_DISPATCH_NOTE=""
+  RALPH_EFFICIENCY_DISPATCH_TICKET="$ticket"
+  RALPH_EFFICIENCY_DISPATCH_COMPLEXITY="$complexity"
+  export RALPH_EFFICIENCY_DISPATCH_STATE RALPH_EFFICIENCY_DISPATCH_NOTE \
+    RALPH_EFFICIENCY_DISPATCH_TICKET RALPH_EFFICIENCY_DISPATCH_COMPLEXITY
+
+  # Gate 1 — the opt-in. Without it this function is the only efficiency code a loop
+  # runs, and it stops here: dispatch stays byte-for-byte today's behavior.
+  ralph_efficiency_enabled || return 4
+
+  # Past the opt-in, forget the previous ticket's decision: an INERT gate below never
+  # reaches ralph_efficiency_select (which does its own reset), and a stale rung would
+  # then be recorded against a ticket that was never right-sized.
+  RALPH_EFFICIENCY_SELECT_STATUS=""; RALPH_EFFICIENCY_SELECT_RUNG=""
+  RALPH_EFFICIENCY_SELECT_BUILDER=""; RALPH_EFFICIENCY_SELECT_BUILDER_POOL=""
+  RALPH_EFFICIENCY_SELECT_REVIEWER=""; RALPH_EFFICIENCY_SELECT_REVIEWER_POOL=""
+  RALPH_EFFICIENCY_SELECT_REASON=""; RALPH_EFFICIENCY_SELECT_PAUSE_SECONDS=""
+  RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL=""
+
+  # Gate 2 — a profile that boot validation accepted. A missing/rejected one already
+  # warned loudly at boot; say plainly that this ticket falls back to normal dispatch.
+  if [[ "${RALPH_EFFICIENCY_STATE:-}" != "valid" ]]; then
+    RALPH_EFFICIENCY_DISPATCH_STATE="inert"
+    RALPH_EFFICIENCY_DISPATCH_NOTE="profile ${RALPH_EFFICIENCY_STATE:-unavailable} — normal --builder/--reviewer dispatch"
+    echo "⚠⚠ ralph: efficiency mode is ON but the profile is ${RALPH_EFFICIENCY_STATE:-unavailable} — $ticket dispatches on the normal --builder/--reviewer path (inert)." >&2
+    return 4
+  fi
+
+  # Gate 3 — the ticket's own complexity. Guessing a tier would silently right-size a
+  # ticket nobody sized, so an unlabelled ticket keeps the operator's own selection.
+  if [[ -z "$complexity" ]]; then
+    RALPH_EFFICIENCY_DISPATCH_STATE="no-complexity"
+    RALPH_EFFICIENCY_DISPATCH_NOTE="no complexity:<tier> label/field on $ticket — normal --builder/--reviewer dispatch"
+    echo "⚠⚠ ralph: efficiency mode is ON but $ticket carries no complexity:<tier> label/field — nothing to right-size it by; dispatching on the normal --builder/--reviewer path." >&2
+    return 4
+  fi
+
+  ralph_efficiency_select "$complexity" "$repo" || rc=$?
+  case "$rc" in
+    0)
+      RALPH_EFFICIENCY_DISPATCH_STATE="applied"
+      RALPH_EFFICIENCY_DISPATCH_NOTE="rung $RALPH_EFFICIENCY_SELECT_RUNG (complexity $complexity): $RALPH_EFFICIENCY_SELECT_REASON"
+      return 0
+      ;;
+    3)
+      RALPH_EFFICIENCY_DISPATCH_STATE="paused"
+      RALPH_EFFICIENCY_DISPATCH_NOTE="$RALPH_EFFICIENCY_SELECT_REASON"
+      return 3
+      ;;
+    *)
+      RALPH_EFFICIENCY_DISPATCH_STATE="inert"
+      RALPH_EFFICIENCY_DISPATCH_NOTE="selection unusable (${RALPH_EFFICIENCY_SELECT_REASON:-no reason reported}) — normal --builder/--reviewer dispatch"
+      echo "⚠⚠ ralph: efficiency selection for $ticket was inert — $RALPH_EFFICIENCY_DISPATCH_NOTE." >&2
+      return 4
+      ;;
+  esac
+}
+
+# One line describing what efficiency did for this ticket, for banners, the final
+# report and the PR/handoff body. Prints nothing when the mode is off, so callers
+# can append it unconditionally without changing the default output.
+ralph_efficiency_dispatch_summary() {
+  case "${RALPH_EFFICIENCY_DISPATCH_STATE:-off}" in
+    off|"") return 0 ;;
+    applied)
+      printf 'efficiency: rung %s (complexity %s) -> builder %s (pool %s), reviewer %s (pool %s) — %s' \
+        "$RALPH_EFFICIENCY_SELECT_RUNG" "$RALPH_EFFICIENCY_DISPATCH_COMPLEXITY" \
+        "$RALPH_EFFICIENCY_SELECT_BUILDER" "$RALPH_EFFICIENCY_SELECT_BUILDER_POOL" \
+        "$RALPH_EFFICIENCY_SELECT_REVIEWER" "$RALPH_EFFICIENCY_SELECT_REVIEWER_POOL" \
+        "$RALPH_EFFICIENCY_SELECT_REASON"
+      ;;
+    paused)
+      printf 'efficiency: PAUSED before dispatch — %s' "$RALPH_EFFICIENCY_DISPATCH_NOTE"
+      ;;
+    *)
+      printf 'efficiency: %s (%s) — selection unchanged' \
+        "$RALPH_EFFICIENCY_DISPATCH_STATE" "$RALPH_EFFICIENCY_DISPATCH_NOTE"
+      ;;
+  esac
+}
+
+# Append this ticket's decision to <run-dir>/efficiency-dispatch.jsonl so the run
+# carries an auditable record of who was chosen and why. No-op when the mode is off.
+ralph_efficiency_dispatch_record() {  # <run-dir>
+  local run_dir="${1:-}"
+  [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
+  case "${RALPH_EFFICIENCY_DISPATCH_STATE:-off}" in off|"") return 0 ;; esac
+  python3 - "$run_dir/efficiency-dispatch.jsonl" \
+    "$RALPH_EFFICIENCY_DISPATCH_TICKET" "$RALPH_EFFICIENCY_DISPATCH_COMPLEXITY" \
+    "$RALPH_EFFICIENCY_DISPATCH_STATE" "$RALPH_EFFICIENCY_DISPATCH_NOTE" \
+    "${RALPH_EFFICIENCY_SELECT_RUNG:-}" "${RALPH_EFFICIENCY_SELECT_BUILDER:-}" \
+    "${RALPH_EFFICIENCY_SELECT_BUILDER_POOL:-}" "${RALPH_EFFICIENCY_SELECT_REVIEWER:-}" \
+    "${RALPH_EFFICIENCY_SELECT_REVIEWER_POOL:-}" "${RALPH_EFFICIENCY_SELECT_REASON:-}" \
+    "${RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL:-}" "${RALPH_EFFICIENCY_SELECT_NOW:-}" <<'PY'
+import json, sys
+(path, ticket, complexity, state, note, rung, builder, builder_pool,
+ reviewer, reviewer_pool, reason, pause_until, now) = sys.argv[1:14]
+record = {
+    "ticket": ticket,
+    "complexity": complexity,
+    "state": state,
+    "note": note,
+    "rung": rung,
+    "builder": builder,
+    "builder_pool": builder_pool,
+    "reviewer": reviewer,
+    "reviewer_pool": reviewer_pool,
+    "reason": reason,
+    "pause_until": pause_until,
+    "decided_at": now,
+}
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+PY
 }

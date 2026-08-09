@@ -8,9 +8,11 @@ complexity tier is allowed to use.
 
 It parses, validates, explains and — since #54 step 4c — SELECTS: `select_rung`
 computes the rung a complexity tier would use, enforcing the pool caps, the
-avoid windows, the #28 circuit and the weekly reserves in code. It still
-DISPATCHES NOTHING: no caller's BUILDER/REVIEWER is touched here, and wiring the
-recommendation into dispatch is the next slice (#54 step 4d).
+avoid windows, the #28 circuit and the weekly reserves in code. This module
+itself still DISPATCHES NOTHING: no caller's BUILDER/REVIEWER is touched here.
+Since #54 step 4d the loops APPLY the `select` result per ticket, but only under
+--efficiency / RALPH_EFFICIENCY (see ralph_efficiency_dispatch_select in
+efficiency.sh); with the opt-in off nothing consults this module at all.
 
 The per-pool usage numbers come from the read-only reader in usage-state.py
 (#60): ledger token sums per window, turned into a percentage only when the
@@ -896,9 +898,9 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=()):
 # Output
 # ---------------------------------------------------------------------------
 INERT_LINE = "efficiency mode: OFF (inert) — builder/reviewer selection is unchanged"
-GOVERNS_NOTHING = ("note: this slice parses and explains only — efficiency mode governs "
-                   "nothing yet, nothing was dispatched, and --builder/--reviewer "
-                   "selection is unchanged.")
+GOVERNS_NOTHING = ("note: explain is read-only — nothing was dispatched here. Under "
+                   "--efficiency the loops apply this same decision per ticket; without "
+                   "it, --builder/--reviewer selection is unchanged.")
 
 
 def warn_rejected(loaded):
@@ -1100,8 +1102,9 @@ EXIT_PAUSED = 3
 EXIT_INERT = 4
 
 SELECT_GOVERNS_NOTHING = (
-    "note: this is a recommendation only — efficiency mode governs nothing yet, "
-    "nothing was dispatched, and --builder/--reviewer selection is unchanged.")
+    "note: this CLI seam only reports the decision — nothing was dispatched here. "
+    "Under --efficiency the loops apply it to the ticket they are about to dispatch; "
+    "without it, --builder/--reviewer selection is unchanged.")
 
 
 def _shell_assignments(pairs):

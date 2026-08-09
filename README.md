@@ -611,7 +611,7 @@ batch also writes `<target>/.ralph/last-run.env`, so `ralph status` / `ralph int
 / `ralph cleanup` work on the batch branch just like a single review run. Add it to
 your operator agent with `/ralph-batch` (installed by `ralph install-agent-commands`).
 
-### Efficiency profile + `ralph explain` (opt-in, governs nothing yet)
+### Efficiency profile + `ralph explain` (opt-in, default OFF)
 
 An **efficiency profile** is the operator's declarative cost policy: a ladder of
 **rungs** (cheapest first), the **credential pool** each role draws on, the window
@@ -667,8 +667,8 @@ pct, reset_at, in_avoid_window, source}`.
   local estimate for that pool. With no ledger, no budget and no quota block,
   `explain` assumes **0 % used** and says so.
 
-The reader writes nothing: the ledger, the profile and dispatch are untouched, and
-it enforces no cap or reserve.
+The reader writes nothing: the ledger and the profile are untouched, and it enforces no
+cap or reserve of its own — it only supplies the numbers the selection is made from.
 
 #### How a rung is chosen
 
@@ -707,10 +707,32 @@ loud warning on stderr and efficiency mode falls back to inert/off — it never 
 or fails a run, and it never enforces part of a policy it could not parse. A missing
 profile prints a clean "not configured" message.
 
-`--efficiency` (or `RALPH_EFFICIENCY=1`) on `ralph review` / `ralph batch` is
-recognized and boot-validates the profile, but **dispatch is unchanged** in this
-slice: selection is computed and reported, while `--builder` / `--reviewer` still
-decide who actually runs. Wiring the recommendation into dispatch is a later slice.
+#### Turning it on: `--efficiency` (default OFF)
+
+`--efficiency` (or `RALPH_EFFICIENCY=1`) on `ralph review` / `ralph batch` boot-validates
+the profile and then right-sizes **each ticket** from it: before dispatching a ticket the
+loop reads its complexity (a `complexity:<tier>` label, or the `complexity` field / a
+`complexity:` label on the PRD story) and applies the rung `ralph_efficiency_select`
+picks, overriding `--builder` / `--reviewer` for that ticket only. The chosen rung, the
+pools and the reason land in the run (`efficiency-dispatch.jsonl`, `final_status.md` /
+`final-report.md`, the per-task result file used for the PR body), in `last-run.env`, and
+in the `efficiency` block of the `.ralph/ledger.jsonl` record for that round.
+
+**Default OFF is the contract.** Without the flag none of that code runs: dispatch is
+exactly `--builder` / `--reviewer` (plus `config.local.sh`), with no extra output and no
+extra ledger field — `tests/efficiency-select.mjs` pins that as a regression test.
+
+Three ways it steps aside rather than surprising you:
+
+- **Ticket with no `complexity:<tier>`** — nothing to right-size by, so the operator's
+  own selection runs, with a loud warning.
+- **Missing or malformed profile** — inert fallback to normal dispatch and a loud
+  warning; never a crash.
+- **No eligible rung (not even the backstop)** — a clean, bounded pause instead of
+  dispatching something the policy forbids: terminal status `EFFICIENCY_PAUSED`, exit
+  **5**, artifacts preserved, reason + retry instant published. In a batch the tasks
+  already completed stay committed with their usage flushed, and `--resume` picks up
+  from there; in a review nothing has been created yet, so the target repo is untouched.
 
 ## State files (.ralph/)
 

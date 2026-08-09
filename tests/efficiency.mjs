@@ -129,8 +129,8 @@ console.log("3) valid profile -> explain picks sensibly per complexity");
       check(/^WHY: /m.test(out), `${complexity} prints WHY`);
       check(out.includes(`tier ${complexity} allows (in order):`),
         `${complexity} lists the tier's rungs in order`);
-      check(/governs nothing yet, nothing was dispatched/.test(out),
-        `${complexity} states it dispatched nothing`);
+      check(/explain is read-only — nothing was dispatched here/.test(out),
+        `${complexity} states that explain itself dispatched nothing`);
     }
 
     // No ledger -> says it is assuming 0%.
@@ -393,12 +393,12 @@ console.log("8) explain CLI contract");
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
-// ── 9) --efficiency / RALPH_EFFICIENCY is recognized but governs nothing ──
-console.log("9) --efficiency is recognized but dispatch/selection is UNCHANGED");
+// ── 9) --efficiency on an UNSIZED story leaves dispatch alone ────────────
+console.log("9) --efficiency on a story with no complexity: dispatch is UNCHANGED");
 {
   // A dry-run `ralph review` with and without --efficiency must resolve the SAME
-  // backends and reach the same outcome. This is the acceptance criterion for the
-  // slice: the flag is plumbed, and it governs nothing.
+  // backends and reach the same outcome when the story carries no complexity:<tier>
+  // — #62 right-sizes a ticket only when the ticket says how big it is.
   const mkRepo = (profile) => {
     const target = makeTarget(profile);
     const g = (...a) => spawnSync("git", ["-C", target, ...a], { encoding: "utf-8" });
@@ -447,7 +447,8 @@ console.log("9) --efficiency is recognized but dispatch/selection is UNCHANGED")
     check(a.status === 0 && /READY_FOR_HUMAN_REVIEW/.test(aOut), "baseline run reaches READY");
     check(/efficiency mode: recognized/.test(bOut), "--efficiency is recognized by the loop");
     check(/is VALID/.test(bOut), "the opt-in run boot-validates the profile");
-    check(/INERT in this slice/.test(bOut), "the opt-in run states the profile is inert");
+    check(/carries no complexity:<tier> label\/field/.test(bOut),
+      "the opt-in run says loudly why it could not right-size this story");
     check(!/efficiency/i.test(aOut), "without the opt-in nothing about efficiency is printed");
     check(selection(aOut) !== "" && selection(aOut) === selection(bOut),
       "builder/reviewer selection is identical with and without --efficiency");

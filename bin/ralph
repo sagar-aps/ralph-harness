@@ -461,11 +461,16 @@ Status options (ralph status):
                                       READY_FOR_HUMAN_REVIEW, 2 otherwise, 124 on timeout.
                                       Tunable: RALPH_WATCH_INTERVAL_MS (15000), RALPH_WATCH_TIMEOUT_MS (6h)
 
-Efficiency mode (opt-in; GOVERNS NOTHING in this slice — #54 step 4c wires selection):
-  --efficiency                        Recognize the efficiency profile (also RALPH_EFFICIENCY=1).
-                                      Boot-validates <repo>/.agents/ralph/efficiency.json; an
-                                      invalid profile is rejected to inert/off with a loud warning
-                                      and the normal --builder/--reviewer path is unaffected.
+Efficiency mode (opt-in, DEFAULT OFF — without --efficiency dispatch is unchanged):
+  --efficiency                        Right-size each ticket from the efficiency profile (also
+                                      RALPH_EFFICIENCY=1). Boot-validates
+                                      <repo>/.agents/ralph/efficiency.json, then picks the rung
+                                      (builder+reviewer) for each ticket carrying a
+                                      complexity:<tier> label/PRD field, overriding
+                                      --builder/--reviewer for that ticket only. A ticket with no
+                                      tier, or an invalid/missing profile, is inert (loud warning,
+                                      normal --builder/--reviewer path). No eligible rung => a
+                                      bounded, clean pause (EFFICIENCY_PAUSED, exit 5).
   --efficiency-profile <path>         Profile path (also RALPH_EFFICIENCY_PROFILE).
                                       On explain, plain --profile means this path too.
   --complexity <level>                explain: trivial | small | medium | large
@@ -828,8 +833,8 @@ async function main() {
     // Normalized agent selection (#4): CLI flags override env; env already passes
     // through via {...process.env}. The loop composes ralph-build/ralph-review.
     if (review.profile) env.RALPH_PROFILE = review.profile;
-    // Efficiency mode (#59): opt-in flag only — the loop boot-validates the profile
-    // and reports it, but selection/dispatch is unchanged in this slice.
+    // Efficiency mode (#59/#62): opt-in flag only. The loop boot-validates the profile
+    // and, per ticket, may override BUILDER/REVIEWER from it. Unset => unchanged dispatch.
     if (review.efficiency) env.RALPH_EFFICIENCY = "1";
     if (review.efficiencyProfile) {
       env.RALPH_EFFICIENCY_PROFILE = path.resolve(cwd, review.efficiencyProfile);
@@ -887,8 +892,8 @@ async function main() {
     // Normalized agent selection (#4): CLI flags override env; env already passes
     // through via {...process.env}. The loop composes ralph-build/ralph-review.
     if (review.profile) env.RALPH_PROFILE = review.profile;
-    // Efficiency mode (#59): opt-in flag only — the loop boot-validates the profile
-    // and reports it, but selection/dispatch is unchanged in this slice.
+    // Efficiency mode (#59/#62): opt-in flag only. The loop boot-validates the profile
+    // and, per ticket, may override BUILDER/REVIEWER from it. Unset => unchanged dispatch.
     if (review.efficiency) env.RALPH_EFFICIENCY = "1";
     if (review.efficiencyProfile) {
       env.RALPH_EFFICIENCY_PROFILE = path.resolve(cwd, review.efficiencyProfile);
@@ -1612,8 +1617,8 @@ async function main() {
 
   // `explain` (#59): read-only. Parses the efficiency profile and prints, for one
   // complexity tier, the allowed rungs, each pool's eligibility, and the rung that
-  // WOULD be chosen. It dispatches nothing and changes no selection — efficiency
-  // mode governs nothing in this slice.
+  // WOULD be chosen. It dispatches nothing and changes no selection of its own —
+  // only a run started with --efficiency applies the same decision (#62).
   if (cmd === "explain") {
     const targetRepo = review.repo || process.env.TARGET_REPO || process.cwd();
     const repo = path.resolve(process.cwd(), targetRepo);

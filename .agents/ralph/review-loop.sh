@@ -138,17 +138,23 @@ REVIEWER_RESOLVED_MODEL="${REVIEWER_RESOLVED_MODEL:-unknown}"
 [[ -f "$BUILDER_PROMPT" ]] || die "Builder prompt not found: $BUILDER_PROMPT"
 [[ -f "$REVIEWER_PROMPT" ]] || die "Reviewer prompt not found: $REVIEWER_PROMPT"
 
-# ---- Efficiency mode (#59) — opt-in, GOVERNS NOTHING in this slice ----------
-# --efficiency / RALPH_EFFICIENCY only boot-validates the declarative profile and
-# reports its state. The selection resolved above is untouched: a missing or
+# ---- Efficiency mode (#59/#62) — opt-in; OFF leaves dispatch untouched ------
+# --efficiency / RALPH_EFFICIENCY boot-validates the declarative profile here; the
+# per-ticket rung is chosen further down, once the story (and its complexity) is
+# known. The selection resolved above stands unless that happens: a missing or
 # rejected profile falls back to inert/off and the run proceeds on the normal
-# --builder/--reviewer path. Enforcement lands in a later slice (#54 step 4c).
+# --builder/--reviewer path. Without the opt-in none of this runs at all.
 if declare -F ralph_efficiency_enabled >/dev/null 2>&1 && ralph_efficiency_enabled; then
   if ralph_efficiency_boot_validate "$TARGET_REPO"; then
-    echo "efficiency mode: recognized, profile parsed — INERT in this slice (selection unchanged)."
+    echo "efficiency mode: recognized, profile parsed — the story's complexity:<tier> decides the rung."
   else
     echo "efficiency mode: recognized but INERT (selection unchanged)."
   fi
+else
+  # Not opted in. Drop any decision inherited from a parent ralph process so this run
+  # cannot be reported as governed by a rung it never used.
+  unset RALPH_EFFICIENCY_DISPATCH_STATE RALPH_EFFICIENCY_DISPATCH_NOTE \
+        RALPH_EFFICIENCY_DISPATCH_TICKET RALPH_EFFICIENCY_DISPATCH_COMPLEXITY
 fi
 
 # ---- Discover PRD -----------------------------------------------------------
@@ -244,6 +250,28 @@ if not isinstance(chosen, dict):
     Path(block_out).write_text("")
     sys.exit(0)
 
+def complexity_of(story):
+    """The story's complexity tier, from a `complexity` field or a complexity: label.
+
+    Read unconditionally so the meta file always describes the story; it only
+    influences anything when the operator opted into efficiency mode (#62).
+    """
+    tiers = ("trivial", "small", "medium", "large")
+    candidates = []
+    raw = story.get("complexity")
+    if isinstance(raw, str):
+        candidates.append(raw)
+    labels = story.get("labels")
+    if isinstance(labels, list):
+        candidates.extend([l for l in labels if isinstance(l, str)])
+    for candidate in candidates:
+        value = candidate.strip().lower()
+        if value.startswith("complexity:"):
+            value = value.split(":", 1)[1].strip()
+        if value in tiers:
+            return value
+    return ""
+
 acceptance = chosen.get("acceptanceCriteria") or []
 desc = chosen.get("description") or ""
 gates = data.get("qualityGates") or []
@@ -264,6 +292,7 @@ Path(meta_out).write_text(json.dumps({
     "ok": True,
     "id": chosen.get("id", ""),
     "title": chosen.get("title", ""),
+    "complexity": complexity_of(chosen),
 }) + "\n")
 PY
 
@@ -274,6 +303,86 @@ if [[ "$STORY_OK" != "True" ]]; then
 fi
 STORY_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("id",""))' "$STORY_META")"
 STORY_TITLE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("title",""))' "$STORY_META")"
+STORY_COMPLEXITY="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("complexity",""))' "$STORY_META")"
+
+# ---- Efficiency mode (#62) — per-ticket rung, opt-in only -------------------
+# THIS is the only place `ralph review` can change who runs, and it is unreachable
+# without --efficiency / RALPH_EFFICIENCY: ralph_efficiency_dispatch_select returns
+# INERT immediately when the mode is off, when the profile was not accepted at boot,
+# or when the story carries no complexity:<tier>. On INERT the backends resolved
+# above stand untouched. Placed here because it needs the story's complexity, and
+# before the worktree so a PAUSE costs nothing to unwind.
+EFFICIENCY_RC=4
+if declare -F ralph_efficiency_dispatch_select >/dev/null 2>&1; then
+  EFFICIENCY_RC=0
+  ralph_efficiency_dispatch_select "$STORY_COMPLEXITY" "$TARGET_REPO" \
+    "story ${STORY_ID:-?}" || EFFICIENCY_RC=$?
+  # Recorded whatever the decision was — an INERT fallback is exactly the thing an
+  # operator who turned the mode ON needs to see afterwards. No-op when it is off.
+  ralph_efficiency_dispatch_record "$RUN_DIR"
+fi
+if [[ "$EFFICIENCY_RC" -eq 3 ]]; then
+  # Bounded PAUSE (#61), handled #29-style: stop CLEANLY. Nothing has been dispatched
+  # yet — no worktree, no branch, no agent — so there is no usage to flush and nothing
+  # to unwind; publish the reason + the bounded retry time, keep the run artifacts, and
+  # exit on a terminal status of its own rather than crashing or failing the story.
+  {
+    echo "# Efficiency PAUSE — no eligible rung for ${STORY_ID:-?}"
+    echo ""
+    echo "- Run ID: $RUN_ID"
+    echo "- Target repo: $TARGET_REPO"
+    echo "- Story: ${STORY_ID:-?}: ${STORY_TITLE:-} (complexity: $STORY_COMPLEXITY)"
+    echo "- Profile: ${RALPH_EFFICIENCY_SELECT_PROFILE:-$RALPH_EFFICIENCY_PROFILE_PATH}"
+    echo "- Reason: $RALPH_EFFICIENCY_SELECT_REASON"
+    echo "- Retry after: ${RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL:-unknown} (${RALPH_EFFICIENCY_SELECT_PAUSE_SECONDS:-?}s)"
+    echo ""
+    echo "Nothing was dispatched: no worktree, no branch, no agent ran, and the target"
+    echo "repo is untouched. Re-run the same command after the retry time, or dispatch"
+    echo "without --efficiency to use the normal --builder/--reviewer path."
+  } > "$RUN_DIR/efficiency-pause.md"
+  {
+    echo "RUN_ID=$RUN_ID"; echo "STATUS=EFFICIENCY_PAUSED"; echo "BRANCH="
+    echo "WORKTREE="; echo "BASE_COMMIT=$(git -C "$TARGET_REPO" rev-parse HEAD 2>/dev/null)"
+    echo "PREVIEW_URL="; echo "ARTIFACTS_DIR=$RUN_DIR"; echo "TARGET_REPO=$TARGET_REPO"
+    echo "EFFICIENCY_COMPLEXITY=$STORY_COMPLEXITY"
+    echo "EFFICIENCY_PAUSE_UNTIL=${RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL:-}"
+  } > "$TARGET_REPO/.ralph/last-run.env"
+  echo ""
+  echo "  ⏸ EFFICIENCY_PAUSED — $RALPH_EFFICIENCY_SELECT_REASON"
+  echo "  Artifacts preserved: $RUN_DIR (see efficiency-pause.md); nothing was dispatched."
+  exit 5
+fi
+if [[ "$EFFICIENCY_RC" -eq 0 ]]; then
+  # The rung OWNS both roles now, so re-derive everything downstream reports from it:
+  # a --builder-provider/--builder-model pin aimed at the old backend would misattribute
+  # this run, and the pool is what the #28 quota circuit keys on.
+  BUILDER="$RALPH_EFFICIENCY_SELECT_BUILDER"
+  REVIEWER="$RALPH_EFFICIENCY_SELECT_REVIEWER"
+  BUILDER_CMD="$(resolve_backend_cmd "$BUILDER")"
+  REVIEWER_CMD="$(resolve_backend_cmd "$REVIEWER")"
+  [[ -n "$BUILDER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown builder backend: $BUILDER"
+  [[ -n "$REVIEWER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown reviewer backend: $REVIEWER"
+  BUILDER_PROVIDER=""; REVIEWER_PROVIDER=""; BUILDER_MODEL=""; REVIEWER_MODEL=""
+  BUILDER_RESOLVED_PROVIDER="$BUILDER"
+  REVIEWER_RESOLVED_PROVIDER="$REVIEWER"
+  BUILDER_RESOLVED_MODEL="$(ralph_command_model_values "$BUILDER_CMD" | head -n1)"
+  REVIEWER_RESOLVED_MODEL="$(ralph_command_model_values "$REVIEWER_CMD" | head -n1)"
+  BUILDER_RESOLVED_MODEL="${BUILDER_RESOLVED_MODEL:-unknown}"
+  REVIEWER_RESOLVED_MODEL="${REVIEWER_RESOLVED_MODEL:-unknown}"
+  RALPH_BUILDER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_BUILDER_POOL"
+  RALPH_REVIEWER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_REVIEWER_POOL"
+  export RALPH_BUILDER_CREDENTIAL_POOL RALPH_REVIEWER_CREDENTIAL_POOL
+  require_backend "builder ($BUILDER)" "$BUILDER_CMD"
+  require_backend "reviewer ($REVIEWER)" "$REVIEWER_CMD"
+  echo "  $(ralph_efficiency_dispatch_summary)"
+fi
+# Empty unless efficiency mode did something, so every consumer below (config
+# snapshot, final status, last-run.env, banner) can print it unconditionally and
+# the default path keeps exactly the output it has today.
+EFFICIENCY_SUMMARY=""
+if declare -F ralph_efficiency_dispatch_summary >/dev/null 2>&1; then
+  EFFICIENCY_SUMMARY="$(ralph_efficiency_dispatch_summary)"
+fi
 
 # ---- Branch / worktree isolation -------------------------------------------
 SAFE_STORY="$(printf '%s' "${STORY_ID:-task}" | tr -c 'A-Za-z0-9._-' '-')"
@@ -426,6 +535,12 @@ write_last_run() {
     echo "REVIEWER=$REVIEWER"
     echo "REVIEWER_PROVIDER=$REVIEWER_RESOLVED_PROVIDER"
     echo "REVIEWER_MODEL=$REVIEWER_RESOLVED_MODEL"
+    if [[ -n "$EFFICIENCY_SUMMARY" ]]; then
+      ralph_env_assignment EFFICIENCY_STATE "${RALPH_EFFICIENCY_DISPATCH_STATE:-}"
+      ralph_env_assignment EFFICIENCY_COMPLEXITY "${RALPH_EFFICIENCY_DISPATCH_COMPLEXITY:-}"
+      ralph_env_assignment EFFICIENCY_RUNG "${RALPH_EFFICIENCY_SELECT_RUNG:-}"
+      ralph_env_assignment EFFICIENCY_REASON "${RALPH_EFFICIENCY_SELECT_REASON:-}"
+    fi
     ralph_env_assignment PROVIDER_QUOTA_PROVIDER "${RALPH_QUOTA_PROVIDER:-}"
     ralph_env_assignment PROVIDER_QUOTA_CREDENTIAL_POOL "${RALPH_QUOTA_CREDENTIAL_POOL:-}"
     ralph_env_assignment PROVIDER_QUOTA_SCOPE "${RALPH_QUOTA_SCOPE:-}"
@@ -448,6 +563,7 @@ write_final_status() {
     echo "- Story: ${STORY_ID:-?}: ${STORY_TITLE:-}"
     echo "- Builder backend: $BUILDER (provider: $BUILDER_RESOLVED_PROVIDER, model: $BUILDER_RESOLVED_MODEL)"
     echo "- Reviewer backend: $REVIEWER (provider: $REVIEWER_RESOLVED_PROVIDER, model: $REVIEWER_RESOLVED_MODEL)"
+    [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "- $EFFICIENCY_SUMMARY"
     echo "- Iterations run: $iters of $MAX_ITERATIONS"
     echo "- Check command: $CHECK_CMD"
     echo "- Preview enabled: $PREVIEW_ENABLED"
@@ -483,6 +599,7 @@ write_final_status() {
   echo "REVIEWER=$REVIEWER  CMD=$REVIEWER_CMD"
   echo "REVIEWER_PROVIDER=$REVIEWER_RESOLVED_PROVIDER"
   echo "REVIEWER_MODEL=$REVIEWER_RESOLVED_MODEL"
+  [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "EFFICIENCY=$EFFICIENCY_SUMMARY"
   echo "MAX_ITERATIONS=$MAX_ITERATIONS"
   echo "CHECK_CMD=$CHECK_CMD"
   echo "USE_WORKTREE=$USE_WORKTREE"
@@ -687,6 +804,7 @@ echo "════════════════════════�
 if [[ "$OUTCOME" == "READY_FOR_HUMAN_REVIEW" ]]; then
   echo "  ✅ READY_FOR_HUMAN_REVIEW (after $ITERS_RUN iteration(s))"
   echo "  Agents: builder=$BUILDER (provider=$BUILDER_RESOLVED_PROVIDER, model=$BUILDER_RESOLVED_MODEL); reviewer=$REVIEWER (provider=$REVIEWER_RESOLVED_PROVIDER, model=$REVIEWER_RESOLVED_MODEL)"
+  [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "  $EFFICIENCY_SUMMARY"
 elif [[ "$OUTCOME" == "BUILDER_UNAVAILABLE" ]]; then
   echo "  ❌ BUILDER_UNAVAILABLE — builder backend '$BUILDER' failed (exit ${BUILDER_RC:-?}); halted after $ITERS_RUN iteration(s)."
 elif [[ "$OUTCOME" == "PROVIDER_QUOTA_EXHAUSTED" ]]; then

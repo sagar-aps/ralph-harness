@@ -62,10 +62,12 @@
 # Efficiency mode (opt-in) — RALPH_EFFICIENCY / RALPH_EFFICIENCY_PROFILE
 # ---------------------------------------------------------------------------
 # RALPH_EFFICIENCY=1 (or --efficiency) makes review/batch boot-validate the
-# declarative efficiency profile and report its state. It GOVERNS NOTHING in this
-# slice: builder/reviewer selection and dispatch are unchanged, and no reserve is
-# enforced. An invalid profile is rejected to inert/off with a loud warning; it
-# never fails a run.
+# declarative efficiency profile and then right-size each ticket from it: a ticket
+# carrying a complexity:<tier> label/PRD field gets the profile rung's builder and
+# reviewer instead of the ones resolved here. DEFAULT OFF: without the opt-in,
+# dispatch is exactly the --builder/--reviewer path below, unchanged. A ticket with
+# no tier, or an invalid/missing profile, is inert (loud warning, normal dispatch);
+# no eligible rung is a bounded clean pause (EFFICIENCY_PAUSED). It never crashes.
 #
 # The profile is operator policy and is gitignored (like config.local.sh). Copy
 # efficiency.json.example to efficiency.json to configure one, or point elsewhere:

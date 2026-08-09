@@ -299,17 +299,93 @@ require_backend() {
 require_backend "builder ($BUILDER)" "$BUILDER_CMD"
 require_backend "reviewer ($REVIEWER)" "$REVIEWER_CMD"
 
-# ---- Efficiency mode (#59) — opt-in, GOVERNS NOTHING in this slice ----------
-# --efficiency / RALPH_EFFICIENCY only boot-validates the declarative profile and
-# reports its state. The selection resolved above is untouched: a missing or
-# rejected profile falls back to inert/off and the batch proceeds on the normal
-# --builder/--reviewer path. Enforcement lands in a later slice (#54 step 4c).
+# The operator-resolved selection, kept so a per-task efficiency rung (#62) can be
+# applied to ONE task and then undone before the next one. Nothing reads these
+# unless efficiency mode is on.
+BASE_BUILDER="$BUILDER"; BASE_REVIEWER="$REVIEWER"
+BASE_BUILDER_CMD="$BUILDER_CMD"; BASE_REVIEWER_CMD="$REVIEWER_CMD"
+BASE_BUILDER_PROVIDER="${BUILDER_PROVIDER:-}"; BASE_REVIEWER_PROVIDER="${REVIEWER_PROVIDER:-}"
+BASE_BUILDER_MODEL="${BUILDER_MODEL:-}"; BASE_REVIEWER_MODEL="${REVIEWER_MODEL:-}"
+BASE_BUILDER_REQUESTED_MODEL="$BUILDER_REQUESTED_MODEL"
+BASE_REVIEWER_REQUESTED_MODEL="$REVIEWER_REQUESTED_MODEL"
+BASE_BUILDER_RESOLVED_PROVIDER="$BUILDER_RESOLVED_PROVIDER"
+BASE_REVIEWER_RESOLVED_PROVIDER="$REVIEWER_RESOLVED_PROVIDER"
+BASE_BUILDER_RESOLVED_MODEL="$BUILDER_RESOLVED_MODEL"
+BASE_REVIEWER_RESOLVED_MODEL="$REVIEWER_RESOLVED_MODEL"
+BASE_BUILDER_POOL="${RALPH_BUILDER_CREDENTIAL_POOL:-}"
+BASE_REVIEWER_POOL="${RALPH_REVIEWER_CREDENTIAL_POOL:-}"
+
+# Put the operator's own selection back (start of every task under efficiency mode,
+# so one task's rung never leaks into the next).
+efficiency_restore_defaults() {
+  BUILDER="$BASE_BUILDER"; REVIEWER="$BASE_REVIEWER"
+  BUILDER_CMD="$BASE_BUILDER_CMD"; REVIEWER_CMD="$BASE_REVIEWER_CMD"
+  BUILDER_PROVIDER="$BASE_BUILDER_PROVIDER"; REVIEWER_PROVIDER="$BASE_REVIEWER_PROVIDER"
+  BUILDER_MODEL="$BASE_BUILDER_MODEL"; REVIEWER_MODEL="$BASE_REVIEWER_MODEL"
+  BUILDER_REQUESTED_MODEL="$BASE_BUILDER_REQUESTED_MODEL"
+  REVIEWER_REQUESTED_MODEL="$BASE_REVIEWER_REQUESTED_MODEL"
+  BUILDER_RESOLVED_PROVIDER="$BASE_BUILDER_RESOLVED_PROVIDER"
+  REVIEWER_RESOLVED_PROVIDER="$BASE_REVIEWER_RESOLVED_PROVIDER"
+  BUILDER_RESOLVED_MODEL="$BASE_BUILDER_RESOLVED_MODEL"
+  REVIEWER_RESOLVED_MODEL="$BASE_REVIEWER_RESOLVED_MODEL"
+  RALPH_BUILDER_CREDENTIAL_POOL="$BASE_BUILDER_POOL"
+  RALPH_REVIEWER_CREDENTIAL_POOL="$BASE_REVIEWER_POOL"
+  export RALPH_BUILDER_CREDENTIAL_POOL RALPH_REVIEWER_CREDENTIAL_POOL
+}
+
+# Hand both roles to the rung ralph_efficiency_select picked, resolving its commands
+# exactly the way the boot path does (auto-approve stripping, read-only reviewer,
+# usage JSON flag) so a rung-dispatched task is instrumented like any other. The
+# provider/model pins are cleared: they were aimed at the backend the rung replaced,
+# and reporting them here would misattribute the run.
+efficiency_apply_rung() {
+  BUILDER="$RALPH_EFFICIENCY_SELECT_BUILDER"
+  REVIEWER="$RALPH_EFFICIENCY_SELECT_REVIEWER"
+  BUILDER_CMD="$(builder_cmd_for "$BUILDER")"
+  REVIEWER_CMD="$(reviewer_cmd_for "$REVIEWER")"
+  [[ -n "$BUILDER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown builder backend: $BUILDER"
+  [[ -n "$REVIEWER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown reviewer backend: $REVIEWER"
+  if declare -F add_json_flag >/dev/null 2>&1; then
+    BUILDER_CMD="$(add_json_flag "$BUILDER_CMD" "$BUILDER")"
+    REVIEWER_CMD="$(add_json_flag "$REVIEWER_CMD" "$REVIEWER")"
+  fi
+  BUILDER_PROVIDER=""; REVIEWER_PROVIDER=""; BUILDER_MODEL=""; REVIEWER_MODEL=""
+  BUILDER_REQUESTED_MODEL="$(ralph_command_model_values "$BUILDER_CMD" | head -n1)"
+  REVIEWER_REQUESTED_MODEL="$(ralph_command_model_values "$REVIEWER_CMD" | head -n1)"
+  BUILDER_REQUESTED_MODEL="${BUILDER_REQUESTED_MODEL:-default}"
+  REVIEWER_REQUESTED_MODEL="${REVIEWER_REQUESTED_MODEL:-default}"
+  BUILDER_RESOLVED_PROVIDER="$BUILDER"; REVIEWER_RESOLVED_PROVIDER="$REVIEWER"
+  BUILDER_RESOLVED_MODEL="$BUILDER_REQUESTED_MODEL"
+  REVIEWER_RESOLVED_MODEL="$REVIEWER_REQUESTED_MODEL"
+  if [[ "$BUILDER_RESOLVED_MODEL" == "default" ]]; then BUILDER_RESOLVED_MODEL="unknown"; fi
+  if [[ "$REVIEWER_RESOLVED_MODEL" == "default" ]]; then REVIEWER_RESOLVED_MODEL="unknown"; fi
+  RALPH_BUILDER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_BUILDER_POOL"
+  RALPH_REVIEWER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_REVIEWER_POOL"
+  export RALPH_BUILDER_CREDENTIAL_POOL RALPH_REVIEWER_CREDENTIAL_POOL
+  require_backend "builder ($BUILDER)" "$BUILDER_CMD"
+  require_backend "reviewer ($REVIEWER)" "$REVIEWER_CMD"
+}
+
+# ---- Efficiency mode (#59/#62) — opt-in; OFF leaves dispatch untouched ------
+# --efficiency / RALPH_EFFICIENCY boot-validates the declarative profile here; each
+# task's own rung is chosen in the task loop, from its complexity:<tier>. The
+# selection resolved above stands unless that happens: a missing or rejected profile
+# falls back to inert/off and the batch proceeds on the normal --builder/--reviewer
+# path. Without the opt-in none of this runs at all.
+EFFICIENCY_ON="false"
 if declare -F ralph_efficiency_enabled >/dev/null 2>&1 && ralph_efficiency_enabled; then
+  EFFICIENCY_ON="true"
   if ralph_efficiency_boot_validate "$TARGET_REPO"; then
-    echo "efficiency mode: recognized, profile parsed — INERT in this slice (selection unchanged)."
+    echo "efficiency mode: recognized, profile parsed — each task's complexity:<tier> decides its rung."
   else
     echo "efficiency mode: recognized but INERT (selection unchanged)."
   fi
+else
+  # Not opted in. Drop any decision inherited from a parent ralph process so this
+  # run cannot be reported (in the ledger, the report or last-run.env) as governed
+  # by a rung it never used.
+  unset RALPH_EFFICIENCY_DISPATCH_STATE RALPH_EFFICIENCY_DISPATCH_NOTE \
+        RALPH_EFFICIENCY_DISPATCH_TICKET RALPH_EFFICIENCY_DISPATCH_COMPLEXITY
 fi
 
 # ---- Dirty check (ignore harness bookkeeping) ------------------------------
@@ -942,6 +1018,13 @@ write_last_run() {
     echo "ORCHESTRATOR_BUDGET_THRESHOLD_TOKENS=${RALPH_BUDGET_THRESHOLD_TOKENS:-}"
     echo "ORCHESTRATOR_BUDGET_OBSERVED_TOKENS=${RALPH_BUDGET_OBSERVED_TOKENS:-0}"
     echo "ORCHESTRATOR_BUDGET_UNKNOWN_ROUNDS=${RALPH_BUDGET_UNKNOWN_ROUNDS:-0}"
+    if [[ -n "${EFFICIENCY_SUMMARY:-}" ]]; then
+      ralph_env_assignment EFFICIENCY_STATE "${RALPH_EFFICIENCY_DISPATCH_STATE:-}"
+      ralph_env_assignment EFFICIENCY_COMPLEXITY "${RALPH_EFFICIENCY_DISPATCH_COMPLEXITY:-}"
+      ralph_env_assignment EFFICIENCY_RUNG "${RALPH_EFFICIENCY_SELECT_RUNG:-}"
+      ralph_env_assignment EFFICIENCY_REASON "${RALPH_EFFICIENCY_SELECT_REASON:-}"
+      ralph_env_assignment EFFICIENCY_PAUSE_UNTIL "${RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL:-}"
+    fi
     ralph_env_assignment PROVIDER_QUOTA_PROVIDER "${RALPH_QUOTA_PROVIDER:-}"
     ralph_env_assignment PROVIDER_QUOTA_CREDENTIAL_POOL "${RALPH_QUOTA_CREDENTIAL_POOL:-}"
     ralph_env_assignment PROVIDER_QUOTA_SCOPE "${RALPH_QUOTA_SCOPE:-}"
@@ -1022,6 +1105,9 @@ echo "  plan:          $PLAN"
 echo "  tasks:         $TASK_RUN_COUNT of $TASK_TOTAL discovered"
 echo "  builder:       $BUILDER   -> $BUILDER_CMD"
 echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
+if [[ "$EFFICIENCY_ON" == "true" ]]; then
+  echo "  efficiency:    ON (${RALPH_EFFICIENCY_STATE:-unknown} profile) — a task with a complexity:<tier> overrides the two lines above"
+fi
 echo "  check:         $CHECK_CMD"
 echo "  verify:        ${VERIFY_CMD:-(none)}"
 if [[ "$PRIMER_STATUS" == "deliberate-opt-out" ]]; then
@@ -1063,6 +1149,9 @@ QUOTA_ROLE=""
 AGENT_ERROR_EXIT=""
 HALTED_TASK=""
 BUDGET_REACHED="false"
+EFFICIENCY_PAUSED="false"   # #62: a bounded PAUSE from ralph_efficiency_select
+EFFICIENCY_PAUSED_TASK=""
+EFFICIENCY_SUMMARY=""       # per-task line for the result file / report (empty when off)
 RALPH_BUDGET_CONFIGURED="false"; RALPH_BUDGET_REACHED="false"
 RALPH_BUDGET_TOKENS="${RALPH_ORCHESTRATOR_BUDGET_TOKENS:-}"
 RALPH_BUDGET_STOP_PCT="${RALPH_ORCHESTRATOR_STOP_PCT:-100}"
@@ -1100,6 +1189,33 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
 
   echo ""
   echo "── Task $IDX/$TASK_TOTAL: $TITLE  (up to $MAX_ITERATIONS attempt(s)) ──"
+
+  # Per-task efficiency rung (#62) — opt-in only. With the mode off this block never
+  # executes, so dispatch below is exactly today's --builder/--reviewer path. With it
+  # on, the task's own complexity:<tier> picks the rung; anything unusable (no tier,
+  # no valid profile) is INERT and leaves the operator's selection alone.
+  if [[ "$EFFICIENCY_ON" == "true" ]]; then
+    efficiency_restore_defaults   # one task's rung must never leak into the next
+    TASK_COMPLEXITY="$(ralph_efficiency_complexity_from_text "$(cat "$TASK_FILE")")"
+    EFFICIENCY_RC=0
+    ralph_efficiency_dispatch_select "$TASK_COMPLEXITY" "$TARGET_REPO" "task $IDX" \
+      || EFFICIENCY_RC=$?
+    ralph_efficiency_dispatch_record "$RUN_DIR"
+    EFFICIENCY_SUMMARY="$(ralph_efficiency_dispatch_summary)"
+    if [[ "$EFFICIENCY_RC" -eq 3 ]]; then
+      # Bounded PAUSE (#61) handled #29-style: this task was never dispatched, so
+      # un-count the attempt and stop the batch CLEANLY. Everything already earned —
+      # committed tasks, their usage lines, the artifacts — stays exactly as it is.
+      ATTEMPTED=$((ATTEMPTED - 1))
+      EFFICIENCY_PAUSED="true"; EFFICIENCY_PAUSED_TASK="$IDX"
+      echo "    ⏸ efficiency PAUSE before dispatch — $RALPH_EFFICIENCY_SELECT_REASON"
+      break
+    fi
+    if [[ "$EFFICIENCY_RC" -eq 0 ]]; then
+      efficiency_apply_rung
+      echo "    $EFFICIENCY_SUMMARY"
+    fi
+  fi
 
   HANDOFF_PATH="$WORKDIR/.agent-handoff.md"
   RESULT_FILE="$RUN_DIR/task-$IDX-result.md"
@@ -1298,6 +1414,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     [[ -n "$VERIFY_CMD" ]] && echo "- Verify exit: ${VERIFY_STATUS:-not reached}"
     echo "- Reviewer verdict: $VERDICT"
     echo "- PR provenance (paste into the PR): builder: $BUILDER (provider: $BUILDER_RESOLVED_PROVIDER, model: $BUILDER_RESOLVED_MODEL), reviewer: $REVIEWER (provider: $REVIEWER_RESOLVED_PROVIDER, model: $REVIEWER_RESOLVED_MODEL), iterations: $ITERS_USED"
+    [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "- $EFFICIENCY_SUMMARY"
     echo "- Commit: $HEAD_BEFORE -> $HEAD_AFTER"
     echo ""
     echo "## Files changed"
@@ -1338,7 +1455,8 @@ done 3< "$MANIFEST"
 # URL (same scripts as `ralph review`). Left running for review; `ralph cleanup`
 # stops it via the preview-down script.
 PREVIEW_RAN="false"; PREVIEW_UP_OK=""; E2E_OK=""
-if [[ "$PREVIEW_ENABLED" == "true" && -z "$AGENT_ERROR_ROLE" && "$BUDGET_REACHED" != "true" ]]; then
+if [[ "$PREVIEW_ENABLED" == "true" && -z "$AGENT_ERROR_ROLE" && "$BUDGET_REACHED" != "true" \
+      && "$EFFICIENCY_PAUSED" != "true" ]]; then
   PREVIEW_RAN="true"
   echo ""
   echo "── End-of-batch preview ──────────────────────"
@@ -1370,6 +1488,10 @@ if [[ -n "$AGENT_ERROR_ROLE" ]]; then
   if [[ -n "$QUOTA_ROLE" ]]; then OUTCOME="PROVIDER_QUOTA_EXHAUSTED"
   elif [[ "$AGENT_ERROR_ROLE" == "reviewer" ]]; then OUTCOME="REVIEWER_UNAVAILABLE"
   else OUTCOME="BUILDER_UNAVAILABLE"; fi
+elif [[ "$EFFICIENCY_PAUSED" == "true" ]]; then
+  # Not a failure and not a quota wall: efficiency mode found no eligible rung, so the
+  # batch stopped before dispatching the next task. Its own terminal status (#62).
+  OUTCOME="EFFICIENCY_PAUSED"
 elif [[ "$BUDGET_REACHED" == "true" ]]; then
   OUTCOME="ORCHESTRATOR_BUDGET_REACHED"
 elif [[ "$STOPPED_EARLY" == "true" ]]; then
@@ -1417,8 +1539,23 @@ REPORT="$RUN_DIR/final-report.md"
     echo "- Preview: skipped (batch halted on $AGENT_ERROR_ROLE error)"
   elif [[ "$BUDGET_REACHED" == "true" ]]; then
     echo "- Preview: skipped (orchestrator budget reached)"
+  elif [[ "$EFFICIENCY_PAUSED" == "true" ]]; then
+    echo "- Preview: skipped (efficiency pause)"
   else
     echo "- Preview: disabled"
+  fi
+  if [[ "$EFFICIENCY_PAUSED" == "true" ]]; then
+    echo ""
+    echo "## ⏸ Efficiency pause"
+    echo ""
+    echo "- Paused before dispatching task $EFFICIENCY_PAUSED_TASK (complexity: ${RALPH_EFFICIENCY_DISPATCH_COMPLEXITY:-unknown})"
+    echo "- Reason: ${RALPH_EFFICIENCY_SELECT_REASON:-no reason reported}"
+    echo "- Retry after: ${RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL:-unknown} (${RALPH_EFFICIENCY_SELECT_PAUSE_SECONDS:-?}s)"
+    echo "- That task was NOT dispatched; every completed task is committed and its"
+    echo "  usage line flushed. Resume after the retry time (completed tasks are skipped):"
+    echo "    ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --resume"
+  elif [[ -n "$EFFICIENCY_SUMMARY" ]]; then
+    echo "- Last task $EFFICIENCY_SUMMARY"
   fi
   if [[ -n "$PRIMER_WARNING" ]]; then
     echo ""
@@ -1558,6 +1695,15 @@ if [[ -n "$AGENT_ERROR_ROLE" ]]; then
   echo "    ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --builder $BUILDER --reviewer $REVIEWER --resume"
   echo "═══════════════════════════════════════════════════════"
   exit 4
+fi
+if [[ "$EFFICIENCY_PAUSED" == "true" ]]; then
+  echo "  ⏸ EFFICIENCY_PAUSED — $RALPH_EFFICIENCY_SELECT_REASON"
+  echo "  Task $EFFICIENCY_PAUSED_TASK was NOT dispatched. Completed tasks are committed, their"
+  echo "  usage is flushed, and every artifact is preserved in $RUN_DIR."
+  echo "  Retry after ${RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL:-the pool recovers} (completed tasks are skipped):"
+  echo "    ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --efficiency --resume"
+  echo "═══════════════════════════════════════════════════════"
+  exit 5
 fi
 if [[ "$BUDGET_REACHED" == "true" ]]; then
   echo "  ⏹ ORCHESTRATOR_BUDGET_REACHED — budget=$RALPH_BUDGET_TOKENS tokens pct=$RALPH_BUDGET_STOP_PCT observed=$RALPH_BUDGET_OBSERVED_TOKENS tokens."
