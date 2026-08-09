@@ -418,5 +418,110 @@ console.log("10) JSON output: unknown provider → cost_usd = 'unknown' string, 
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
+// ── 11) Role + pool breakout, incl. a driver entry (issue-70) ─────────
+// A ledger holding builder/reviewer rounds AND a role:driver line must report the
+// driver separately, by role and by pool — the driver is unmetered by the loop and
+// on a capped plan is often the largest consumer.
+console.log("11) Totals are broken out by role and by pool; a driver entry gets its own row");
+{
+  const target = seedLedger(makeTarget());
+  const ledger = path.join(target, ".ralph", "ledger.jsonl");
+  // 20000/1M*3.00 + 1500/1M*15.00 + 50000/1M*0.30 = 0.06 + 0.0225 + 0.015 = 0.0975
+  const driver = {
+    run_id: "run-A",
+    target,
+    round: "task-001",
+    timestamp: "2026-01-01T02:00:00Z",
+    role: "driver",
+    pool: "anthropic",
+    provider: "claude",
+    model: "claude-opus-4-5",
+    source: "log-usage",
+    tokens: { input: 20000, output: 1500, cached: 50000, total: 71500 },
+  };
+  writeFileSync(ledger, readFileSync(ledger, "utf-8") + JSON.stringify(driver) + "\n");
+  try {
+    const r = ralph(["report", "--repo", target]);
+    const out = `${r.stdout}`;
+    check(r.status === 0, `report with a driver entry exits 0 (got ${r.status})`);
+
+    const roleBlock = out.slice(out.indexOf("by role:"), out.indexOf("by pool:"));
+    check(/by role:/.test(out), "human output has a 'by role' section");
+    check(/driver:\s*1 line\(s\), tokens 71500, cost \$0\.097500/.test(roleBlock),
+      "by role: driver row shows its own tokens + cost");
+    check(/pool anthropic: 1 line\(s\), tokens 71500/.test(roleBlock),
+      "by role: the driver row is broken out by pool (anthropic)");
+    check(/builder\+reviewer:\s*4 line\(s\), tokens 20250/.test(roleBlock),
+      "by role: the 4 builder/reviewer rounds stay in the combined role bucket");
+    check(/claude:claude-opus-4-5/.test(roleBlock), "by role: driver provider+model shown");
+
+    const poolBlock = out.slice(out.indexOf("by pool:"));
+    check(/anthropic: 1 line\(s\), tokens 71500, cost \$0\.097500 \(roles: driver\)/.test(poolBlock),
+      "by pool: anthropic pool attributed to the driver role");
+    check(/unknown: 4 line\(s\), tokens 20250/.test(poolBlock),
+      "by pool: rounds with no declared pool land in the 'unknown' pool");
+
+    // Grand totals now include the driver's tokens and cost.
+    check(/total:\s*91750\b/.test(out), "grand total tokens include the driver (20250+71500)");
+    check(/\$0\.178778/.test(out), "grand cost includes the driver (0.081278+0.097500)");
+
+    // --json carries the same two breakouts.
+    const rj = ralph(["report", "--repo", target, "--json"]);
+    check(rj.status === 0, "report --json with a driver entry exits 0");
+    const data = JSON.parse(`${rj.stdout}`);
+    const roles = data.by_role.map((x) => x.role);
+    check(roles.includes("driver"), "JSON: by_role has a driver row");
+    check(roles.includes("builder+reviewer"), "JSON: by_role has the combined round row");
+    const dr = data.by_role.find((x) => x.role === "driver");
+    check(dr && dr.entries === 1 && dr.tokens.total === 71500, "JSON: driver row totals");
+    check(dr && dr.cost_usd === 0.0975, "JSON: driver row cost_usd = 0.0975");
+    check(dr && dr.pools.length === 1 && dr.pools[0].pool === "anthropic" &&
+      dr.pools[0].tokens.total === 71500, "JSON: driver row is split by pool");
+    const pools = data.by_pool.map((x) => x.pool);
+    check(pools.includes("anthropic") && pools.includes("unknown"),
+      "JSON: by_pool lists anthropic and unknown");
+    const ap = data.by_pool.find((x) => x.pool === "anthropic");
+    check(ap && ap.roles.length === 1 && ap.roles[0] === "driver",
+      "JSON: anthropic pool roles = [driver]");
+    check(Array.isArray(data.notes) && data.notes.some((n) => /no per-role split/.test(n)),
+      "JSON: notes explain why rounds are a combined role");
+    check(data.tokens.total === 91750, "JSON: grand tokens include the driver");
+
+    // The driver entry joined its round, so per-round cost now includes it.
+    const t1 = data.tickets.find((t) => t.round === "task-001");
+    check(t1 && t1.tokens.total === 85700, "JSON: task-001 tokens include the driver pass");
+  } finally { rmSync(target, { recursive: true, force: true }); }
+}
+
+// ── 12) A pool declared by efficiency mode is used for the round ──────
+console.log("12) Rounds dispatched by efficiency mode report their builder pool");
+{
+  const target = makeTarget();
+  const line = {
+    run_id: "run-E",
+    target,
+    round: "task-001",
+    timestamp: "2026-01-01T00:00:00Z",
+    agents: {
+      builder: { provider: "claude", requested_model: "sonnet", reported_model: "unknown", model_match: "unknown", role: "builder" },
+      reviewer: { provider: "claude", requested_model: "haiku", reported_model: "unknown", model_match: "unknown", role: "reviewer" },
+    },
+    invocations: { builder_attempts: 1, reviewer_attempts: 1, quota_rejected: 0 },
+    tokens: { input: 1000, output: 200, cached: 0, total: 1200 },
+    efficiency: { state: "on", complexity: "small", rung: "cheap", builder_pool: "anthropic", reviewer_pool: "anthropic", reason: "r" },
+  };
+  writeFileSync(path.join(target, ".ralph", "ledger.jsonl"), JSON.stringify(line) + "\n");
+  try {
+    const r = ralph(["report", "--repo", target, "--json"]);
+    check(r.status === 0, "report --json exits 0");
+    const data = JSON.parse(`${r.stdout}`);
+    check(data.by_pool.length === 1 && data.by_pool[0].pool === "anthropic",
+      "the round is attributed to the pool its efficiency block names");
+    check(data.by_pool[0].roles[0] === "builder+reviewer", "…under the combined role");
+    check(!data.notes.some((n) => /different pool for the reviewer/.test(n)),
+      "no mixed-pool note when both roles drew on the same pool");
+  } finally { rmSync(target, { recursive: true, force: true }); }
+}
+
 console.log(`\nreport: ${failures ? failures + " failed" : "all passed"}`);
 process.exit(failures ? 1 : 0);

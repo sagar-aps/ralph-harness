@@ -69,6 +69,15 @@ const review = {
   // its iterations still ends at FAILED_MAX_ITERATIONS, exactly as it does today.
   autoEscalate: false,
   escalateIterations: null,
+  // log-usage (#70) — the driver/orchestrator ingestion hook. Nothing else reads
+  // these; they are forwarded verbatim to log-usage.py.
+  role: null,
+  pool: null,
+  usageJson: null,
+  model: null,
+  provider: null,
+  round: null,
+  runId: null,
 };
 
 function exists(p) {
@@ -398,7 +407,11 @@ Commands:
                                       also installs the Manager skill (.claude/skills/manager/)
   install-agent-commands [--agent X]  Install operator commands (claude|codex|copilot)
   overview                            Render a human overview from PRD JSON
-  report [--repo <target>] [--json]   Show per-ticket usage summary from .ralph/ledger.jsonl
+  report [--repo <target>] [--json]   Show per-ticket usage summary from .ralph/ledger.jsonl,
+                                      with totals broken out by role and by pool
+  log-usage --role driver --pool <p> --usage-json <f>
+                                      Append the DRIVER's own usage to .ralph/ledger.jsonl
+                                      from the JSON its CLI printed (see below)
   explain --complexity <level>        Explain which efficiency-profile rung WOULD be used
                                       for a complexity tier (trivial|small|medium|large).
                                       Read-only: dispatches nothing, changes no selection.
@@ -489,6 +502,20 @@ Efficiency mode (opt-in, DEFAULT OFF — without --efficiency dispatch is unchan
                                       RALPH_ESCALATE_ITERATIONS).
   --complexity <level>                explain: trivial | small | medium | large
   --json                              explain/report: machine-readable output
+
+log-usage options (ralph log-usage) — the driver/orchestrator ingestion hook:
+  --role driver|orchestrator          Required. builder/reviewer usage is captured
+                                      automatically by the loop and is rejected here.
+  --pool <name>                       Required. The credential pool the run drew on.
+  --usage-json <file|->               Required. The usage JSON the driver's CLI printed:
+                                      claude --output-format json, codex --json (JSONL,
+                                      final turn.completed), or a harness *.usage.json.
+  --provider <p>                      Prices the line in the report (default: the pool name)
+  --model <m>                         Model id (default: whatever the usage JSON reports)
+  --round <id>                        Attribute the pass to a ticket (default: "driver")
+  --run-id <id>                       Record the run this pass belongs to
+  --repo <path>                       Target repo (default: TARGET_REPO, else cwd)
+  --json                              Print the appended record instead of a summary
 
 Preflight options (build / review / batch / preflight):
   --no-preflight | --skip-preflight   Skip the repo-contract preflight phase
@@ -621,6 +648,13 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     "--complexity": "complexity",
     "--efficiency-profile": "efficiencyProfile",
     "--escalate-iterations": "escalateIterations",
+    "--role": "role",
+    "--pool": "pool",
+    "--usage-json": "usageJson",
+    "--model": "model",
+    "--provider": "provider",
+    "--round": "round",
+    "--run-id": "runId",
   };
   let matchedReviewFlag = false;
   for (const [flag, key] of Object.entries(reviewFlags)) {
@@ -1622,6 +1656,42 @@ async function main() {
       }
     }
     process.exit(0);
+  }
+
+  // --- log-usage (#70): the driver/orchestrator ingestion hook ----------------
+  // The builder and reviewer are metered by the loop itself. The driver — the
+  // model that reads ORCHESTRATOR.md and dispatches each round — is not, so this
+  // appends ITS usage (from the JSON its own CLI already prints) to the same
+  // ledger as role=driver|orchestrator. Validation lives in log-usage.py.
+  if (cmd === "log-usage") {
+    const targetRepo = review.repo || process.env.TARGET_REPO || process.cwd();
+    const repo = path.resolve(process.cwd(), targetRepo);
+    const logTemplateDir = exists(localDir) ? localDir : globalDir;
+    const logScript = path.join(logTemplateDir, "log-usage.py");
+    if (!exists(logScript)) {
+      console.error(`log-usage.py not found at ${logScript}`);
+      process.exit(1);
+    }
+    const pyArgs = [logScript, "--repo", repo];
+    const pass = (flag, value) => {
+      if (value) pyArgs.push(flag, value);
+    };
+    pass("--role", review.role);
+    pass("--pool", review.pool);
+    // "-" means stdin and must stay literal; anything else is a path.
+    if (review.usageJson) {
+      pyArgs.push(
+        "--usage-json",
+        review.usageJson === "-" ? "-" : path.resolve(process.cwd(), review.usageJson),
+      );
+    }
+    pass("--model", review.model);
+    pass("--provider", review.provider);
+    pass("--round", review.round);
+    pass("--run-id", review.runId);
+    if (review.reportJson) pyArgs.push("--json");
+    const result = spawnSync("python3", pyArgs, { stdio: "inherit" });
+    process.exit(result.status ?? 1);
   }
 
   if (cmd === "report") {

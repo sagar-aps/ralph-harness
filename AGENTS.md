@@ -49,6 +49,19 @@ change a flag.
   (not installed by `init-target`) — see docs/OPERATING.md §4.1 for the four pitfalls
   they exist to prevent. Operator commands: canonical set in `agent-commands/ralph/`,
   adapted per agent (claude/codex/copilot) by `ralph install-agent-commands`.
+- Usage ledger + `ralph report` (#56/#57, extended #70): `report.py` is READ-ONLY over
+  `<target>/.ralph/ledger.jsonl` and breaks grand totals out BY ROLE and BY POOL
+  (`by_role`/`by_pool` in `--json`). A round record covers builder+reviewer with ONE
+  token total (no honest per-role split), so it is reported under the combined role
+  `builder+reviewer`; a line's pool is the one it declares (`pool`, or
+  `efficiency.builder_pool` on a round) and is otherwise `unknown` — never inferred.
+  The DRIVER is metered by nothing automatically: `ralph log-usage --role
+  driver|orchestrator --pool <p> --usage-json <f|->` (`.agents/ralph/log-usage.py`)
+  appends ONE single-role line from the JSON the driver's CLI already prints (claude
+  `--output-format json`, `codex --json` final `turn.completed`, or a harness
+  `*.usage.json`). Append-only; `builder`/`reviewer` roles are refused (already
+  captured); unusable input exits 2 and writes nothing. Driver lines do NOT feed
+  efficiency-mode pool selection (which still reads builder-attributed rounds only).
 - Operator commands live in `bin/ralph`: `review`, `batch`, `preflight`, `status`,
   `integrate`, `cleanup`, `init-target`, `install-agent-commands`. Run metadata:
   `<target>/.ralph/last-run.env`; artifacts: `<target>/.ralph/runs/<run-id>/` (review)

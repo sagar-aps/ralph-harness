@@ -25,6 +25,7 @@ contract: an unset flag means the code path does not run.
 | Per-rung budget | `--escalate-iterations <n>` / `RALPH_ESCALATE_ITERATIONS` | `3` (only used when auto-escalate is on) | `review` |
 | Orchestrator token ceiling | `RALPH_ORCHESTRATOR_BUDGET_TOKENS` (+ `RALPH_ORCHESTRATOR_STOP_PCT`) | **unset = off** (stop pct `100`) | `batch` **only** |
 | Custom pricing table | `RALPH_PRICING_FILE` | ships `.agents/ralph/pricing.json` | `ralph report` |
+| Driver usage in the ledger | `ralph log-usage --role driver --pool <p> --usage-json <f>` | **nothing logs the driver automatically** | `ralph log-usage` (§11.1) |
 | Custom quota-exhaustion regex | `RALPH_QUOTA_REGEX` | built-in ERE (see §9) | `batch` |
 | Credential-pool identity | `RALPH_BUILDER_CREDENTIAL_POOL` / `RALPH_REVIEWER_CREDENTIAL_POOL` | provider name | `batch` |
 | Identity wrapper | `ralph.target.json` `identity.enabled` / `RALPH_IDENTITY_WRAPPER` / `.agents/ralph/identity.sh` | **no marker → ambient `gh`** | Manager / Orchestrator |
@@ -165,6 +166,9 @@ still wins over it. Set `RALPH_NO_LOCAL_CONFIG=1` to skip sourcing it (the test 
   Because `cmd="$(ralph_resolve_cron_driver)"` runs in a subshell, a caller that wants those
   exports must invoke it directly and redirect stdout instead. The driver is composed in
   **build (writable)** mode — unlike the reviewer it must act.
+- **Metering**: the loop meters the builder and the reviewer, **never the driver** — its own
+  context (reading `ORCHESTRATOR.md`, dispatching every round) is invisible until you record it
+  with `ralph log-usage` (§11.1), which is what makes the per-round cost complete.
 - **Composition**: independent of `BUILDER`/`REVIEWER` in both directions. Its one real
   coupling is efficiency mode: the driver's backend is mapped to a pool through the profile's
   own rungs, and that pool carries the `orchestrator_pct` reserve (§5). Point the driver at
@@ -466,13 +470,20 @@ provider usage API is called, and it writes nothing.
 
 ### `.ralph/ledger.jsonl` — the cross-run, append-only log
 
-- Written in the **target** repo. Two writers:
+- Written in the **target** repo. Three writers:
   - `round-usage.sh` — one record per completed **batch** round (timestamp, round id, per-role
     provider/model, attempt counts, `tokens.{input,output,cached,total}`, `run_id`, `target`;
     plus an `efficiency` block **only** when efficiency mode actually decided something, so a
     default run writes exactly the record it always has);
   - `efficiency.sh:ralph_efficiency_escalation_record` — an `event` record per auto-escalate
-    promotion (from/to rung, reason, iteration; no token totals).
+    promotion (from/to rung, reason, iteration; no token totals);
+  - `ralph log-usage` — one **single-role** record per driver/orchestrator pass you feed it
+    (`role`, `pool`, `model`, `provider`, `timestamp`, the same `tokens` block, `source:
+    "log-usage"`). Nothing writes these automatically; see §11.1.
+- **Two line shapes, and the difference is not cosmetic.** A round record covers builder *and*
+  reviewer with **one** token total (their sidecars are summed), so there is no honest per-role
+  split and `ralph report` reports it under the combined role `builder+reviewer`. A single-role
+  record's tokens are that role's alone.
 - **Agents may read it; they must never truncate, rewrite, or edit it** (stated in both the
   Manager and Orchestrator charters).
 - It is also the input to the per-pool usage reader that efficiency mode selects from (§5).
@@ -486,7 +497,55 @@ ralph report [--repo <target>] [--json]
 Per-ticket usage/cost summary. `--repo` defaults to `TARGET_REPO`, else the current directory.
 Cost is **captured tokens × the producing backend's provider rate**, *not* the CLI's
 `total_cost_usd`. `event` records (escalations) are skipped. Unknown providers yield
-`cost_usd = "unknown"` rather than a guess.
+`cost_usd = "unknown"` rather than a guess. **Read-only**: it never writes to the ledger.
+
+Grand totals are additionally broken out **by role** and **by pool** (`by_role` / `by_pool` in
+`--json`), which is what makes the driver's share visible next to the dispatched agents':
+
+- `by_role` rows are `builder+reviewer` (every round record) and whatever single roles the
+  ledger holds (`driver`, `orchestrator`). Each row is itself split per pool.
+- `by_pool` rows carry the roles that drew on that pool.
+- A line's pool is the one it declares: `pool` on a single-role record, `efficiency.builder_pool`
+  on a round. A round dispatched without efficiency mode declares none and lands in the pool
+  named `unknown` — no pool is inferred from the provider. When a round's reviewer drew on a
+  different pool than its builder, the round is attributed to the **builder's** pool (one token
+  total, no split) and a note says how many rounds that was.
+
+### 11.1 `ralph log-usage` — recording the driver's own usage
+
+```bash
+ralph log-usage --role driver --pool anthropic --usage-json driver.json \
+  [--provider claude] [--model <id>] [--round task-007] [--run-id <id>] [--repo <target>] [--json]
+```
+
+The builder and reviewer are metered automatically; the **driver** (§4) is not — it runs outside
+the loop, and on a capped plan it is usually the largest single consumer. This hook closes that
+gap: it reads the usage JSON the driver's own CLI already prints and appends **one**
+`role=driver|orchestrator` line to `.ralph/ledger.jsonl`. Capturing that JSON inside the
+unattended wrapper is the wrapper's job (§4.1); this command is what it — or you, interactively
+— calls.
+
+- **`--usage-json`** accepts a file or `-` (stdin), in any of the three shapes the tools already
+  emit: a claude-family `--output-format json` result object, a `codex --json` JSONL stream (the
+  usage rides the **final** `turn.completed`), or a harness `*.usage.json` sidecar. Field names
+  match `extract_usage` exactly, so the hook and the automatic capture read the same log the
+  same way.
+- **`--role`** takes `driver` or `orchestrator` only. `builder`/`reviewer` are **rejected** —
+  those rounds are already metered, and logging them again would double-count.
+- **`--provider`** prices the line; it defaults to the **pool name**, which is correct whenever
+  the pool is named after its provider (`anthropic`, `openai`, `zai`, …). A pool named anything
+  else needs it explicitly, or the cost is `unknown`.
+- **`--round`** folds the pass into that ticket's total, so per-round cost finally includes the
+  driver. Without it the line lands under the standing pseudo-ticket `driver`.
+- **`--model`** defaults to what the JSON reports (the claude family's `modelUsage`), else
+  `unknown`. Nothing is guessed.
+- **Failure mode**: a missing flag, a `builder`/`reviewer` role, or a usage JSON with no usable
+  token counts is an error (**exit 2**) that writes **nothing** — an under-counted driver is
+  worse than a loud refusal. Writing is append-only; existing lines are never read back or
+  rewritten.
+- **Not wired into pool selection**: efficiency mode's per-pool windows (§5) still read
+  builder-attributed rounds only, so a driver line changes what you can *see*, not what the
+  harness dispatches.
 
 ### `RALPH_PRICING_FILE`
 
@@ -652,7 +711,7 @@ running the loops without invoking a real agent.
 `ralph help` prints the authoritative flag list. Everything above is enforced by the hermetic
 suite — `npm test` — with the mode-specific gates in `tests/efficiency.mjs`,
 `tests/efficiency-select.mjs`, `tests/efficiency-dispatch.mjs`, `tests/auto-escalate.mjs`,
-`tests/usage-state.mjs`, `tests/report.mjs`, `tests/cron-driver.mjs`, `tests/usage.mjs`,
+`tests/usage-state.mjs`, `tests/report.mjs`, `tests/log-usage.mjs`, `tests/cron-driver.mjs`, `tests/usage.mjs`,
 `tests/usage-per-backend.mjs` and `tests/agent-selection.mjs`. The default-OFF contracts in §5
 and §6 are pinned as explicit regression tests, so if a default in this document ever drifts,
 those tests fail first.

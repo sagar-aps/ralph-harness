@@ -793,6 +793,46 @@ still `FAILED_MAX_ITERATIONS`, byte-for-byte. And with the flag but no rung ladd
 (efficiency off/inert, or a story with no `complexity:<tier>`) there is nothing to climb,
 so it degrades to a **no-op with a note** — `tests/auto-escalate.mjs` pins both.
 
+### Who spent what: `ralph report` + `ralph log-usage`
+
+`ralph report [--repo <target>] [--json]` summarises `<target>/.ralph/ledger.jsonl`:
+per ticket, and — since the dispatched agents are not the only consumers — as
+totals broken out **by role** and **by pool**. It is read-only.
+
+```
+  by role:
+    builder+reviewer: 12 line(s), tokens 402100, cost $1.204300
+      pool zai: 12 line(s), tokens 402100, cost $1.204300
+    driver: 9 line(s), tokens 613500, cost $2.881000
+      pool anthropic: 9 line(s), tokens 613500, cost $2.881000
+
+  by pool:
+    anthropic: 9 line(s), tokens 613500, cost $2.881000 (roles: driver)
+    zai: 12 line(s), tokens 402100, cost $1.204300 (roles: builder+reviewer)
+```
+
+A round record covers builder **and** reviewer with one shared token total (their
+sidecars are summed), so it is reported under the combined role
+`builder+reviewer` rather than split on a guess.
+
+The **driver** — the model that reads `ORCHESTRATOR.md` and dispatches each round —
+is metered by nothing at all, and on a capped plan it is routinely the biggest
+line. Record it yourself from the JSON its own CLI prints:
+
+```bash
+# claude family:  claude -p --output-format json ... > driver.json
+# codex:          codex exec --json ...            > driver.jsonl   (final turn.completed)
+ralph log-usage --role driver --pool anthropic --usage-json driver.json --round task-007
+```
+
+That appends one `role=driver` line (`{pool, tokens, model, provider, timestamp}`)
+to the same ledger, so the driver shows up in the breakouts above and `--round`
+folds its cost into that ticket's total. `--role` takes `driver`/`orchestrator`
+only: builder and reviewer rounds are already captured, and logging them again
+would double-count. Anything unusable — a missing flag, a usage JSON with no token
+counts — exits **2** and writes nothing. Full flag reference:
+[docs/OPERATING.md §11](docs/OPERATING.md).
+
 ## State files (.ralph/)
 
 - `progress.md` — append‑only progress log
