@@ -2,6 +2,11 @@
 
 Keep this file short. It is always loaded into context.
 
+**Every mode/flag — enable method, default (opt-in vs on-by-default), composition, and a
+defaults table — is in [`docs/OPERATING.md`](docs/OPERATING.md).** Read it there instead of
+re-deriving a default from the scripts, and update it in the same change when you add or
+change a flag.
+
 ## Build & test
 - No build step.
 - Tests (dry-run): `npm test`
@@ -14,7 +19,8 @@ Keep this file short. It is always loaded into context.
 - State/logs: `.ralph/` (local only)
 - Skills: `skills/`
 - Tests: `tests/`
-- Docs/examples: `README.md`, `examples/`, `docs/agent-operator.md`
+- Docs/examples: `README.md`, `examples/`, `docs/OPERATING.md` (all modes/flags + defaults),
+  `docs/agent-operator.md`
 
 ## Review loop + operator (target-repo orchestration)
 - Preflight (repo contract): `.agents/ralph/preflight.sh` — runs configured

@@ -4,6 +4,11 @@
 
 Ralph is a minimal, file‑based agent loop for autonomous coding. Each iteration starts fresh, reads the same on‑disk state, and commits work for one story at a time.
 
+> **Operator reference:** every mode and flag — how to enable it, its default (opt-in vs
+> on-by-default), and how it composes — is in **[docs/OPERATING.md](docs/OPERATING.md)**,
+> including a defaults/opt-in table. Start at [docs/modes.md](docs/modes.md) if you are
+> choosing a setup rather than looking up a flag.
+
 ## How it works
 
 Ralph treats **files and git** as memory, not the model context:

@@ -1,0 +1,570 @@
+# Operating the harness — every mode and flag in one place
+
+This is the **operator reference**: for each mode/flag, what it is, **how to turn it on**,
+its **default**, and **how it composes** with the others. Everything here was read off the
+merged source in this repo (`bin/ralph`, `.agents/ralph/*.sh|*.py`) — file/line pointers are
+given so you can re-verify rather than trust the prose.
+
+Related docs: [modes.md](modes.md) (which *setup* to pick — unmanaged vs managed),
+[architecture.md](architecture.md) (the five roles), [agent-operator.md](agent-operator.md)
+(driving the harness from a coding agent), and the [README](../README.md) (tutorials).
+
+---
+
+## 1. Defaults / opt-in at a glance
+
+**Nothing in the "opt-in" half of this table does anything until you enable it.** That is the
+contract: an unset flag means the code path does not run.
+
+| Mode / flag | Enable with | Default | Scope |
+|---|---|---|---|
+| **Opt-in (OFF unless you ask)** | | | |
+| Efficiency mode | `--efficiency` or `RALPH_EFFICIENCY=1\|true\|yes\|on` | **OFF** | `review`, `batch` |
+| Efficiency profile path | `--efficiency-profile <p>` / `RALPH_EFFICIENCY_PROFILE` | `<repo>/.agents/ralph/efficiency.json` | `review`, `batch`, `explain` |
+| Auto-escalate | `--auto-escalate` or `RALPH_AUTO_ESCALATE=1\|true\|yes\|on` | **OFF** | `review` **only** |
+| Per-rung budget | `--escalate-iterations <n>` / `RALPH_ESCALATE_ITERATIONS` | `3` (only used when auto-escalate is on) | `review` |
+| Orchestrator token ceiling | `RALPH_ORCHESTRATOR_BUDGET_TOKENS` (+ `RALPH_ORCHESTRATOR_STOP_PCT`) | **unset = off** (stop pct `100`) | `batch` **only** |
+| Custom pricing table | `RALPH_PRICING_FILE` | ships `.agents/ralph/pricing.json` | `ralph report` |
+| Custom quota-exhaustion regex | `RALPH_QUOTA_REGEX` | built-in ERE (see §9) | `batch` |
+| Credential-pool identity | `RALPH_BUILDER_CREDENTIAL_POOL` / `RALPH_REVIEWER_CREDENTIAL_POOL` | provider name | `batch` |
+| Identity wrapper | `ralph.target.json` `identity.enabled` / `RALPH_IDENTITY_WRAPPER` / `.agents/ralph/identity.sh` | **no marker → ambient `gh`** | Manager / Orchestrator |
+| Cron/orchestrator driver | `RALPH_CRON_DRIVER` (or `_PROVIDER`/`_MODEL`/`_EFFORT`) | `RALPH_CRON_DRIVER_DEFAULT` → `$DEFAULT_AGENT` → `codex` | orchestrator loop |
+| Manager role | `ralph init-target` installs it; boot `/manager` in the target repo | not booted | target repo session |
+| Verify gate | `--verify <cmd>` / `ralph.target.json` `.verify` | empty = disabled | `batch` |
+| Primer | `--primer <file>` / `ralph.target.json` `.primer` | unset (soft warning) | `batch` |
+| Primer opt-out | `RALPH_PRIMER_OPTOUT=1` | off (warning shown) | `batch` |
+| Unattended builder | `--auto-approve-builder` | `false` | `batch` |
+| Stop at first failure | `--stop-on-fail` | `false` | `batch` |
+| Resume a halted run | `--resume` | `false` | `batch` |
+| Detached run | `--detach` | `false` | `batch` |
+| Dirty target allowed | `--allow-dirty` / `ALLOW_DIRTY=true` | `false` | `review`, `batch` |
+| Branch in place (no worktree) | `--no-worktree` / `USE_WORKTREE=false` | worktree **on** | `review` |
+| Skip preflight | `--no-preflight` / `--skip-preflight` / `PREFLIGHT_SKIP=true` | preflight runs | `build`, `review`, `batch` |
+| Skip `config.local.sh` | `RALPH_NO_LOCAL_CONFIG=1` | sourced when present | all loops |
+| Skip update check | `RALPH_SKIP_UPDATE_CHECK=1` | check runs | CLI |
+| **On by default (opt-OUT)** | | | |
+| Per-attempt usage capture | on; disable with `RALPH_USAGE=0` | **ON** | `batch` |
+| Ledger (`.ralph/ledger.jsonl`) | written automatically | **ON** | `batch` rounds; `review` escalation events |
+| Preflight (repo contract) | `ralph.target.json` `preflight` block | runs when configured + enabled | `build`, `review`, `batch` |
+| Floor guard | `source .agents/ralph/floor-guard.sh`; disable with `RALPH_FLOOR_GUARD=off` | **armed once sourced** | orchestrator shell |
+| WIP snapshots (detached) | `RALPH_SNAPSHOT_INTERVAL` seconds | `60` (`0` disables) | `batch --detach` |
+| Agent-ERROR retries | `RALPH_AGENT_RETRIES` / `RALPH_AGENT_RETRY_DELAY` | `2` retries, `2`s backoff (doubling) | `batch` |
+| Iterations per task/story | `--max-iterations <n>` / `MAX_ITERATIONS` | `5` | `review`, `batch` |
+| Check command | `--check <cmd>` / `CHECK_CMD` / `ralph.target.json` `.check` | `./scripts/check.sh` | `review`, `batch` |
+| Verdict regex | `--verdict-regex` / `VERDICT_REGEX` | `^VERDICT: (PASS\|FAIL)` (`batch` also allows `BLOCKED`) | `review`, `batch` |
+| Builder / reviewer backend | `--builder` / `--reviewer` (or `BUILDER` / `REVIEWER`) | `opencode` / `claude` | `review`, `batch` |
+| Website preview + e2e | `ralph.target.json` `preview.enabled`; force with `--preview` / `--no-preview` | target config decides | `review`, end of `batch` |
+
+---
+
+## 2. Roles vs backends (the base layer everything else modifies)
+
+A **role** is a job (builder, reviewer, cron driver). A **backend** is a concrete command.
+Any backend can fill any role.
+
+- **Shipped backends** (`.agents/ralph/agents.sh`): `claude`, `codex`, `codex-write`,
+  `codex-readonly`, `droid`, `opencode`, `opencode-z`, plus `cxb` / `cxr` if you define
+  `AGENT_CXB_CMD` / `AGENT_CXR_CMD`.
+- **Any new backend, no code change**: define `AGENT_<NAME>_CMD` (name uppercased, dashes →
+  underscores) in `config.local.sh`, then `--builder <name>`. The template either contains
+  `{prompt}` (a quoted prompt-file path is substituted) or reads the prompt from stdin.
+- **Defaults**: `BUILDER=opencode`, `REVIEWER=claude`
+  (`review-loop.sh:105-106`, `batch-loop.sh:129-130`).
+- **Codex hardening is unconditional**: every resolved `codex exec` command gets
+  `-c 'mcp_servers={}' --disable apps` re-applied at resolution time, so an old local
+  override cannot restore MCP/app connector write paths (`agents.sh:ralph_codex_disable_connectors`).
+
+### Normalized selection: `{provider, model, effort}`
+
+Instead of hand-writing command strings:
+
+```bash
+ralph batch --repo <t> --plan <p> \
+  --builder-provider codex --builder-effort high \
+  --reviewer-provider zai  --reviewer-model glm-4.5-air
+```
+
+- Providers: `codex`, `claude`, `zai`/`zlaude`, `opencode`, `droid`, or any custom wrapper
+  backend name.
+- `--profile cheap|balanced|max` (`RALPH_PROFILE`) fills only the knobs you left unset:
+  `cheap` = builder codex/low + reviewer codex/low; `balanced` = builder codex/medium +
+  reviewer codex/low; `max` = builder codex/high + reviewer codex/medium
+  (`agents.sh:ralph_apply_profile`).
+- Effort is `low|medium|high`. **Only codex maps it** (`-c model_reasoning_effort=…`);
+  claude effort is deferred, and zai/opencode/droid ignore it (`agents.sh:ralph_effort_flag`).
+- The reviewer is composed read-only where the CLI supports it (codex gets
+  `--sandbox read-only`).
+- **This is opt-in machinery**: with no provider/model/effort/profile set,
+  `ralph_resolve_role_agents` returns immediately and the legacy `--builder <name>` path is
+  byte-for-byte unchanged.
+
+### Configuring it: `config.local.sh`
+
+`cp .agents/ralph/config.local.sh.example .agents/ralph/config.local.sh` — the real file is
+**gitignored**. It is sourced **last** (after `agents.sh`, `config.sh`, `review-config.sh`),
+so it wins over shipped defaults; use `: "${VAR:=value}"` so an explicit CLI flag / env var
+still wins over it. Set `RALPH_NO_LOCAL_CONFIG=1` to skip sourcing it (the test suite does).
+
+### Provider credentials
+
+- **Z.AI**: `RALPH_ZAI_AUTH_TOKEN` (no default) and `RALPH_ZAI_BASE_URL`
+  (default `https://api.z.ai/api/anthropic`). These stay as *runtime env references* inside
+  the composed command precisely so the token is never expanded into the logged command
+  (`agents.sh:ralph_provider_cmd`, `zai|zlaude` branch).
+- **Anthropic**: the `claude` backend deliberately runs under
+  `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_DEFAULT_{SONNET,HAIKU,OPUS}_MODEL`
+  so a stray key/endpoint cannot silently redirect it.
+- **Other providers (incl. DeepSeek): there is no built-in backend and no
+  `RALPH_DEEPSEEK_*` variable in this harness.** `deepseek` appears only as (a) a pricing
+  key + the `dlaude` alias in `pricing.json`, and (b) the `backstop: true` rung name in
+  `efficiency.json.example`. To actually run it you define your own wrapper backend —
+  e.g. `AGENT_DLAUDE_CMD='dlaude -p … "$(cat {prompt})"'` in `config.local.sh`, with the
+  endpoint and key kept inside the wrapper script, never in the repo. Any
+  claude-CLI-to-alternate-endpoint wrapper **must** `unset ANTHROPIC_API_KEY` (a stray key
+  outranks `ANTHROPIC_AUTH_TOKEN` and sends the run to real Anthropic — root cause of #22).
+
+**Composition:** roles/backends are the *base* selection. Efficiency mode (§5) can override
+`BUILDER`/`REVIEWER` **per ticket**; auto-escalate (§6) can override them again **per rung**.
+`RALPH_CRON_DRIVER` (§4) never touches them, and they never touch it.
+
+---
+
+## 3. Manager role / skill
+
+- **What**: the frontier-model verification gate inside the *target* repo — acceptance,
+  merge, prod deploy, and the paper trail. Charter template:
+  `.agents/ralph/target-templates/manager-SKILL.md`.
+- **Enable**: `ralph init-target --repo <target>` copies it to
+  `<target>/.claude/skills/manager/SKILL.md` (plus `LABELS.md`), then you boot `/manager`
+  in a session inside that repo. Existing files are **never overwritten** without `--force`
+  — the Manager edits its own "Project facts" section in place (`bin/ralph:1231-1254`).
+- **Default**: not booted. Unmanaged mode (you drive `ralph review`/`ralph batch`) needs no
+  Manager at all — see [modes.md](modes.md).
+- **Composition**: the Manager is *above* the harness; it does not change any flag here. Two
+  couplings matter:
+  - it runs on a credential pool that efficiency mode reserves quota for —
+    `RALPH_MANAGER_POOL`, defaulting to the `anthropic` pool (§5);
+  - it reads, never rewrites, `.ralph/ledger.jsonl` (§11).
+
+---
+
+## 4. Orchestrator loop + `RALPH_CRON_DRIVER`
+
+- **What**: the **driver** is the third role — the agent that wakes on your recurring cadence
+  (cron, timer, session loop), reads `.agents/ralph/ORCHESTRATOR.md` and runs one pass. It is
+  **not** the builder or the reviewer.
+- **Enable** (either spelling; the normalized spec wins if both are set):
+  - `RALPH_CRON_DRIVER="<backend name>"` — anything `resolve_backend_cmd` accepts;
+  - `RALPH_CRON_DRIVER_PROVIDER` + `_MODEL` + `_EFFORT` — composed by the same adapter the
+    roles use, exposed as the synthetic backend `ralph-cron` (`AGENT_RALPH_CRON_CMD`).
+- **Default when unset**: `RALPH_CRON_DRIVER_DEFAULT` → `$DEFAULT_AGENT` → `codex`
+  (`agents.sh:ralph_resolve_cron_driver`). No vendor is hardcoded — repoint `DEFAULT_AGENT`
+  or `RALPH_CRON_DRIVER_DEFAULT` and every unset caller follows.
+- **How it is used**: a driver script/cron entry calls `ralph_resolve_cron_driver`, which
+  prints the command **and** exports `RALPH_CRON_DRIVER_BACKEND` / `RALPH_CRON_DRIVER_CMD`.
+  Because `cmd="$(ralph_resolve_cron_driver)"` runs in a subshell, a caller that wants those
+  exports must invoke it directly and redirect stdout instead. The driver is composed in
+  **build (writable)** mode — unlike the reviewer it must act.
+- **Composition**: independent of `BUILDER`/`REVIEWER` in both directions. Its one real
+  coupling is efficiency mode: the driver's backend is mapped to a pool through the profile's
+  own rungs, and that pool carries the `orchestrator_pct` reserve (§5). Point the driver at
+  `zai` and the zai pool carries 50 %; point it at `codex` and the openai pool does instead.
+- **Floor guard** (mechanical, identity-agnostic): `source .agents/ralph/floor-guard.sh` in
+  the orchestrator shell prepends `gh`/`git` shims that refuse PR merge/approve and pushes to
+  the default branch. Armed as soon as it is sourced; `RALPH_FLOOR_GUARD=off` disables it with
+  a loud warning; `RALPH_DEFAULT_BRANCH` overrides the autodetected protected branch
+  (falls back to `main`). PATH-scoped to that shell, so builders/reviewers are unaffected.
+
+---
+
+## 5. Efficiency mode — `--efficiency` + `efficiency.json`
+
+**Opt-in, DEFAULT OFF.** Without the flag none of this code runs and dispatch is byte-for-byte
+the `--builder`/`--reviewer` path (pinned by `tests/efficiency-select.mjs`).
+
+- **Enable**: `--efficiency`, or `RALPH_EFFICIENCY` set to `1|true|yes|on` (case-insensitive,
+  `efficiency.sh:ralph_efficiency_enabled`). Valid on `ralph review` and `ralph batch`.
+- **Profile**: `<repo>/.agents/ralph/efficiency.json`, overridable with
+  `--efficiency-profile <path>` / `RALPH_EFFICIENCY_PROFILE`. The real file is **gitignored**
+  (operator policy, like `config.local.sh`); only `efficiency.json.example` ships:
+  `cp .agents/ralph/efficiency.json.example .agents/ralph/efficiency.json`.
+  On `ralph explain`, a plain `--profile` also means this path (everywhere else `--profile`
+  is the `cheap|balanced|max` agent preset).
+
+### What the profile declares
+
+| Block | Meaning |
+|---|---|
+| `rungs` | The ladder, **cheapest first**. Each rung names a `backend` + credential `pool` per role. |
+| `caps` | Keyed by pool. `{window_5h_pct, window_weekly_pct}` = stop at that share of the window; `{source: "provider"}` = the provider meters it, no local cap; `{backstop: true}` = uncapped last resort. |
+| `caps` (optional, #60) | `window_5h_budget_tokens` / `window_weekly_budget_tokens` — the **only** thing that turns ledger token sums into a percentage; `weekly_reset_anchor` — an ISO-8601 UTC instant the week repeats from. |
+| `avoid_windows` | Per rung: `from`/`to` as `HH:MM` in `tz` (UTC only), `days` like `Mon-Fri` / `Sat,Sun` / `*`. Inside the window the rung is ineligible. |
+| `reserves` | Keyed by **role**: `manager_pct`, `orchestrator_pct`, `near_weekly_reset_hours`. |
+| `tiers` | Which rungs each complexity (`trivial\|small\|medium\|large`) may use, in preference order. |
+
+### Selection rules (enforced in code, not by the profile)
+
+`ralph_efficiency_select <tier> [repo]` (`efficiency.sh`) / `efficiency.py select` walks the
+tier's rungs and takes the **first eligible** one. A pool is ineligible when an avoid window is
+active, its quota circuit (§9) is open, or it breaches its cap / weekly reserve.
+
+- **Reserves follow the control-plane ROLE, not the pool.** `manager_pct` (**25**) applies to
+  `RALPH_MANAGER_POOL` or, unset, the `anthropic` pool; `orchestrator_pct` (**50**) applies to
+  whichever pool `RALPH_CRON_DRIVER` resolves onto. When both roles share a pool the reserves
+  **stack** (25 + 50 = 75). A pool no control-plane role runs on carries no reserve.
+- **The defaults apply even if the profile omits them.** Omitting `manager_pct` /
+  `orchestrator_pct` does **not** switch the reserve off — the built-in 25 / 50 (and
+  `near_weekly_reset_hours` = 5) apply. The profile supplies numbers, not the switch.
+- **Near the weekly reset**, both weekly gates (cap *and* reserve) are relaxed. The rolling
+  5 h cap is never relaxed.
+- **Unknown usage fails open** — no budget and no quota observation means no percentage, and a
+  missing number must not freeze the ladder; the hard quota circuit stays the real gate.
+- **Backstop**: if no rung of the tier is eligible, the `backstop: true` rung is used even when
+  the tier does not list it (exempt from caps and reserves; only its own circuit or avoid
+  window can take it out).
+- **Return codes**: `0` = selected, `3` = bounded PAUSE, `4` = inert.
+
+### Dispatch (#62) — per ticket, only under the opt-in
+
+The ticket's complexity comes from a `complexity:<tier>` label, or the PRD story's
+`complexity` field / `complexity:` label. The chosen rung overrides `--builder`/`--reviewer`
+**for that ticket only**, and is recorded in `efficiency-dispatch.jsonl`, `final_status.md` /
+`final-report.md`, the per-task result used for the PR body, `last-run.env`, and the
+`efficiency` block of that round's ledger record.
+
+Three ways it steps aside instead of surprising you:
+
+| Situation | Behaviour |
+|---|---|
+| Ticket has no `complexity:<tier>` | Inert + loud warning; your normal `--builder`/`--reviewer` runs. |
+| Profile missing or invalid | **Reject-to-safe**: loud stderr warning, mode falls back to inert/off. Never fatal, never partially enforced. |
+| No eligible rung, not even the backstop | Clean **bounded pause**: `EFFICIENCY_PAUSED`, **exit 5**, artifacts kept, reason + retry instant published. In a batch, completed tasks stay committed and `--resume` picks up; in a review nothing was created yet. |
+
+### Reading the policy back (read-only, dispatches nothing)
+
+```bash
+ralph explain --complexity medium [--repo <target>] [--profile <path>] [--json]
+.agents/ralph/usage-state.sh --repo <target> [--profile <path>] [--json]
+```
+
+`usage-state.sh`/`usage-state.py` is the **read-only** per-pool reader: 5 h + weekly token sums
+from `.ralph/ledger.jsonl`, turned into a pct only when the profile sets that pool's
+`window_*_budget_tokens` (otherwise `pct=unknown` and raw tokens are shown — a percentage is
+never invented), plus reset proximity and avoid-window-now. It is a **local estimate**: no
+provider usage API is called, and it writes nothing.
+
+---
+
+## 6. Auto-escalate — `--auto-escalate`
+
+**Opt-in, DEFAULT OFF, `ralph review` only.** (`bin/ralph` wires `RALPH_AUTO_ESCALATE` /
+`RALPH_ESCALATE_ITERATIONS` in the review branch only — `ralph batch` ignores the flag.)
+
+- **Enable**: `--auto-escalate`, or `RALPH_AUTO_ESCALATE=1|true|yes|on`.
+- **Per-rung budget**: `--escalate-iterations <n>` / `RALPH_ESCALATE_ITERATIONS`, **default 3**
+  (`review-loop.sh:423`). This replaces `--max-iterations` as the per-attempt budget *within*
+  a rung.
+- **What it changes**: a rung that spends its budget without a `VERDICT: PASS` is **promoted**
+  to the next stronger **eligible** rung and retried with a fresh budget, carrying the
+  reviewer's must-fix feedback forward.
+- **Bounded by construction**: `ralph_efficiency_escalate_select` → `efficiency.py select
+  --after-rung` only ever looks **above** the failed rung, so the ladder strictly shrinks.
+  Eligibility is *not* relaxed to make a promotion possible — the same avoid windows, caps,
+  quota circuits and role reserves apply, so an ineligible rung is skipped, not used.
+- **Outcomes**: a PASS at any rung ends the run normally (`READY_FOR_HUMAN_REVIEW`);
+  exhausting the ladder ends it on `FAILED_ESCALATION_EXHAUSTED` (**exit 2**) naming every rung
+  tried, e.g. `cheap -> mid -> strong -> backstop (all failed)`.
+- **Recorded in**: `<run>/escalations.jsonl`, `.ralph/ledger.jsonl` as an `event` record
+  (`ralph report` skips it — it carries no token totals), the run banner, `final_status.md`,
+  and `last-run.env`.
+- **Composition**: it needs the `--efficiency` rung ladder. With the flag but efficiency
+  off/inert, or a story with no `complexity:<tier>`, it is a **no-op with a note**. Without the
+  flag, a spent budget is still `FAILED_MAX_ITERATIONS`, byte-for-byte
+  (`tests/auto-escalate.mjs` pins both).
+
+---
+
+## 7. `--max-iterations`
+
+- **What**: builder/reviewer cycles — per story in `ralph review`, per task in `ralph batch`.
+- **Enable / set**: `--max-iterations <n>`, env `MAX_ITERATIONS`, or `MAX_ITERATIONS` in
+  `config.local.sh` / `review-config.sh`.
+- **Default**: **5** (`review-loop.sh:107`, `batch-loop.sh:157`). (`.agents/ralph/loop.sh`, the
+  older single-agent build loop, has its own `MAX_ITERATIONS` — the `config.sh` comment shows
+  `25`.)
+- **Composition**: exhausting it is `FAILED_MAX_ITERATIONS`. Under `--auto-escalate` the
+  effective per-attempt budget becomes `--escalate-iterations` *per rung* instead (§6). It is
+  unrelated to `--max-tasks` (how many tasks a batch runs) and to `RALPH_AGENT_RETRIES`
+  (retries for a tooling **ERROR**, which consume no builder attempt).
+
+---
+
+## 8. `RALPH_USAGE` — per-attempt token/cost capture
+
+- **What**: makes instrumented backends emit machine-readable usage, captured into a sidecar
+  next to each attempt log:
+  `.agent-run/<run>/task-<NNN>-iter-<N>-<role>.usage.json` with numeric
+  `input`/`output`/`cache_read`/`cache_creation` tokens (plus `num_turns`, `duration_ms`,
+  `total_cost_usd` where reported).
+- **Default: ON — this one is opt-OUT.** `RALPH_USAGE=0` disables it
+  (`batch-loop.sh:253` tests `${RALPH_USAGE:-1}`). Cost visibility on capped plans is the point
+  of the harness, and the extraction is safe: the JSON is always converted back to plain text
+  before the verdict grep, and an unrecognised shape is **salvaged** (verdict still parses) with
+  a warning that metrics were skipped.
+- **Scope**: `ralph batch`. Instrumented families:
+  claude-CLI → `--output-format json`; codex → `--json` on `exec`. **opencode is deliberately
+  not instrumented** (its usage field names are unverified). Extend wrapper coverage with
+  `RALPH_CLAUDE_LIKE` (default `claude rlaude zlaude`) / `RALPH_CODEX_LIKE` (default `codex`).
+- **Composition**: usage feeds the per-round totals → `round-usage.jsonl` → `.ralph/ledger.jsonl`
+  → `ralph report` (§11), and the observable total that `RALPH_ORCHESTRATOR_BUDGET_TOKENS`
+  (§10) measures against. Turning it off blinds all three.
+
+---
+
+## 9. `RALPH_QUOTA_REGEX` — terminal provider window, and credential pools
+
+- **What**: detects a genuinely exhausted provider usage window in a captured backend log and
+  opens a **circuit** for that credential pool. Deliberately narrower than a generic HTTP 429:
+  the default requires both an explicit usage-limit exhaustion **and** a reset time, so a
+  transient 429 does not trip it.
+- **Default ERE** (`agents.sh:ralph_detect_quota_exhaustion`):
+
+  ```
+  usage[[:space:]]+limit[[:space:]]+reached.*reset[[:space:]]+at[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}
+  ```
+
+- **Enable / override**: set `RALPH_QUOTA_REGEX` to your provider's terminal wording.
+- **Credential pools**: pool identity defaults to the provider name; set
+  `RALPH_BUILDER_CREDENTIAL_POOL` / `RALPH_REVIEWER_CREDENTIAL_POOL` when two backend names
+  share one plan's quota. On a match the harness exports `RALPH_QUOTA_PROVIDER`,
+  `RALPH_QUOTA_CREDENTIAL_POOL`, `RALPH_QUOTA_SCOPE`, `RALPH_QUOTA_OBSERVED_AT`,
+  `RALPH_QUOTA_RESET_AT` and appends `pool|reset` to `RALPH_QUOTA_OPEN_CIRCUITS`; with
+  `RALPH_QUOTA_ARTIFACT` set it also persists a `STATUS=PROVIDER_QUOTA_EXHAUSTED` env file.
+- **Effect**: an open pool is skipped for the rest of the run; unrelated pools stay
+  dispatchable; a parsed reset time that has elapsed closes the circuit automatically. In a
+  batch the run halts as `PROVIDER_QUOTA_EXHAUSTED` recording provider + reset time.
+- **Composition**: efficiency mode **reuses this exact circuit** (`ralph_quota_pool_is_exhausted`)
+  as one of its eligibility gates — it never re-implements quota detection. It is also the
+  "real gate" the fail-open rule in §5 defers to. Distinct from an *agent ERROR*
+  (`RALPH_AGENT_RETRIES`, default 2, exponential backoff, then
+  `BUILDER_UNAVAILABLE`/`REVIEWER_UNAVAILABLE`, exit 4).
+
+---
+
+## 10. `RALPH_ORCHESTRATOR_BUDGET_*` — proactive token ceiling
+
+- **What**: stops a batch cleanly once cumulative observable builder+reviewer usage reaches a
+  ceiling you set.
+- **Enable**: `RALPH_ORCHESTRATOR_BUDGET_TOKENS=<n>`. **Unset = feature off** (there is no
+  flag; it is env-only).
+- **`RALPH_ORCHESTRATOR_STOP_PCT`**: percentage applied to the ceiling, **default `100`**.
+  Both values must be finite and > 0 or the run errors out.
+- **Scope**: `ralph batch` only (`batch-loop.sh:1094-1157`, `orchestrator-budget.sh`).
+- **Behaviour**: the completed round's usage is flushed first, then the batch ends as
+  `ORCHESTRATOR_BUDGET_REACHED`, with budget, pct, threshold, observed total and
+  unknown-round count in `last-run.env` and the banner. **Unknown round totals count as zero**
+  and are reported separately rather than guessed at.
+- **Composition**: it measures the same numbers `RALPH_USAGE` captures — with `RALPH_USAGE=0`
+  every round is "unknown", contributes zero, and the ceiling is never reached. It is a
+  *per-run* ceiling and is independent of efficiency-mode caps/reserves, which are *per-pool,
+  per-window* policy.
+
+---
+
+## 11. Pricing, the ledger, and `ralph report`
+
+### `.ralph/ledger.jsonl` — the cross-run, append-only log
+
+- Written in the **target** repo. Two writers:
+  - `round-usage.sh` — one record per completed **batch** round (timestamp, round id, per-role
+    provider/model, attempt counts, `tokens.{input,output,cached,total}`, `run_id`, `target`;
+    plus an `efficiency` block **only** when efficiency mode actually decided something, so a
+    default run writes exactly the record it always has);
+  - `efficiency.sh:ralph_efficiency_escalation_record` — an `event` record per auto-escalate
+    promotion (from/to rung, reason, iteration; no token totals).
+- **Agents may read it; they must never truncate, rewrite, or edit it** (stated in both the
+  Manager and Orchestrator charters).
+- It is also the input to the per-pool usage reader that efficiency mode selects from (§5).
+
+### `ralph report`
+
+```bash
+ralph report [--repo <target>] [--json]
+```
+
+Per-ticket usage/cost summary. `--repo` defaults to `TARGET_REPO`, else the current directory.
+Cost is **captured tokens × the producing backend's provider rate**, *not* the CLI's
+`total_cost_usd`. `event` records (escalations) are skipped. Unknown providers yield
+`cost_usd = "unknown"` rather than a guess.
+
+### `RALPH_PRICING_FILE`
+
+- **Default**: `.agents/ralph/pricing.json`, shipped next to `report.py`.
+- **Override**: point `RALPH_PRICING_FILE` at your own file with the same schema —
+  `{"providers": {"<name>": {"input", "output", "cache_read", "cache_write"}}, "aliases": {...}}`,
+  all rates **USD per million tokens**; `cost_usd = tokens × rate / 1_000_000`.
+- **Failure mode**: an unreadable/invalid override silently falls back to the shipped
+  `pricing.json`, and then to an empty table (everything `unknown`) — it never crashes a report
+  (`report.py:_load_pricing`).
+
+---
+
+## 12. Identity marker
+
+- **What**: which `gh`/`git` identity wrapper the Manager/Orchestrator act under, so the
+  orchestrator identity can never approve, merge, push main, or deploy prod.
+- **Resolution order** (`.agents/ralph/resolve-identity.sh`):
+  1. `ralph.target.json` `identity` block with `enabled: true` (+ `wrapper`, `role`) —
+     **authoritative; resolution stops here**;
+  2. `RALPH_IDENTITY_WRAPPER` (when it names an executable file);
+  3. `<target>/.agents/ralph/identity.sh` (when executable);
+  4. ambient `gh auth`.
+- **Default**: no marker → step 4, and that silent fallback is **correct, not degraded**.
+- **The marker changes the failure mode, which is the point**: with `identity.enabled=true` but
+  no resolvable wrapper, the status is **`DEGRADED`** (loud warnings in PR bodies and to the
+  Manager) rather than a quiet fallback. Without the marker, an unresolvable wrapper is just
+  `FALLBACK`.
+- Outputs (printed when run directly, exported when sourced): `RESOLVED_WRAPPER`,
+  `IDENTITY_STATUS` (`resolved|degraded|fallback`), `IDENTITY_SOURCE`,
+  `IDENTITY_MARKER_ENABLED`, `IDENTITY_MARKER_ROLE`.
+- **Composition**: a *soft* dependency — absent or failing, the Manager works in fallback mode.
+  Complementary to, and independent of, the **floor guard** (§4), which enforces the same floor
+  mechanically under plain `gh auth`.
+
+---
+
+## 13. How they compose
+
+### 13.1 The precedence chain
+
+For roles and workflow knobs (`config.local.sh.example`, `batch-loop.sh:116`):
+
+```
+CLI flag  >  environment variable  >  config.local.sh  >  ralph.target.json "agents"
+          >  config.sh / review-config.sh  >  agents.sh defaults
+```
+
+Two caveats that bite:
+
+- `config.local.sh` only stays *below* flags/env if you write `: "${VAR:=value}"`. A plain
+  `VAR=value` there beats the flag.
+- The `ralph.target.json` **`agents`** block is honored by **`ralph batch` only**; `ralph review`
+  takes roles from env/CLI and `config.local.sh` (`review-loop.sh:101`).
+
+### 13.2 Dispatch: who actually picks the builder and reviewer
+
+Each layer only runs if the one before it opted in:
+
+```
+--builder / --reviewer  (or BUILDER/REVIEWER, config.local.sh, target "agents")
+   └─ --efficiency + a ticket with complexity:<tier>  →  rung overrides both, for that ticket
+        └─ --auto-escalate + a spent per-rung budget  →  promotes to the next eligible rung
+```
+
+Remove the opt-in at any level and every level below it disappears with it: no `--efficiency`
+means `--auto-escalate` is a no-op with a note; no `complexity:<tier>` means the rung ladder is
+empty, so there is nothing to select from *or* climb.
+
+### 13.3 Which knob gates which
+
+| Layer | Question it answers | Knob |
+|---|---|---|
+| Preflight | Is the repo baseline healthy at all? | `ralph.target.json` `preflight`, `--no-preflight` |
+| Role selection | Who runs this? | `--builder`/`--reviewer`, providers/models/efforts, `--profile` |
+| Efficiency policy | *May* this pool run right now? | caps, avoid windows, reserves, quota circuit |
+| Iteration budget | How many tries before giving up? | `--max-iterations`, then `--escalate-iterations` per rung |
+| Run ceiling | How many tokens may this whole batch spend? | `RALPH_ORCHESTRATOR_BUDGET_TOKENS` / `_STOP_PCT` |
+| Hard stop | Has the provider actually cut us off? | `RALPH_QUOTA_REGEX` circuit |
+
+They are checked in that order, and the **hard quota circuit always wins** — efficiency mode
+reuses it rather than modelling exhaustion itself, and fails *open* wherever its own numbers are
+unknown, so a missing estimate can never freeze the ladder.
+
+### 13.4 Where the control-plane roles couple to cost policy
+
+`RALPH_CRON_DRIVER` and `RALPH_MANAGER_POOL` look like unrelated role settings, but they are
+what makes reserves land on the right pool: change the driver and the 50 % orchestrator reserve
+**moves with it**, while the pool it left reverts to its plain caps. Share a pool between both
+control-plane roles and their reserves stack to 75 %.
+
+### 13.5 Terminal statuses and exit codes
+
+Both loops end **0** only on `READY_FOR_HUMAN_REVIEW` and **2** on anything else, except
+where a distinct code is listed below.
+
+| Status | `review` | `batch` | Cause |
+|---|---|---|---|
+| `READY_FOR_HUMAN_REVIEW` | 0 | 0 | reviewer PASS + checks green (the loop never merges) |
+| `FAILED_MAX_ITERATIONS` | 2 | — | iteration budget spent (auto-escalate off) |
+| `FAILED_ESCALATION_EXHAUSTED` | 2 | — | ladder exhausted under `--auto-escalate` |
+| `PREFLIGHT_FAILED` | 3 | 3 | repo contract broke before any worktree/agent |
+| `BUILDER_UNAVAILABLE` / `REVIEWER_UNAVAILABLE` | 2 | **4** | agent ERROR survived `RALPH_AGENT_RETRIES`; `--resume` continues |
+| `PROVIDER_QUOTA_EXHAUSTED` | 2 | **4** | terminal provider window matched by `RALPH_QUOTA_REGEX` |
+| `EFFICIENCY_PAUSED` | **5** | **5** | no eligible rung, not even the backstop; artifacts kept |
+| `ORCHESTRATOR_BUDGET_REACHED` | — | 2 | token ceiling hit; usage flushed first |
+| `STOPPED_ON_FAIL` | — | 2 | `--stop-on-fail` and a task failed |
+| `COMPLETED_WITH_FAILURES` / `COMPLETED_WITH_BLOCKERS` | — | 2 | batch finished with failed / `VERDICT: BLOCKED` tasks |
+
+`NO_CHANGES` is a **per-task** result, not a run status: every builder attempt for that task
+produced an empty diff, which is a failure, never a pass.
+
+`ralph status --watch` polls to a terminal status: exit **0** if `READY_FOR_HUMAN_REVIEW`, **2**
+otherwise, **124** on timeout (`RALPH_WATCH_INTERVAL_MS` default 15000,
+`RALPH_WATCH_TIMEOUT_MS` default 6 h).
+
+---
+
+## 14. The rest of the flag surface
+
+The modes above are the ones with an on/off contract. These are the remaining flags
+`bin/ralph` parses — plumbing and selection, no default-OFF semantics of their own. Together
+with §1 this is the complete flag surface; `ralph help` is the authoritative list.
+
+| Flag | Commands | Meaning / default |
+|---|---|---|
+| `--repo <path>` | `review`, `batch`, `preflight`, `status`, `integrate`, `cleanup`, `init-target`, `report`, `explain` | Target repo. Falls back to `TARGET_REPO`; **required** for `review`/`batch`, defaults to cwd for `report`/`explain`. |
+| `--prd <path>` | `build`, `prd`, `review` | Override the PRD JSON. Unset → prompts among `.agents/tasks/*.json`. |
+| `--out <path>` | `prd` | PRD output path. Default `.agents/tasks/`. |
+| `--progress <path>` | `build` | Override the progress log. Default `.ralph/progress.md`. |
+| `--agent <codex\|claude\|droid\|opencode>` | `build`, `prd` | Agent runner for the single-agent loop (not the review/batch roles). |
+| `--no-commit` | `build` | Dry run: the loop does not commit (parsed by `loop.sh`, not `bin/ralph`). |
+| `--skills` | `install` | Also install the `commit` / `dev-browser` / `prd` skills. |
+| `--force` | `install`, `init-target`, `integrate`, `cleanup` | Overwrite on install; integrate a non-ready run; force-remove a dirty worktree. |
+| `--task <id>` | `review` | Select a PRD story by id (a bare positional number selects by 1-based index). |
+| `--branch <name>` | `review`, `batch` | Override the working branch name (default is generated from the run id). |
+| `--plan <dir\|file>` | `batch` | **Required**: a dir of `*.md` (sorted) or one `.md` split by its top heading level. |
+| `--max-tasks <n>` | `batch` | Cap how many tasks run. Default: all. |
+| `--run latest\|<run-id>` | `status`, `integrate`, `cleanup` | Which run to act on. Default `latest`. |
+| `--watch` | `status` | Poll to a terminal status (see §13.5 for exit codes). |
+| `--json` | `report`, `explain` | Machine-readable output. Default: human text. |
+| `--pr` | `integrate` | Push the branch + `gh pr create` instead of merging main. `Fixes #N` from the branch name; `RALPH_FIXES="1 3 4"` closes several. Keeps the branch, removes the worktree, needs `gh`. |
+| `--merged` | `cleanup` | Sweep every worktree whose PR is already merged (needs `gh`). |
+| `--delete-branch` | `cleanup`, `integrate` | Also delete the run branch. Default: branch kept. |
+| `--keep-worktree` / `--skip-cleanup` | `integrate` | Don't auto-clean up after integrating. Default: auto-cleanup. |
+| `--cleanup` | — | Accepted by the parser but **read nowhere** in `bin/ralph` today — it is inert. `integrate` already auto-cleans unless you pass `--keep-worktree`. |
+| `--type generic\|nextjs-postgres` | `init-target` | Scaffold type. Default `generic`. |
+| `--app-port <n>` / `--db-port <n>` | `review`, `batch` | Pin preview ports. Default: auto-allocated. |
+| `--preview-host <host>` | `review`, `batch` | Hostname in the preview URL. Default `localhost`. |
+| `--keep-preview-on-fail` | `review` | Leave the preview running after a failed run. Default: torn down. |
+| `--complexity trivial\|small\|medium\|large` | `explain` | Which tier to explain. Required (or as a bare positional). |
+| `--builder-provider` / `--builder-model` / `--builder-effort` (and `--reviewer-*`) | `review`, `batch` | Normalized selection — see §2. |
+| `--profile cheap\|balanced\|max` | `review`, `batch` | Agent preset (see §2). **On `explain` only**, `--profile` instead means the efficiency profile *path*. |
+
+Also worth knowing: `RALPH_WORKTREE_DIR` moves the worktree base (default
+`<target-parent>/.ralph-worktrees`), and `RALPH_DRY_RUN=1` is the test suite's hook for
+running the loops without invoking a real agent.
+
+---
+
+## 15. Verifying any of this yourself
+
+`ralph help` prints the authoritative flag list. Everything above is enforced by the hermetic
+suite — `npm test` — with the mode-specific gates in `tests/efficiency.mjs`,
+`tests/efficiency-select.mjs`, `tests/efficiency-dispatch.mjs`, `tests/auto-escalate.mjs`,
+`tests/usage-state.mjs`, `tests/report.mjs`, `tests/cron-driver.mjs`, `tests/usage.mjs`,
+`tests/usage-per-backend.mjs` and `tests/agent-selection.mjs`. The default-OFF contracts in §5
+and §6 are pinned as explicit regression tests, so if a default in this document ever drifts,
+those tests fail first.
+
+Identity resolution (§12) has its own suite, `tests/identity-resolution.mjs`, which is **not**
+in the `npm test` list — run it directly with `node tests/identity-resolution.mjs`.
