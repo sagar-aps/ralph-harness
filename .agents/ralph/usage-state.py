@@ -10,11 +10,21 @@ What it computes, per pool referenced by the profile's rungs:
 
   * used_tokens inside the rolling 5h window and inside the current weekly
     window, summed from each ledger line's own timestamp;
-  * pct — ONLY when the profile configures a per-pool token budget for that
-    window (`window_5h_budget_tokens` / `window_weekly_budget_tokens` on the
-    rung's cap block). With no budget there is no denominator, so pct is
-    "unknown" and the raw token count is still reported. A percentage is NEVER
-    fabricated: the #28 hard circuit remains the real backstop;
+  * pct — from one of two sources, never invented:
+      - a per-pool USAGE PROVIDER (#68): a cap of shape
+        {source: "provider_pct", usage_provider: "<script>"} names a script this
+        reader invokes; its printed JSON
+        {window_5h_pct, window_weekly_pct, weekly_reset_at} IS the percentage.
+        That is the only way a pool whose provider publishes usage as a
+        PERCENTAGE ONLY (an Anthropic Pro/Max plan) can bind its cap and the
+        reserves it carries, because such a plan has no token budget to divide
+        by. A script that fails, times out or prints unparseable output FAILS
+        OPEN: pct stays "unknown" and the #28 circuit is the gate;
+      - otherwise the LEDGER path, which needs a per-pool token budget for that
+        window (`window_5h_budget_tokens` / `window_weekly_budget_tokens` on the
+        rung's cap block). With no budget there is no denominator, so pct is
+        "unknown" and the raw token count is still reported. A percentage is
+        NEVER fabricated: the #28 hard circuit remains the real backstop;
   * reset proximity — for 5h, when the oldest in-window record rolls off; for
     weekly, the next occurrence of the profile's `weekly_reset_anchor` (and
     whether that is "near" per reserves.near_weekly_reset_hours). With no
@@ -23,7 +33,9 @@ What it computes, per pool referenced by the profile's rungs:
   * in_avoid_window — whether a rung drawing on the pool is inside one of its
     `avoid_windows` right now (current UTC day + time).
 
-Read-only: it opens the ledger and the profile for reading and writes nothing.
+Read-only: it opens the ledger and the profile for reading and writes nothing. The
+one thing it EXECUTES is a pool's own `usage_provider` adapter, which the operator
+put in their own profile and which is expected to print JSON and change nothing.
 It never enforces a cap or a reserve and never selects a backend.
 
 Usage:
@@ -51,11 +63,35 @@ BUDGET_5H_KEY = "window_5h_budget_tokens"
 BUDGET_WEEKLY_KEY = "window_weekly_budget_tokens"
 WEEKLY_ANCHOR_KEY = "weekly_reset_anchor"
 
+# #68: the pool's own usage adapter — a script printing the provider's PERCENTAGES.
+# It is what makes a %-only plan's cap and reserves bindable without a token budget.
+USAGE_PROVIDER_KEY = "usage_provider"
+CAP_SOURCE_PROVIDER = "provider"
+CAP_SOURCE_PROVIDER_PCT = "provider_pct"
+
+# The fields a usage adapter prints. The first two are the percentages; the third
+# is what makes the weekly reset (and the near-reset relaxation) knowable.
+PROVIDER_PCT_FIELDS = ("window_5h_pct", "window_weekly_pct")
+PROVIDER_RESET_FIELD = "weekly_reset_at"
+
+# A usage adapter that will not answer must not freeze the reader: it is killed and
+# treated exactly like a failure (fail-open, pct unknown). RALPH_USAGE_PROVIDER_TIMEOUT
+# moves the bound (tests/ops — an adapter behind a slow network); it is never unbounded.
+USAGE_PROVIDER_TIMEOUT_SECONDS = 20
+USAGE_PROVIDER_TIMEOUT_ENV = "RALPH_USAGE_PROVIDER_TIMEOUT"
+
 UNKNOWN = "unknown"
 
 SOURCE_LEDGER = "ledger"
 SOURCE_NONE = "none"
 SOURCE_UNREADABLE = "ledger-unreadable"
+
+# Where a record's pct came from — None when there is none.
+PCT_SOURCE_BUDGET = "budget"
+PCT_SOURCE_PROVIDER = "provider_pct"
+
+# reset_basis when the weekly reset was reported by a usage adapter.
+RESET_BASIS_PROVIDER = "usage_provider"
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +331,178 @@ def pool_weekly_anchor(profile, pool):
     return parse_iso_utc(value) if value is not None else None, conflicts
 
 
+def pool_usage_provider(profile, pool):
+    """(adapter path, conflicts) — the pool's `usage_provider` script, or None.
+
+    Declared on the cap block, exactly like the token budgets. A cap of shape
+    {source: "provider_pct", ...} always carries one (efficiency.py's validator
+    requires it); any other shape MAY carry one, in which case the adapter's
+    percentages simply replace the budget-derived ones.
+    """
+    value, conflicts = pool_cap_value(profile, pool, USAGE_PROVIDER_KEY)
+    return (value.strip() if nonempty_str(value) else None), conflicts
+
+
+# ---------------------------------------------------------------------------
+# Usage providers (#68) — a pool's own adapter for provider-reported percentages
+# ---------------------------------------------------------------------------
+def is_pct(val):
+    return is_number(val) and 0 <= val <= 100
+
+
+def usage_provider_timeout():
+    """Seconds to allow an adapter, from RALPH_USAGE_PROVIDER_TIMEOUT or the default."""
+    raw = os.environ.get(USAGE_PROVIDER_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        print("ralph: ignoring unusable {}={!r}".format(USAGE_PROVIDER_TIMEOUT_ENV, raw),
+              file=sys.stderr)
+    return USAGE_PROVIDER_TIMEOUT_SECONDS
+
+
+def resolve_usage_provider(script, repo):
+    """Absolute path of a pool's adapter; a relative one is relative to the repo."""
+    if os.path.isabs(script):
+        return os.path.normpath(script)
+    return os.path.normpath(os.path.join(os.path.abspath(repo), script))
+
+
+def _empty_provider_usage(script, path):
+    return {"usage_provider": script, "path": path, "window_5h_pct": None,
+            "window_weekly_pct": None, "weekly_reset_at": None, "error": None}
+
+
+def _kill_process_group(proc):
+    """Kill a timed-out adapter AND anything it spawned, then reap it.
+
+    Killing only the script itself is not enough: a grandchild (`sleep`, a curl the
+    adapter left running) inherits the stdout pipe, so the read would keep blocking
+    long past the timeout. The adapter is started in its own session, so the whole
+    group can be signalled at once.
+    """
+    import signal
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        proc.kill()
+    try:
+        proc.communicate(timeout=5)
+    except Exception:  # already gone, or a pipe still held: either way, move on
+        pass
+
+
+def run_usage_provider(script, pool, repo):
+    """Invoke a pool's usage adapter and normalize the JSON it prints.
+
+    The contract (documented in usage_provider.example.sh): exit 0 and print ONE
+    JSON object {window_5h_pct, window_weekly_pct, weekly_reset_at} on stdout.
+    Argv is <pool> <repo>, and the same two values are also passed as
+    RALPH_USAGE_PROVIDER_POOL / RALPH_USAGE_PROVIDER_REPO.
+
+    Returns the normalized record; `error` is a human string when the adapter
+    could not be used at all. EVERY failure mode — missing file, non-zero exit,
+    timeout, unparseable or out-of-range output — leaves the percentage(s) None
+    so the caller FAILS OPEN and defers to the #28 circuit. Never raises.
+    """
+    path = resolve_usage_provider(script, repo)
+    out = _empty_provider_usage(script, path)
+    if not os.path.isfile(path):
+        out["error"] = "no such script"
+        return out
+    timeout = usage_provider_timeout()
+
+    import subprocess
+    env = dict(os.environ)
+    env["RALPH_USAGE_PROVIDER_POOL"] = pool
+    env["RALPH_USAGE_PROVIDER_REPO"] = os.path.abspath(repo)
+    # An executable script runs on its own shebang; anything else is handed to
+    # bash, so a non-chmod +x adapter still works instead of silently failing open.
+    argv = ([path] if os.access(path, os.X_OK) else ["bash", path]) + [pool, os.path.abspath(repo)]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                cwd=os.path.abspath(repo), env=env, universal_newlines=True,
+                                start_new_session=True)
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        out["error"] = "timed out after {:g}s".format(timeout)
+        return out
+    except OSError as exc:
+        out["error"] = "could not be executed: {}".format(exc)
+        return out
+    if proc.returncode != 0:
+        detail = (stderr or "").strip().splitlines()
+        out["error"] = "exited {}{}".format(
+            proc.returncode, ": " + detail[-1] if detail else "")
+        return out
+
+    try:
+        payload = json.loads(stdout)
+    except ValueError:
+        out["error"] = "printed unparseable output (expected one JSON object)"
+        return out
+    if not isinstance(payload, dict):
+        out["error"] = "printed {} — expected a JSON object".format(type(payload).__name__)
+        return out
+
+    bad = []
+    for field in PROVIDER_PCT_FIELDS:
+        if field not in payload or payload[field] is None:
+            continue
+        if is_pct(payload[field]):
+            out[field] = float(payload[field])
+        else:
+            bad.append("{}={!r} is not a number 0-100".format(field, payload[field]))
+    reset = payload.get(PROVIDER_RESET_FIELD)
+    if reset is not None:
+        parsed = parse_iso_utc(reset) if nonempty_str(reset) else None
+        if parsed is None:
+            bad.append("{}={!r} is not an ISO-8601 UTC timestamp".format(
+                PROVIDER_RESET_FIELD, reset))
+        else:
+            out[PROVIDER_RESET_FIELD] = parsed
+
+    if all(out[field] is None for field in PROVIDER_PCT_FIELDS):
+        out["error"] = "reported no usable percentage" + ("; " + "; ".join(bad) if bad else "")
+    elif bad:
+        # Partial answers are kept: an adapter that knows the 5h window but not the
+        # week must not cost us the number it does know.
+        out["partial"] = "; ".join(bad)
+    return out
+
+
+def collect_provider_usage(profile, repo, pools, notes):
+    """Run the usage adapter of every pool that declares one. Never raises."""
+    collected = {}
+    for pool in pools:
+        script, conflicts = pool_usage_provider(profile, pool)
+        if conflicts:
+            notes.append("pool {}: conflicting {} values in the profile; using the "
+                         "cheapest rung's".format(pool, USAGE_PROVIDER_KEY))
+        if script is None:
+            continue
+        result = run_usage_provider(script, pool, repo)
+        collected[pool] = result
+        if result["error"]:
+            notes.append(
+                "pool {}: usage provider {} FAILED OPEN — {}; pct stays unknown (no "
+                "percentage is invented; the #28 quota circuit remains the real "
+                "gate)".format(pool, script, result["error"]))
+            continue
+        notes.append(
+            "pool {}: window percentage(s) reported by the usage provider {} — no "
+            "token budget needed".format(pool, script))
+        if result.get("partial"):
+            notes.append("pool {}: usage provider {} — {} (that field falls back to "
+                         "the ledger/budget path)".format(pool, script, result["partial"]))
+    return collected
+
+
 # ---------------------------------------------------------------------------
 # Windows
 # ---------------------------------------------------------------------------
@@ -477,6 +685,10 @@ def compute_usage_state(profile, repo, now):
     reserves = reserves if isinstance(reserves, dict) else {}
     near_hours = reserves.get("near_weekly_reset_hours")
 
+    # #68: the pools whose provider publishes percentages instead of tokens. One
+    # adapter invocation per pool, before the per-window loop.
+    provider_usage = collect_provider_usage(profile, repo, pools, notes)
+
     out = []
     for pool in pools:
         anchor, anchor_conflicts = pool_weekly_anchor(profile, pool)
@@ -484,6 +696,12 @@ def compute_usage_state(profile, repo, now):
             notes.append("pool {}: conflicting {} values in the profile; using the "
                          "cheapest rung's".format(pool, WEEKLY_ANCHOR_KEY))
         week_start, week_reset, week_basis = weekly_window(anchor, now)
+        provider = provider_usage.get(pool) or {}
+        # A provider-reported weekly reset is the real one, so it wins over the
+        # anchor. The token WINDOW itself is left alone: the ledger sums stay
+        # comparable, and for such a pool the percentage no longer comes from them.
+        if provider.get(PROVIDER_RESET_FIELD) is not None:
+            week_reset, week_basis = provider[PROVIDER_RESET_FIELD], RESET_BASIS_PROVIDER
         for window, start in (("5h", now - FIVE_HOURS), ("weekly", week_start)):
             budget, budget_conflicts = pool_budget(profile, pool, window)
             if budget_conflicts:
@@ -513,10 +731,15 @@ def compute_usage_state(profile, repo, now):
             else:
                 near = UNKNOWN
 
-            if budget is None or source != SOURCE_LEDGER:
-                pct = UNKNOWN
+            # The adapter's percentage IS the percentage: it is what the provider
+            # reports, so it needs no denominator and beats the local estimate.
+            provider_pct = provider.get("window_{}_pct".format(window))
+            if provider_pct is not None:
+                pct, pct_source = round(float(provider_pct), 1), PCT_SOURCE_PROVIDER
+            elif budget is None or source != SOURCE_LEDGER:
+                pct, pct_source = UNKNOWN, None
             else:
-                pct = round(100.0 * used / budget, 1)
+                pct, pct_source = round(100.0 * used / budget, 1), PCT_SOURCE_BUDGET
 
             out.append({
                 "pool": pool,
@@ -527,6 +750,8 @@ def compute_usage_state(profile, repo, now):
                 "window_start": iso_z(start),
                 "budget_tokens": budget,
                 "pct": pct,
+                "pct_source": pct_source,
+                "usage_provider": provider.get("usage_provider"),
                 "reset_at": iso_z(reset),
                 "reset_in_hours": hours,
                 "reset_basis": reset_basis,
@@ -540,7 +765,10 @@ def compute_usage_state(profile, repo, now):
         if budgeted:
             notes.append("per-pool window usage computed locally from the ledger vs the "
                          "profile's token budget for: {}".format(", ".join(budgeted)))
-        unbudgeted = sorted({r["pool"] for r in out if r["budget_tokens"] is None})
+        # A pool whose percentage came from its usage provider needs no budget, so
+        # it is not missing anything.
+        unbudgeted = sorted({r["pool"] for r in out if r["budget_tokens"] is None
+                             and r["pct_source"] != PCT_SOURCE_PROVIDER})
         if unbudgeted:
             notes.append("no window token budget configured for: {} — pct is unknown "
                          "(raw token counts are still reported; add {} / {} to the "
@@ -613,6 +841,8 @@ def _print_human(state):
     for rec in state["records"]:
         pct = rec["pct"]
         pct_text = UNKNOWN if pct == UNKNOWN else "{:.1f}%".format(pct)
+        if rec["pct_source"] == PCT_SOURCE_PROVIDER:
+            pct_text += " (from the usage provider {})".format(rec["usage_provider"])
         budget = rec["budget_tokens"]
         print("  pool {} [{}]: used {} token(s) over {} record(s); budget {}; pct {}".format(
             rec["pool"], rec["window"], rec["used_tokens"], rec["records"],

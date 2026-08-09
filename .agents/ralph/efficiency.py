@@ -20,7 +20,12 @@ efficiency.sh); with the opt-in off nothing consults this module at all.
 
 The per-pool usage numbers come from the read-only reader in usage-state.py
 (#60): ledger token sums per window, turned into a percentage only when the
-profile configures a token budget for that pool + window.
+profile configures a token budget for that pool + window. A pool whose provider
+publishes usage as a PERCENTAGE only (an Anthropic Pro/Max plan, where there is no
+token budget to divide by) instead declares a cap of shape
+{source: "provider_pct", usage_provider: "<script>"} (#68): the adapter's printed
+JSON supplies the percentages, so that pool's cap and the reserves it carries bind
+like any other. An adapter that fails FAILS OPEN, exactly like a missing budget.
 
 Usage:
   python3 efficiency.py validate [--profile PATH] [--repo DIR] [--json]
@@ -98,7 +103,16 @@ USAGE_STATE = _load_sibling_module("usage-state.py", "ralph_usage_state")
 BUDGET_5H_KEY = getattr(USAGE_STATE, "BUDGET_5H_KEY", "window_5h_budget_tokens")
 BUDGET_WEEKLY_KEY = getattr(USAGE_STATE, "BUDGET_WEEKLY_KEY", "window_weekly_budget_tokens")
 WEEKLY_ANCHOR_KEY = getattr(USAGE_STATE, "WEEKLY_ANCHOR_KEY", "weekly_reset_anchor")
-OPTIONAL_CAP_KEYS = (BUDGET_5H_KEY, BUDGET_WEEKLY_KEY, WEEKLY_ANCHOR_KEY)
+# #68: the pool's usage adapter. Optional and additive on any cap shape (it only
+# changes where the percentage comes from), and REQUIRED by source="provider_pct".
+USAGE_PROVIDER_KEY = getattr(USAGE_STATE, "USAGE_PROVIDER_KEY", "usage_provider")
+OPTIONAL_CAP_KEYS = (BUDGET_5H_KEY, BUDGET_WEEKLY_KEY, WEEKLY_ANCHOR_KEY,
+                     USAGE_PROVIDER_KEY)
+
+CAP_SOURCE_PROVIDER = getattr(USAGE_STATE, "CAP_SOURCE_PROVIDER", "provider")
+CAP_SOURCE_PROVIDER_PCT = getattr(USAGE_STATE, "CAP_SOURCE_PROVIDER_PCT", "provider_pct")
+CAP_SOURCES = (CAP_SOURCE_PROVIDER, CAP_SOURCE_PROVIDER_PCT)
+PCT_FIELDS = ("window_5h_pct", "window_weekly_pct")
 
 USAGE_STATE_MISSING = (
     "⚠⚠ ralph: usage-state.py not found next to efficiency.py — per-pool usage, "
@@ -176,14 +190,31 @@ def parse_days(spec):
     return USAGE_STATE.parse_days(spec) if USAGE_STATE else None
 
 
+def _validate_window_pcts(cap, where, errors):
+    """Both window percentages of a capped shape must be numbers 0-100."""
+    ok = True
+    for field in PCT_FIELDS:
+        if not _is_pct(cap.get(field)):
+            errors.append("{}.{}: must be a number 0-100 (got {!r})".format(
+                where, field, cap.get(field)))
+            ok = False
+    return ok
+
+
 def _validate_cap(cap, where, errors):
-    """Validate one cap block and return its kind (pct/provider/backstop/None)."""
+    """Validate one cap block and return its kind.
+
+    Kinds: "pct" (local window caps), "provider" (the provider meters it, no local
+    cap), "provider_pct" (#68 — the pool's own adapter reports the percentages,
+    optionally capped by window_5h_pct/window_weekly_pct), "backstop", or None when
+    the block is invalid.
+    """
     if not isinstance(cap, dict):
         errors.append("{}: must be an object".format(where))
         return None
-    # #60's optional window budgets / weekly reset anchor may sit on ANY cap
-    # shape: they are what turns raw ledger tokens into a percentage and a reset
-    # time. They never replace the cap shape itself.
+    # #60's optional window budgets / weekly reset anchor and #68's usage_provider
+    # may sit on ANY cap shape: they only decide where a percentage (and a reset
+    # time) comes from. They never replace the cap shape itself.
     for field in (BUDGET_5H_KEY, BUDGET_WEEKLY_KEY):
         if field in cap and not (_is_number(cap[field]) and cap[field] > 0):
             errors.append("{}.{}: must be a number > 0 (tokens) (got {!r})".format(
@@ -192,31 +223,52 @@ def _validate_cap(cap, where, errors):
         errors.append(
             "{}.{}: must be an ISO-8601 UTC timestamp like \"2026-08-05T09:00:00Z\" "
             "(got {!r})".format(where, WEEKLY_ANCHOR_KEY, cap[WEEKLY_ANCHOR_KEY]))
+    if USAGE_PROVIDER_KEY in cap and not _nonempty_str(cap[USAGE_PROVIDER_KEY]):
+        errors.append(
+            "{}.{}: must be a path to a script that prints "
+            "{{\"window_5h_pct\", \"window_weekly_pct\", \"weekly_reset_at\"}} as JSON "
+            "(got {!r})".format(where, USAGE_PROVIDER_KEY, cap[USAGE_PROVIDER_KEY]))
     keys = set(cap.keys()) - set(OPTIONAL_CAP_KEYS)
-    if keys == {"source"}:
-        if cap.get("source") != "provider":
-            errors.append("{}.source: only \"provider\" is supported (got {!r})".format(
-                where, cap.get("source")))
-            return None
-        return "provider"
+    # A source-shaped cap: bare, or (provider_pct only) carrying window caps that
+    # the adapter's percentages are then measured against.
+    if keys == {"source"} or keys == {"source"} | set(PCT_FIELDS):
+        capped = keys != {"source"}
+        source = cap.get("source")
+        if source == CAP_SOURCE_PROVIDER:
+            if capped:
+                errors.append(
+                    "{}: source \"{}\" applies no local cap, so it cannot carry {} — use "
+                    "source \"{}\" with a {} to cap a provider-reported percentage".format(
+                        where, CAP_SOURCE_PROVIDER, " / ".join(PCT_FIELDS),
+                        CAP_SOURCE_PROVIDER_PCT, USAGE_PROVIDER_KEY))
+                return None
+            return "provider"
+        if source == CAP_SOURCE_PROVIDER_PCT:
+            ok = _validate_window_pcts(cap, where, errors) if capped else True
+            if not _nonempty_str(cap.get(USAGE_PROVIDER_KEY)):
+                errors.append(
+                    "{}: source \"{}\" requires {} — the script whose printed JSON "
+                    "supplies the percentages (that is the whole point of this shape: "
+                    "the pool has no token budget to divide by)".format(
+                        where, CAP_SOURCE_PROVIDER_PCT, USAGE_PROVIDER_KEY))
+                ok = False
+            return "provider_pct" if ok else None
+        errors.append("{}.source: only {} are supported (got {!r})".format(
+            where, " or ".join('"{}"'.format(s) for s in CAP_SOURCES), source))
+        return None
     if keys == {"backstop"}:
         if cap.get("backstop") is not True:
             errors.append("{}.backstop: must be true".format(where))
             return None
         return "backstop"
-    if keys == {"window_5h_pct", "window_weekly_pct"}:
-        ok = True
-        for field in ("window_5h_pct", "window_weekly_pct"):
-            if not _is_pct(cap.get(field)):
-                errors.append("{}.{}: must be a number 0-100 (got {!r})".format(
-                    where, field, cap.get(field)))
-                ok = False
-        return "pct" if ok else None
+    if keys == set(PCT_FIELDS):
+        return "pct" if _validate_window_pcts(cap, where, errors) else None
     errors.append(
         "{}: unknown cap shape {} — expected "
         "{{window_5h_pct, window_weekly_pct}} or {{source: \"provider\"}} "
-        "or {{backstop: true}}, plus any of the optional {}".format(
-            where, sorted(keys), ", ".join(OPTIONAL_CAP_KEYS)))
+        "or {{source: \"provider_pct\", usage_provider: \"<script>\"}} (optionally with "
+        "window_5h_pct/window_weekly_pct) or {{backstop: true}}, plus any of the "
+        "optional {}".format(where, sorted(keys), ", ".join(OPTIONAL_CAP_KEYS)))
     return None
 
 
@@ -397,6 +449,48 @@ def _empty_pool_usage():
     }
 
 
+def _merge_local_state(result, repo, now, profile):
+    """Fold usage-state.py's normalized per-pool records into `result["pools"]`.
+
+    Returns (local_seen, provider_seen): whether a budget-derived percentage and
+    whether an adapter-reported one (#68) was found.
+
+    Precedence, strongest first: a pool's own usage adapter (the provider's live
+    numbers), then a ledger `quota` observation, then the local budget estimate. So
+    an adapter percentage OVERWRITES what is already there, while a budget-derived
+    one only fills a gap.
+    """
+    local_seen = provider_seen = False
+    if profile is None or USAGE_STATE is None:
+        return local_seen, provider_seen
+    state = USAGE_STATE.compute_usage_state(profile, repo, now)
+    result["state"] = state
+    result["notes"].extend(state["notes"])
+    provider_source = getattr(USAGE_STATE, "PCT_SOURCE_PROVIDER", "provider_pct")
+    provider_basis = getattr(USAGE_STATE, "RESET_BASIS_PROVIDER", "usage_provider")
+    for rec in state["records"]:
+        entry = result["pools"].setdefault(rec["pool"], _empty_pool_usage())
+        entry["local_{}".format(rec["window"])] = rec
+        field = "window_{}_pct".format(rec["window"])
+        from_provider = rec.get("pct_source") == provider_source
+        if rec["pct"] != USAGE_STATE.UNKNOWN and (from_provider or entry[field] is None):
+            entry[field] = float(rec["pct"])
+            entry[field + "_source"] = provider_source if from_provider else "budget"
+            if from_provider:
+                provider_seen = True
+            else:
+                local_seen = True
+        if rec["window"] != "weekly" or rec["reset_at"] == USAGE_STATE.UNKNOWN:
+            continue
+        if rec["reset_basis"] == provider_basis:
+            entry["weekly_reset_at"] = rec["reset_at"]
+            entry["weekly_reset_source"] = provider_basis
+        elif entry["weekly_reset_at"] is None and rec["reset_basis"] == "weekly_anchor":
+            entry["weekly_reset_at"] = rec["reset_at"]
+            entry["weekly_reset_source"] = "anchor"
+    return local_seen, provider_seen
+
+
 def read_ledger_usage(repo, now, profile=None):
     """Per-pool usage read from <repo>/.ralph/ledger.jsonl.
 
@@ -415,6 +509,13 @@ def read_ledger_usage(repo, now, profile=None):
         closest thing to a provider-reported number the ledger can hold, so it
         WINS over the local estimate for the same pool + window.
 
+    A fourth source does NOT come from the ledger at all: a pool whose cap is
+    {source: "provider_pct", usage_provider: "<script>"} (#68) has its percentages
+    reported by that adapter, which usage-state.py invokes. Those are the provider's
+    OWN numbers, so they win over both of the ledger-derived views — and they are
+    available even with no ledger at all, which is exactly the case a %-only plan
+    (Anthropic Pro/Max) is in.
+
     When no source yields a percentage the caller assumes 0% (and says so).
 
     Returns {"ledger": path|None, "pools": {pool: {...}}, "state": {...}|None,
@@ -425,6 +526,9 @@ def read_ledger_usage(repo, now, profile=None):
     if not os.path.isfile(ledger):
         result["notes"].append(
             "no ledger at {} — assuming 0% used for every pool".format(ledger))
+        # A usage_provider needs no ledger, so the profile-driven state is still
+        # computed: without this a %-only pool could never bind anything.
+        _merge_local_state(result, repo, now, profile)
         return result
 
     result["ledger"] = ledger
@@ -437,6 +541,7 @@ def read_ledger_usage(repo, now, profile=None):
     if status != USAGE_STATE.SOURCE_LEDGER:
         result["notes"].append(
             "ledger {} is not readable — assuming 0% used for every pool".format(ledger))
+        _merge_local_state(result, repo, now, profile)
         return result
 
     report = _load_report_module()
@@ -506,27 +611,9 @@ def read_ledger_usage(repo, now, profile=None):
     for entry in result["pools"].values():
         entry.pop("_observed_at", None)
 
-    # #60: the local, budget-derived view of the same windows. It fills in only
-    # what the quota blocks did NOT provide — a provider-reported percentage
-    # always beats a locally computed one.
-    local_seen = False
-    if profile is not None:
-        state = USAGE_STATE.compute_usage_state(profile, repo, now)
-        result["state"] = state
-        result["notes"].extend(state["notes"])
-        for rec in state["records"]:
-            entry = bucket(rec["pool"])
-            entry["local_{}".format(rec["window"])] = rec
-            field = "window_{}_pct".format(rec["window"])
-            if rec["pct"] != USAGE_STATE.UNKNOWN and entry[field] is None:
-                entry[field] = float(rec["pct"])
-                entry[field + "_source"] = "budget"
-                local_seen = True
-            if (rec["window"] == "weekly" and entry["weekly_reset_at"] is None
-                    and rec["reset_at"] != USAGE_STATE.UNKNOWN
-                    and rec["reset_basis"] == "weekly_anchor"):
-                entry["weekly_reset_at"] = rec["reset_at"]
-                entry["weekly_reset_source"] = "anchor"
+    # #60/#68: the profile-driven view of the same windows — the local
+    # budget-derived percentages, plus whatever a pool's usage adapter reported.
+    local_seen, provider_seen = _merge_local_state(result, repo, now, profile)
 
     if quota_seen:
         result["notes"].append(
@@ -535,6 +622,8 @@ def read_ledger_usage(repo, now, profile=None):
         result["notes"].append(
             "window usage below is the LOCAL estimate: ledger tokens vs the profile's "
             "per-pool token budget (no provider usage API was called)")
+    elif provider_seen:
+        pass  # the per-pool notes above already name the adapter each pct came from
     else:
         result["notes"].append(
             "ledger {} has observed spend but no quota observations "
@@ -562,12 +651,14 @@ def _pct_provenance(pool_usage, field):
     """Suffix naming where a window percentage came from.
 
     A quota observation is reported bare (it is the closest thing to a
-    provider-reported number). A locally computed one says so, and an absent one
-    is flagged as the assumption it is.
+    provider-reported number). A locally computed one says so, an adapter-reported
+    one (#68) names its source, and an absent one is flagged as the assumption it is.
     """
     source = pool_usage.get(field + "_source")
     if source == "budget":
         return " (local: ledger tokens vs budget)"
+    if source == CAP_SOURCE_PROVIDER_PCT:
+        return " (provider-reported via the pool's usage_provider)"
     if pool_usage.get(field) is None:
         return " (assumed, no observation)"
     return ""
@@ -883,12 +974,14 @@ def _evaluate_rung(rung, policy, usage, now, exhausted, in_tier):
             continue
 
         # (c) Caps. Unknown usage fails OPEN — a missing denominator must never
-        # freeze the ladder.
-        if "source" in cap:
+        # freeze the ladder. A source-shaped cap only applies a window cap when it
+        # is source="provider_pct" AND declares the percentages to cap (#68); a
+        # bare source cap leaves the metering to the provider.
+        if "source" in cap and not all(field in cap for field in PCT_FIELDS):
             checks.append({
                 "kind": "cap", "pool": pool, "ok": True,
-                "detail": "pool {}: cap source=provider — the provider enforces its own "
-                          "limit, the harness applies none".format(pool),
+                "detail": "pool {}: cap source={} — the provider enforces its own "
+                          "limit, the harness applies none".format(pool, cap["source"]),
             })
         else:
             for field, used_label in (("window_5h_pct", "5h"), ("window_weekly_pct", "weekly")):
@@ -1234,25 +1327,33 @@ def cmd_validate(loaded, as_json):
 
 
 def _cap_label(cap):
+    pcts = all(field in cap for field in PCT_FIELDS)
+    windows = ("{}%/5h {}%/week".format(cap["window_5h_pct"], cap["window_weekly_pct"])
+               if pcts else "")
     if "backstop" in cap:
         label = "backstop"
     elif "source" in cap:
-        label = "provider"
+        label = "{}{}".format(cap["source"], " " + windows if pcts else "")
     else:
-        label = "{}%/5h {}%/week".format(cap["window_5h_pct"], cap["window_weekly_pct"])
+        label = windows
     extras = []
+    if USAGE_PROVIDER_KEY in cap:
+        extras.append("pct from {}".format(cap[USAGE_PROVIDER_KEY]))
     if BUDGET_5H_KEY in cap:
         extras.append("{} tok/5h".format(cap[BUDGET_5H_KEY]))
     if BUDGET_WEEKLY_KEY in cap:
         extras.append("{} tok/week".format(cap[BUDGET_WEEKLY_KEY]))
     if WEEKLY_ANCHOR_KEY in cap:
         extras.append("weekly reset anchored at {}".format(cap[WEEKLY_ANCHOR_KEY]))
-    return "{} budget[{}]".format(label, " ".join(extras)) if extras else label
+    return "{} usage[{}]".format(label, " ".join(extras)) if extras else label
 
 
 def _local_window_line(record):
-    """One line for a normalized per-pool usage record (#60)."""
-    if record["budget_tokens"] is None:
+    """One line for a normalized per-pool usage record (#60/#68)."""
+    if record.get("pct_source") == CAP_SOURCE_PROVIDER_PCT:
+        share = "{:.1f}% reported by the usage provider {}".format(
+            record["pct"], record["usage_provider"])
+    elif record["budget_tokens"] is None:
         share = "no budget configured -> pct unknown"
     else:
         share = "{:.1f}% of the {}-token budget".format(

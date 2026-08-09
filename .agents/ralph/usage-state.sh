@@ -3,9 +3,11 @@
 #
 # READ-ONLY: it reads <target-repo>/.ralph/ledger.jsonl and the efficiency profile
 # and prints the per-pool 5h/weekly token sums, the pct (only when the profile
-# configures a token budget for that window), the reset proximity and whether a
-# rung's avoid window is active now. It writes nothing, calls no provider API,
-# enforces no cap or reserve, and changes no selection.
+# configures a token budget for that window, or the pool's cap names a #68
+# usage_provider script that reports the provider's own percentages), the reset
+# proximity and whether a rung's avoid window is active now. It writes nothing,
+# enforces no cap or reserve, and changes no selection. The only thing it executes is
+# a pool's own usage_provider adapter; a failing adapter fails OPEN (pct=unknown).
 #
 # Sourced:  ralph_usage_state_json <target-repo> [profile-path]
 #           ralph_usage_state_report <target-repo> [profile-path]

@@ -23,6 +23,8 @@ pnpm-debug.log*
 # Efficiency profile — OPERATOR policy (cost/quota posture), like config.local.sh.
 # Only the .example is tracked; the real profile stays local.
 .agents/ralph/efficiency.json
+# Operator-supplied usage adapter for a %-only pool (#68); only the .example ships.
+.agents/ralph/usage_provider.sh
 
 # Temp
 .tmp/

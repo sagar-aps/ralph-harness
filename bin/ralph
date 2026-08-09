@@ -1595,15 +1595,16 @@ async function main() {
       if (exists(diagramSrc)) fs.copyFileSync(diagramSrc, diagramDst);
       if (exists(imageSrc)) fs.copyFileSync(imageSrc, imageDst);
       const projectRoot = path.resolve(localDir, "..", "..");
-      // Keep the operator's untracked local policy files (backend config +
-      // efficiency profile) out of version control; only their .example ships.
-      if (ensureGitignore(projectRoot, [
+      // Keep the operator's untracked local policy files (backend config,
+      // efficiency profile, usage adapter) out of version control; only their
+      // .example ships.
+      const localPolicyFiles = [
         ".agents/ralph/config.local.sh",
         ".agents/ralph/efficiency.json",
-      ])) {
-        console.log(
-          "Updated .gitignore (ignoring .agents/ralph/config.local.sh, .agents/ralph/efficiency.json)",
-        );
+        ".agents/ralph/usage_provider.sh",
+      ];
+      if (ensureGitignore(projectRoot, localPolicyFiles)) {
+        console.log(`Updated .gitignore (ignoring ${localPolicyFiles.join(", ")})`);
       }
     }
     if (installSkills) {

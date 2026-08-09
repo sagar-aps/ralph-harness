@@ -655,13 +655,25 @@ API, it only sums what the harness itself wrote to `<target>/.ralph/ledger.jsonl
 
 For every pool the rungs reference it reports, per window (rolling 5 h and the
 current week), a normalized record: `{pool, window, used_tokens, budget_tokens,
-pct, reset_at, in_avoid_window, source}`.
+pct, pct_source, usage_provider, reset_at, in_avoid_window, source}`.
 
 - **pct only with a budget.** Add `window_5h_budget_tokens` /
   `window_weekly_budget_tokens` to a pool's cap block and the token sums become a
   percentage. Without one there is no denominator, so `pct` is `unknown` and only
   the raw token count is reported — a percentage is never invented (the hard
   quota circuit remains the real backstop).
+- **…or a usage provider, for a %-only plan.** Some providers publish usage as a
+  *percentage* and sell no token budget — an Anthropic Pro/Max plan, which is the
+  pool the manager runs on, so its cap and reserve used to fail open forever. Give
+  that pool a cap of shape
+  `{"source": "provider_pct", "usage_provider": ".agents/ralph/usage_provider.sh"}`
+  and the reader runs that script and takes the
+  `{window_5h_pct, window_weekly_pct, weekly_reset_at}` it prints as the percentage
+  — no budget needed, cap and reserves bind normally. Add `window_5h_pct` /
+  `window_weekly_pct` to the same block to cap it locally too. A script that exits
+  non-zero, times out (20 s) or prints garbage **fails open** (pct `unknown`, the
+  quota circuit is the gate) and never crashes the harness. The contract and a
+  working implementation ship as `.agents/ralph/usage_provider.example.sh`.
 - **Reset proximity.** The 5 h reset is when the oldest in-window record ages out.
   The weekly window (and its reset, and `near_weekly_reset` vs
   `reserves.near_weekly_reset_hours`) needs `weekly_reset_anchor` — an ISO-8601 UTC
