@@ -44,12 +44,21 @@ Keep this file short. It is always loaded into context.
   `integrate`, `cleanup`, `init-target`, `install-agent-commands`. Run metadata:
   `<target>/.ralph/last-run.env`; artifacts: `<target>/.ralph/runs/<run-id>/` (review)
   or `<target>/.agent-run/batch-<ts>/` (batch).
-- Efficiency mode (opt-in, **governs nothing yet**): `.agents/ralph/efficiency.py` +
+- Efficiency mode (opt-in, **dispatches nothing yet**): `.agents/ralph/efficiency.py` +
   `efficiency.sh` parse/validate the declarative profile (`efficiency.json`, gitignored;
   `efficiency.json.example` ships the policy). `--efficiency`/`RALPH_EFFICIENCY` only
   boot-validates — an invalid profile is rejected to inert/off, never fatal — and
-  `ralph explain --complexity <tier>` reports which rung WOULD be chosen. Selection and
-  dispatch are unchanged; wiring them is a later slice. Per-pool usage comes from the
+  `ralph explain --complexity <tier>` reports which rung WOULD be chosen. The decision
+  itself is `ralph_efficiency_select <tier> [repo]` (efficiency.sh) / `efficiency.py
+  select` (#61): first eligible rung of the tier, where a pool is eligible unless an
+  avoid window is active, its #28 circuit is open (reused from `agents.sh`, never
+  re-implemented), or it breaches its cap/weekly reserve. The reserves are enforced in
+  CODE (anthropic 25 %, zai 55 % by default even if the profile omits them; the profile
+  only supplies the numbers), the near-WEEKLY-reset relaxation lifts the weekly cap +
+  reserve, unknown usage FAILS OPEN, deepseek is the always-on backstop, and an
+  unusable backstop returns a bounded PAUSE (rc 3; rc 4 = inert) instead of crashing.
+  Nothing there sets BUILDER/REVIEWER — dispatch is still a later slice (4d). Per-pool
+  usage comes from the
   read-only reader `usage-state.sh`/`usage-state.py` (#60): 5h + weekly token sums from
   `.ralph/ledger.jsonl`, converted to a pct ONLY when the profile sets that pool's
   `window_*_budget_tokens` (else pct=unknown, raw tokens still shown), plus reset

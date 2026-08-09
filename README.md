@@ -670,14 +670,47 @@ pct, reset_at, in_avoid_window, source}`.
 The reader writes nothing: the ledger, the profile and dispatch are untouched, and
 it enforces no cap or reserve.
 
+#### How a rung is chosen
+
+`explain` and the selection function are the same code. In shell it is
+`ralph_efficiency_select <complexity> [<target>]` (source `.agents/ralph/efficiency.sh`),
+which reports its decision in `RALPH_EFFICIENCY_SELECT_RUNG` / `_BUILDER` / `_REVIEWER`
+/ `_REASON` and returns **0** on a selection, **3** on a bounded pause and **4** when
+efficiency is inert. It walks the tier's rungs in order and takes the first eligible
+one; a rung is eligible only if every pool it draws on is:
+
+- **outside an avoid window** right now (current UTC day + time);
+- **not tripped in the hard quota circuit** — the `ralph_quota_pool_is_exhausted`
+  circuit from the provider-exhaustion path, reused as-is (an elapsed reset closes it);
+- **under its window caps** and **above its weekly reserve**.
+
+Two rules are deliberate:
+
+- **The reserves are enforced in code.** The profile supplies the numbers, but
+  omitting `reserves.anthropic_weekly_pct` / `zai_weekly_pct` does not switch the
+  reserve off — the built-in 25 % / 55 % (and `near_weekly_reset_hours` of 5) apply.
+  Within that many hours of the **weekly** reset both weekly gates (cap and reserve)
+  are relaxed: quota about to expire is quota you may as well spend. The rolling 5 h
+  cap is never relaxed.
+- **Unknown usage fails open.** With no budget and no quota observation there is no
+  percentage, and a missing number must never freeze the ladder: the pool stays
+  eligible and the hard circuit remains the real gate.
+
+If no rung of the tier is eligible, the `backstop: true` rung (deepseek) is used even
+when the tier does not list it — it is exempt from caps and reserves, and only its own
+circuit or avoid window can take it out. If even that is unavailable the result is a
+distinct **bounded PAUSE** (a retry instant, never longer than the 5 h window), never a
+crash and never a silent selection.
+
 Validation is **reject-to-safe**: a malformed or invalid profile is rejected with a
 loud warning on stderr and efficiency mode falls back to inert/off — it never crashes
-or fails a run. A missing profile prints a clean "not configured" message.
+or fails a run, and it never enforces part of a policy it could not parse. A missing
+profile prints a clean "not configured" message.
 
 `--efficiency` (or `RALPH_EFFICIENCY=1`) on `ralph review` / `ralph batch` is
-recognized and boot-validates the profile, but **selection and dispatch are
-unchanged** in this slice: `--builder` / `--reviewer` still decide who runs.
-Wiring the profile into selection is a later slice.
+recognized and boot-validates the profile, but **dispatch is unchanged** in this
+slice: selection is computed and reported, while `--builder` / `--reviewer` still
+decide who actually runs. Wiring the recommendation into dispatch is a later slice.
 
 ## State files (.ralph/)
 

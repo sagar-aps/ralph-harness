@@ -6,18 +6,23 @@ each role draws from, the window caps / avoid-windows that make a pool
 ineligible, the reserves to keep for higher-value work, and which rungs each
 complexity tier is allowed to use.
 
-This slice GOVERNS NOTHING. It parses, validates and explains — it never selects
-a backend, never enforces a reserve and never dispatches. Wiring it into
-builder/reviewer selection is a later slice (#54 step 4c).
+It parses, validates, explains and — since #54 step 4c — SELECTS: `select_rung`
+computes the rung a complexity tier would use, enforcing the pool caps, the
+avoid windows, the #28 circuit and the weekly reserves in code. It still
+DISPATCHES NOTHING: no caller's BUILDER/REVIEWER is touched here, and wiring the
+recommendation into dispatch is the next slice (#54 step 4d).
 
-The per-pool usage numbers `explain` reports come from the read-only reader in
-usage-state.py (#60): ledger token sums per window, turned into a percentage only
-when the profile configures a token budget for that pool + window.
+The per-pool usage numbers come from the read-only reader in usage-state.py
+(#60): ledger token sums per window, turned into a percentage only when the
+profile configures a token budget for that pool + window.
 
 Usage:
   python3 efficiency.py validate [--profile PATH] [--repo DIR] [--json]
   python3 efficiency.py explain --complexity <trivial|small|medium|large>
                                 [--profile PATH] [--repo DIR] [--json]
+  python3 efficiency.py select  --complexity <trivial|small|medium|large>
+                                [--profile PATH] [--repo DIR] [--json|--shell]
+                                [--exhausted-pool POOL]...
 
 Boot-validation contract: a malformed or invalid profile is REJECTED to a SAFE
 inert state — loud warning on stderr, "efficiency mode: OFF" on stdout, exit 0.
@@ -543,137 +548,348 @@ def _pct_provenance(pool_usage, field):
     return ""
 
 
-def evaluate(profile, complexity, usage, now):
-    """Evaluate every rung of a tier and pick the first fully eligible one."""
+# ---------------------------------------------------------------------------
+# Selection (#61) — the enforcement keystone
+#
+# select_rung(profile, complexity, usage, now, exhausted_pools) walks the tier's
+# allowed rungs in order and returns the FIRST eligible one. A rung is eligible
+# iff every pool it draws on is eligible, and a pool is eligible iff:
+#
+#   (a) no avoid window on the rung is active right now (current UTC day + time),
+#   (b) its #28 quota circuit is closed — the caller passes the open pools in,
+#       because the circuit semantics (and its reset handling) live exactly once,
+#       in agents.sh's ralph_quota_pool_is_exhausted, and
+#   (c) its window usage is under the profile's cap AND leaves the pool's weekly
+#       reserve intact — unless the weekly window resets within
+#       reserves.near_weekly_reset_hours, which RELAXES both weekly gates (quota
+#       about to expire is quota you may as well spend). The rolling 5h cap is
+#       never relaxed: it is a rate limit, not an expiring budget.
+#
+# Two deliberate asymmetries:
+#
+#   * FAIL-OPEN on unknown usage. No budget and no quota observation means no
+#     percentage (usage-state.py never invents one), and a missing number must
+#     never freeze the ladder: the pool stays eligible and the #28 circuit is the
+#     real gate. The caps are a local estimate; the circuit is fact.
+#   * The RESERVES are enforced HERE, in code. The profile supplies the numbers
+#     (validation has already rejected malformed ones), but a profile that simply
+#     omits reserves.anthropic_weekly_pct does NOT switch that reserve off — the
+#     code default below applies. Reserve policy is not bypassable by profile data.
+#
+# When no rung of the tier is eligible the always-on backstop rung is used even if
+# the tier does not list it; when even that is unavailable the result is a
+# distinct BOUNDED PAUSE signal. Never an exception, never a frozen loop.
+#
+# This still GOVERNS NOTHING: the result is a recommendation. Nothing here exports
+# BUILDER/REVIEWER and nothing is dispatched — that is #54 step 4d.
+# ---------------------------------------------------------------------------
+SELECT_SELECTED = "selected"
+SELECT_PAUSED = "paused"
+SELECT_INERT = "inert"
+
+# Pools whose weekly reserve is enforced by CODE, with the share of the weekly
+# window to keep unspent when the profile does not name one. The finalized policy
+# (#54): keep a quarter of the manager's (anthropic) week and a bit over half of
+# zai's week for higher-value work.
+DEFAULT_RESERVE_WEEKLY_PCT = {"anthropic": 25, "zai": 55}
+DEFAULT_NEAR_WEEKLY_RESET_HOURS = 5
+
+# A bounded PAUSE never waits longer than the shortest window the harness models
+# (the rolling 5h one) — after that there is always new information to re-evaluate.
+PAUSE_MAX_SECONDS = 5 * 3600
+PAUSE_MIN_SECONDS = 60
+
+
+def reserve_weekly_pct(pool, reserves):
+    """(reserve pct, source) for a pool — the profile's number, else the code default.
+
+    Returns (None, None) for a pool with neither, which is how a pool opts out of
+    reserves entirely (e.g. a provider-metered one).
+    """
+    value = reserves.get("{}_weekly_pct".format(pool)) if isinstance(reserves, dict) else None
+    if _is_pct(value):
+        return value, "from the profile"
+    if pool in DEFAULT_RESERVE_WEEKLY_PCT:
+        return DEFAULT_RESERVE_WEEKLY_PCT[pool], "code default, not set in the profile"
+    return None, None
+
+
+def near_weekly_reset_hours(reserves):
+    """(hours, source) — how close to the weekly reset lifts the weekly gates."""
+    value = reserves.get("near_weekly_reset_hours") if isinstance(reserves, dict) else None
+    if _is_number(value) and value >= 0:
+        return value, "from the profile"
+    return DEFAULT_NEAR_WEEKLY_RESET_HOURS, "code default, not set in the profile"
+
+
+def backstop_rung_name(profile):
+    """The name of the first rung whose every pool is an uncapped backstop, or None."""
+    for rung in profile.get("rungs", []):
+        caps = rung.get("caps", {})
+        pools = [rung[role]["pool"] for role in ("builder", "reviewer")]
+        if pools and all(isinstance(caps.get(p), dict) and "backstop" in caps[p] for p in pools):
+            return rung["name"]
+    return None
+
+
+def _evaluate_rung(rung, reserves, usage, now, exhausted, in_tier):
+    """Evaluate one rung: its avoid windows, then every pool it draws on."""
+    checks = []
+    eligible = True
+    lifted_any = False  # did the near-weekly-reset relaxation lift a weekly gate?
+    unblocks = []  # aware datetimes at which one of this rung's blocks could lift
+
+    for win in rung.get("avoid_windows", []):
+        active = window_active(win, now)
+        checks.append({
+            "kind": "avoid_window",
+            "pool": None,
+            "ok": not active,
+            "detail": "avoid window {}-{} {} {} ({}) — {}".format(
+                win["from"], win["to"], win["tz"], win["days"], win["reason"],
+                "ACTIVE now" if active else "not active now"),
+        })
+        if active:
+            eligible = False
+
+    pools = []
+    for role in ("builder", "reviewer"):
+        pool = rung[role]["pool"]
+        if pool not in pools:
+            pools.append(pool)
+
+    near_hours, near_source = near_weekly_reset_hours(reserves)
+
+    for pool in pools:
+        cap = rung["caps"][pool]
+        pool_usage = _pool_usage(usage, pool)
+        used_weekly = pool_usage["window_weekly_pct"]
+        hours = _hours_to_reset(pool_usage["weekly_reset_at"], now)
+        relaxed = hours is not None and hours <= near_hours
+        if hours is not None and hours > 0:
+            unblocks.append(now + datetime.timedelta(hours=hours))
+
+        # (b) The #28 circuit: observed provider exhaustion. It is the one gate
+        # that also binds the backstop, and the one that makes fail-open safe.
+        open_circuit = pool in exhausted
+        checks.append({
+            "kind": "circuit", "pool": pool, "ok": not open_circuit,
+            "detail": "pool {}: #28 quota circuit is {}".format(
+                pool,
+                "OPEN (the provider reported exhaustion and the reset has not elapsed)"
+                if open_circuit else "closed"),
+        })
+        if open_circuit:
+            eligible = False
+
+        if "backstop" in cap:
+            checks.append({
+                "kind": "cap", "pool": pool, "ok": True,
+                "detail": "pool {}: backstop rung — no window cap and no reserve, always "
+                          "eligible unless its circuit is open or an avoid window is "
+                          "active".format(pool),
+            })
+            continue
+
+        # (c) Caps. Unknown usage fails OPEN — a missing denominator must never
+        # freeze the ladder.
+        if "source" in cap:
+            checks.append({
+                "kind": "cap", "pool": pool, "ok": True,
+                "detail": "pool {}: cap source=provider — the provider enforces its own "
+                          "limit, the harness applies none".format(pool),
+            })
+        else:
+            for field, used_label in (("window_5h_pct", "5h"), ("window_weekly_pct", "weekly")):
+                limit = cap[field]
+                used = pool_usage[field]
+                value = used if used is not None else 0.0
+                over = used is not None and value >= limit
+                # Only the WEEKLY cap is lifted near the weekly reset.
+                lifted = over and used_label == "weekly" and relaxed
+                detail = "pool {}: {} window {:.1f}%{} vs cap {}% — {}".format(
+                    pool, used_label, value, _pct_provenance(pool_usage, field),
+                    limit, "OVER CAP" if over else "under cap")
+                if used is None:
+                    detail += " (FAIL-OPEN: no usage data for this pool)"
+                if lifted:
+                    lifted_any = True
+                    detail += ("; RELAXED — the weekly window resets in {:.1f}h "
+                               "(<= near_weekly_reset_hours={})".format(hours, near_hours))
+                checks.append({
+                    "kind": "cap", "pool": pool, "ok": (not over) or lifted, "detail": detail,
+                })
+                if over and not lifted:
+                    eligible = False
+
+        # (c) The reserve — enforced here, in code, from the profile's numbers.
+        reserve, reserve_source = reserve_weekly_pct(pool, reserves)
+        if reserve is None:
+            checks.append({
+                "kind": "reserve", "pool": pool, "ok": True,
+                "detail": "pool {}: no reserve configured ({}_weekly_pct unset and the pool "
+                          "has no code-enforced reserve)".format(pool, pool),
+            })
+        elif used_weekly is None:
+            checks.append({
+                "kind": "reserve", "pool": pool, "ok": True,
+                "detail": "pool {}: reserve {}% ({}) — weekly usage unknown, FAIL-OPEN "
+                          "(the #28 circuit is the real gate)".format(
+                              pool, reserve, reserve_source),
+            })
+        elif relaxed:
+            # Quota that is about to expire is quota you may as well spend.
+            lifted_any = lifted_any or (100.0 - used_weekly) < reserve
+            checks.append({
+                "kind": "reserve", "pool": pool, "ok": True,
+                "detail": "pool {}: reserve {}% RELAXED — weekly quota resets in "
+                          "{:.1f}h (<= near_weekly_reset_hours={}, {}); {:.1f}% of the "
+                          "weekly window left".format(
+                              pool, reserve, hours, near_hours, near_source,
+                              100.0 - used_weekly),
+            })
+        else:
+            remaining = 100.0 - used_weekly
+            breached = remaining < reserve
+            detail = "pool {}: {:.1f}% of the weekly window left{} vs reserve {}% ({}) — {}".format(
+                pool, remaining, _pct_provenance(pool_usage, "window_weekly_pct"),
+                reserve, reserve_source, "BELOW RESERVE" if breached else "above reserve")
+            if hours is None:
+                detail += "; weekly reset time unknown, no relaxation"
+            checks.append({
+                "kind": "reserve", "pool": pool, "ok": not breached, "detail": detail,
+            })
+            if breached:
+                eligible = False
+
+    return {
+        "name": rung["name"],
+        "builder": rung["builder"],
+        "reviewer": rung["reviewer"],
+        "pools": pools,
+        "in_tier": in_tier,
+        "eligible": eligible,
+        "relaxed": lifted_any,
+        "checks": checks,
+        "_unblocks": unblocks,
+    }
+
+
+def _blocking_reasons(entry):
+    """The failed checks of a rung, joined for a one-line explanation."""
+    return "; ".join(check["detail"] for check in entry["checks"] if not check["ok"])
+
+
+def _pause_signal(evaluated, now):
+    """A BOUNDED pause: how long to wait before re-evaluating. Never a crash.
+
+    The bound is the soonest moment a block could lift (a known weekly reset),
+    capped at PAUSE_MAX_SECONDS — within the rolling 5h window there is always new
+    information, so a pause never becomes an indefinite freeze.
+    """
+    seconds = PAUSE_MAX_SECONDS
+    candidates = [moment for entry in evaluated for moment in entry["_unblocks"] if moment > now]
+    if candidates:
+        seconds = min(seconds, int(round((min(candidates) - now).total_seconds())))
+    seconds = max(seconds, PAUSE_MIN_SECONDS)
+    return {
+        "seconds": seconds,
+        "until": (now + datetime.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def select_rung(profile, complexity, usage, now, exhausted_pools=()):
+    """Pick the (builder, reviewer) rung for one complexity tier.
+
+    Returns {status, rung_name, builder, reviewer, reason, ...}: status is
+    "selected" (rung_name/builder/reviewer are set) or "paused" (they are None and
+    `pause` carries the bounded retry hint). Pure and read-only — it inspects the
+    already-loaded profile plus the usage read by #60 and decides nothing else.
+    """
     rungs = {r["name"]: r for r in profile["rungs"]}
-    order = profile["tiers"][complexity]
+    order = list(profile["tiers"][complexity])
     reserves = profile.get("reserves", {})
-    near_reset_hours = reserves.get("near_weekly_reset_hours")
+    exhausted = set(exhausted_pools or ())
 
     evaluated = []
     chosen = None
-    chosen_at = None
     for name in order:
-        rung = rungs[name]
-        checks = []
-        eligible = True
+        entry = _evaluate_rung(rungs[name], reserves, usage, now, exhausted, True)
+        evaluated.append(entry)
+        if entry["eligible"] and chosen is None:
+            chosen = entry
 
-        for win in rung.get("avoid_windows", []):
-            active = window_active(win, now)
-            checks.append({
-                "kind": "avoid_window",
-                "pool": None,
-                "ok": not active,
-                "detail": "avoid window {}-{} {} {} ({}) — {}".format(
-                    win["from"], win["to"], win["tz"], win["days"], win["reason"],
-                    "ACTIVE now" if active else "not active now"),
-            })
-            if active:
-                eligible = False
+    # Nothing in the tier: fall back to the always-on backstop, even when the tier
+    # does not list it.
+    backstop_name = backstop_rung_name(profile)
+    backstop_used = False
+    if chosen is None and backstop_name:
+        entry = None
+        for candidate in evaluated:
+            if candidate["name"] == backstop_name:
+                entry = candidate
+                break
+        if entry is None:
+            entry = _evaluate_rung(rungs[backstop_name], reserves, usage, now, exhausted, False)
+            evaluated.append(entry)
+        if entry["eligible"]:
+            chosen = entry
+            backstop_used = True
 
-        pools = []
-        for role in ("builder", "reviewer"):
-            pool = rung[role]["pool"]
-            if pool not in pools:
-                pools.append(pool)
-
-        for pool in pools:
-            cap = rung["caps"][pool]
-            pool_usage = _pool_usage(usage, pool)
-            used_5h = pool_usage["window_5h_pct"]
-            used_weekly = pool_usage["window_weekly_pct"]
-            used_5h_val = used_5h if used_5h is not None else 0.0
-            used_weekly_val = used_weekly if used_weekly is not None else 0.0
-
-            if "backstop" in cap:
-                checks.append({
-                    "kind": "cap", "pool": pool, "ok": True,
-                    "detail": "pool {}: backstop rung — no window cap, always eligible".format(pool),
-                })
-            elif "source" in cap:
-                checks.append({
-                    "kind": "cap", "pool": pool, "ok": True,
-                    "detail": "pool {}: cap source=provider — the provider enforces its own "
-                              "limit, the harness applies none".format(pool),
-                })
-            else:
-                for field, used, used_label in (
-                    ("window_5h_pct", used_5h, "5h"),
-                    ("window_weekly_pct", used_weekly, "weekly"),
-                ):
-                    limit = cap[field]
-                    value = used if used is not None else 0.0
-                    over = value >= limit
-                    checks.append({
-                        "kind": "cap", "pool": pool, "ok": not over,
-                        "detail": "pool {}: {} window {:.1f}%{} vs cap {}% — {}".format(
-                            pool, used_label, value, _pct_provenance(pool_usage, field),
-                            limit, "OVER CAP" if over else "under cap"),
-                    })
-                    if over:
-                        eligible = False
-
-            reserve_key = "{}_weekly_pct".format(pool)
-            reserve = reserves.get(reserve_key)
-            if reserve is None:
-                checks.append({
-                    "kind": "reserve", "pool": pool, "ok": True,
-                    "detail": "pool {}: no reserve configured ({} unset)".format(pool, reserve_key),
-                })
-            else:
-                remaining = 100.0 - used_weekly_val
-                hours = _hours_to_reset(pool_usage["weekly_reset_at"], now)
-                relaxed = (
-                    _is_number(near_reset_hours)
-                    and hours is not None
-                    and hours <= near_reset_hours
-                )
-                breached = remaining < reserve
-                if relaxed:
-                    checks.append({
-                        "kind": "reserve", "pool": pool, "ok": True,
-                        "detail": "pool {}: reserve {}% RELAXED — weekly quota resets in "
-                                  "{:.1f}h (<= near_weekly_reset_hours={})".format(
-                                      pool, reserve, hours, near_reset_hours),
-                    })
-                else:
-                    detail = "pool {}: {:.1f}% of the weekly window left{} vs reserve {}% — {}".format(
-                        pool, remaining,
-                        _pct_provenance(pool_usage, "window_weekly_pct"),
-                        reserve, "BELOW RESERVE" if breached else "above reserve")
-                    if hours is None:
-                        detail += "; weekly reset time unknown, no relaxation"
-                    checks.append({
-                        "kind": "reserve", "pool": pool, "ok": not breached, "detail": detail,
-                    })
-                    if breached:
-                        eligible = False
-
-        evaluated.append({
-            "name": name,
-            "builder": rung["builder"],
-            "reviewer": rung["reviewer"],
-            "pools": pools,
-            "eligible": eligible,
-            "checks": checks,
-        })
-        if eligible and chosen is None:
-            chosen = name
-            chosen_at = len(evaluated) - 1
+    result = {
+        "status": SELECT_SELECTED,
+        "complexity": complexity,
+        "order": order,
+        "rungs": evaluated,
+        "backstop": backstop_used,
+        "backstop_rung": backstop_name,
+        "pause": None,
+        "enforced": False,
+    }
 
     if chosen is None:
-        why = ("no rung in tier '{}' is eligible right now — every allowed rung is "
-               "blocked by a cap, an active avoid window or a reserve".format(complexity))
-    else:
-        blocked = [r["name"] for r in evaluated[:chosen_at] if not r["eligible"]]
-        if blocked:
-            why = ("first eligible rung in tier '{}' — {} {} skipped (see above)".format(
-                complexity, ", ".join(blocked), "was" if len(blocked) == 1 else "were"))
+        pause = _pause_signal(evaluated, now)
+        if backstop_name is None:
+            unavailable = "the profile configures no backstop rung"
         else:
-            why = ("cheapest rung in tier '{}' and every check passed".format(complexity))
+            blocked = [e for e in evaluated if e["name"] == backstop_name]
+            unavailable = "the '{}' backstop rung is unavailable too ({})".format(
+                backstop_name, _blocking_reasons(blocked[0]) if blocked else "not evaluated")
+        result.update({
+            "status": SELECT_PAUSED,
+            "rung_name": None,
+            "builder": None,
+            "reviewer": None,
+            "pause": pause,
+            "reason": ("no rung in tier '{}' is eligible right now and {} — bounded PAUSE: "
+                       "retry in {}s (at {})".format(
+                           complexity, unavailable, pause["seconds"], pause["until"])),
+        })
+    else:
+        if backstop_used:
+            reason = ("no rung in tier '{}' is eligible right now — falling back to the "
+                      "'{}' backstop rung (uncapped last resort)".format(
+                          complexity, chosen["name"]))
+        else:
+            blocked = [e["name"] for e in evaluated[:evaluated.index(chosen)] if not e["eligible"]]
+            if blocked:
+                reason = ("first eligible rung in tier '{}' — {} {} skipped (see above)".format(
+                    complexity, ", ".join(blocked), "was" if len(blocked) == 1 else "were"))
+            else:
+                reason = "cheapest rung in tier '{}' and every check passed".format(complexity)
+            if chosen["relaxed"]:
+                reason += (" — its weekly gate(s) only pass because the weekly window "
+                           "resets soon (near-weekly-reset relaxation)")
+        result.update({
+            "rung_name": chosen["name"],
+            "builder": chosen["builder"],
+            "reviewer": chosen["reviewer"],
+            "reason": reason,
+        })
 
-    return {"complexity": complexity, "order": list(order), "rungs": evaluated,
-            "chosen": chosen, "why": why}
+    for entry in evaluated:
+        entry.pop("_unblocks", None)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +1010,7 @@ def _local_window_line(record):
     return line
 
 
-def cmd_explain(loaded, complexity, repo, as_json):
+def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
     now = now_utc()
 
     if loaded["status"] != STATUS_VALID:
@@ -818,11 +1034,13 @@ def cmd_explain(loaded, complexity, repo, as_json):
 
     profile = loaded["profile"]
     usage = read_ledger_usage(repo, now, profile)
-    result = evaluate(profile, complexity, usage, now)
+    result = select_rung(profile, complexity, usage, now, exhausted)
 
     if as_json:
         payload = dict(result)
-        payload["status"] = STATUS_VALID
+        payload["selection_status"] = result["status"]
+        payload["status"] = STATUS_VALID          # the PROFILE's status, as ever
+        payload["chosen"] = result["rung_name"]   # explain's historical key
         payload["profile_path"] = loaded["path"]
         payload["now_utc"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         payload["usage"] = {"ledger": usage["ledger"], "notes": usage["notes"],
@@ -843,8 +1061,9 @@ def cmd_explain(loaded, complexity, repo, as_json):
         complexity, " -> ".join(result["order"])))
     print("")
     for i, rung in enumerate(result["rungs"], start=1):
-        print("  {}. {}  builder={}({}) reviewer={}({})".format(
-            i, rung["name"], rung["builder"]["backend"], rung["builder"]["pool"],
+        print("  {}. {}{}  builder={}({}) reviewer={}({})".format(
+            i, rung["name"], "" if rung["in_tier"] else " [backstop, outside the tier order]",
+            rung["builder"]["backend"], rung["builder"]["pool"],
             rung["reviewer"]["backend"], rung["reviewer"]["pool"]))
         for check in rung["checks"]:
             print("     [{}] {}".format("ok" if check["ok"] else "no", check["detail"]))
@@ -861,10 +1080,129 @@ def cmd_explain(loaded, complexity, repo, as_json):
                     print("     [--] {}".format(_local_window_line(local)))
         print("     => {}".format("ELIGIBLE" if rung["eligible"] else "NOT ELIGIBLE"))
         print("")
-    print("CHOSEN: {}".format(result["chosen"] or "none"))
-    print("WHY: {}".format(result["why"]))
+    print("CHOSEN: {}".format(result["rung_name"] or "none"))
+    print("WHY: {}".format(result["reason"]))
+    if result["status"] == SELECT_PAUSED:
+        print("PAUSE: bounded — retry in {}s (at {})".format(
+            result["pause"]["seconds"], result["pause"]["until"]))
     print(GOVERNS_NOTHING)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# select
+#
+# Exit code is a STATUS, never a crash: 0 = a rung was selected, EXIT_PAUSED = the
+# bounded pause, EXIT_INERT = efficiency is off (no profile / rejected profile), in
+# which case the caller keeps its normal --builder/--reviewer path.
+# ---------------------------------------------------------------------------
+EXIT_PAUSED = 3
+EXIT_INERT = 4
+
+SELECT_GOVERNS_NOTHING = (
+    "note: this is a recommendation only — efficiency mode governs nothing yet, "
+    "nothing was dispatched, and --builder/--reviewer selection is unchanged.")
+
+
+def _shell_assignments(pairs):
+    """Emit `KEY=value` lines that a shell can safely `eval`."""
+    import shlex
+    for key, value in pairs:
+        print("{}={}".format(key, shlex.quote("" if value is None else str(value))))
+
+
+def _select_shell_payload(result, loaded, now):
+    return [
+        ("RALPH_EFFICIENCY_SELECT_STATUS", result["status"]),
+        ("RALPH_EFFICIENCY_SELECT_COMPLEXITY", result.get("complexity")),
+        ("RALPH_EFFICIENCY_SELECT_RUNG", result.get("rung_name")),
+        ("RALPH_EFFICIENCY_SELECT_BUILDER",
+         (result.get("builder") or {}).get("backend")),
+        ("RALPH_EFFICIENCY_SELECT_BUILDER_POOL",
+         (result.get("builder") or {}).get("pool")),
+        ("RALPH_EFFICIENCY_SELECT_REVIEWER",
+         (result.get("reviewer") or {}).get("backend")),
+        ("RALPH_EFFICIENCY_SELECT_REVIEWER_POOL",
+         (result.get("reviewer") or {}).get("pool")),
+        ("RALPH_EFFICIENCY_SELECT_BACKSTOP", "1" if result.get("backstop") else ""),
+        ("RALPH_EFFICIENCY_SELECT_PAUSE_SECONDS",
+         (result.get("pause") or {}).get("seconds")),
+        ("RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL", (result.get("pause") or {}).get("until")),
+        ("RALPH_EFFICIENCY_SELECT_REASON", result.get("reason")),
+        ("RALPH_EFFICIENCY_SELECT_PROFILE", loaded["path"]),
+        ("RALPH_EFFICIENCY_SELECT_NOW", now.strftime("%Y-%m-%dT%H:%M:%SZ")),
+    ]
+
+
+def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted):
+    now = now_utc()
+
+    if loaded["status"] != STATUS_VALID:
+        # Reject-to-safe (4a): a bad or missing profile makes efficiency inert.
+        # There is no partial enforcement — the caller keeps its own selection.
+        if loaded["status"] == STATUS_REJECTED:
+            warn_rejected(loaded)
+        inert = {"status": SELECT_INERT, "complexity": complexity, "rung_name": None,
+                 "builder": None, "reviewer": None, "pause": None, "backstop": False,
+                 "enforced": False,
+                 "reason": "efficiency mode is OFF (inert): profile {}".format(
+                     loaded["status"])}
+        if as_shell:
+            _shell_assignments(_select_shell_payload(inert, loaded, now))
+            return EXIT_INERT
+        if as_json:
+            payload = dict(inert)
+            payload["profile_status"] = loaded["status"]
+            payload["profile_path"] = loaded["path"]
+            payload["errors"] = loaded["errors"]
+            json.dump(payload, sys.stdout, indent=2, sort_keys=True, default=str)
+            sys.stdout.write("\n")
+            return EXIT_INERT
+        if loaded["status"] == STATUS_NOT_CONFIGURED:
+            print_not_configured(loaded)
+        else:
+            print("efficiency profile: {}".format(loaded["path"]))
+            print("  status: REJECTED (see the warning above)")
+            print(INERT_LINE)
+        return EXIT_INERT
+
+    usage = read_ledger_usage(repo, now, loaded["profile"])
+    result = select_rung(loaded["profile"], complexity, usage, now, exhausted)
+    code = 0 if result["status"] == SELECT_SELECTED else EXIT_PAUSED
+
+    if as_shell:
+        _shell_assignments(_select_shell_payload(result, loaded, now))
+        return code
+    if as_json:
+        payload = dict(result)
+        payload["profile_status"] = loaded["status"]
+        payload["profile_path"] = loaded["path"]
+        payload["now_utc"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload["usage"] = {"ledger": usage["ledger"], "notes": usage["notes"],
+                            "pools": usage["pools"], "state": usage["state"]}
+        payload["exhausted_pools"] = sorted(exhausted)
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True, default=str)
+        sys.stdout.write("\n")
+        return code
+
+    print("efficiency select — complexity: {}".format(complexity))
+    print("  profile: {} (VALID)".format(loaded["path"]))
+    print("  now (UTC): {}".format(now.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    if exhausted:
+        print("  #28 open quota circuits: {}".format(", ".join(sorted(exhausted))))
+    if result["status"] == SELECT_PAUSED:
+        print("PAUSE: bounded — retry in {}s (at {})".format(
+            result["pause"]["seconds"], result["pause"]["until"]))
+    else:
+        print("SELECTED: {}{}".format(
+            result["rung_name"], " (backstop)" if result["backstop"] else ""))
+        print("  builder:  {} (pool {})".format(
+            result["builder"]["backend"], result["builder"]["pool"]))
+        print("  reviewer: {} (pool {})".format(
+            result["reviewer"]["backend"], result["reviewer"]["pool"]))
+    print("REASON: {}".format(result["reason"]))
+    print(SELECT_GOVERNS_NOTHING)
+    return code
 
 
 # ---------------------------------------------------------------------------
@@ -872,8 +1210,11 @@ def cmd_explain(loaded, complexity, repo, as_json):
 # ---------------------------------------------------------------------------
 USAGE = (
     "Usage: efficiency.py validate [--profile PATH] [--repo DIR] [--json]\n"
-    "       efficiency.py explain --complexity <{}> "
-    "[--profile PATH] [--repo DIR] [--json]".format("|".join(TIERS))
+    "       efficiency.py explain --complexity <{tiers}> "
+    "[--profile PATH] [--repo DIR] [--json]\n"
+    "       efficiency.py select --complexity <{tiers}> "
+    "[--profile PATH] [--repo DIR] [--json|--shell]\n"
+    "                            [--exhausted-pool POOL]...".format(tiers="|".join(TIERS))
 )
 
 
@@ -882,7 +1223,7 @@ def main(argv):
         print(USAGE)
         return 0
     command = argv[0]
-    if command not in ("validate", "explain"):
+    if command not in ("validate", "explain", "select"):
         print("ralph: unknown efficiency command {!r}".format(command), file=sys.stderr)
         print(USAGE, file=sys.stderr)
         return 2
@@ -891,13 +1232,19 @@ def main(argv):
     repo = os.getcwd()
     complexity = None
     as_json = False
+    as_shell = False
+    # Pools whose #28 circuit the CALLER found open. agents.sh owns that decision
+    # (ralph_quota_pool_is_exhausted); this module never re-derives it.
+    exhausted = []
     rest = argv[1:]
     i = 0
     while i < len(rest):
         arg = rest[i]
         if arg == "--json":
             as_json = True
-        elif arg in ("--profile", "--repo", "--complexity"):
+        elif arg == "--shell":
+            as_shell = True
+        elif arg in ("--profile", "--repo", "--complexity", "--exhausted-pool"):
             if i + 1 >= len(rest):
                 print("ralph: {} needs a value".format(arg), file=sys.stderr)
                 return 2
@@ -907,6 +1254,8 @@ def main(argv):
                 profile_arg = value
             elif arg == "--repo":
                 repo = value
+            elif arg == "--exhausted-pool":
+                exhausted.append(value)
             else:
                 complexity = value
         elif arg.startswith("--profile="):
@@ -915,6 +1264,8 @@ def main(argv):
             repo = arg.split("=", 1)[1]
         elif arg.startswith("--complexity="):
             complexity = arg.split("=", 1)[1]
+        elif arg.startswith("--exhausted-pool="):
+            exhausted.append(arg.split("=", 1)[1])
         else:
             print("ralph: unknown efficiency option {!r}".format(arg), file=sys.stderr)
             print(USAGE, file=sys.stderr)
@@ -925,8 +1276,12 @@ def main(argv):
         # The reader owns the clock/window primitives; without it nothing here can
         # be evaluated honestly, so fall back to inert exactly like a rejection.
         print(USAGE_STATE_MISSING, file=sys.stderr)
-        print(INERT_LINE)
-        return 0
+        if as_shell:
+            _shell_assignments([("RALPH_EFFICIENCY_SELECT_STATUS", SELECT_INERT),
+                                ("RALPH_EFFICIENCY_SELECT_REASON", USAGE_STATE_MISSING)])
+        else:
+            print(INERT_LINE)
+        return EXIT_INERT if command == "select" else 0
 
     path = resolve_profile_path(profile_arg, repo)
     loaded = load_profile(path)
@@ -935,13 +1290,16 @@ def main(argv):
         return cmd_validate(loaded, as_json)
 
     if not complexity:
-        print("ralph: explain needs --complexity <{}>".format("|".join(TIERS)), file=sys.stderr)
+        print("ralph: {} needs --complexity <{}>".format(command, "|".join(TIERS)),
+              file=sys.stderr)
         return 2
     if complexity not in TIERS:
         print("ralph: unknown complexity {!r} — expected one of {}".format(
             complexity, ", ".join(TIERS)), file=sys.stderr)
         return 2
-    return cmd_explain(loaded, complexity, repo, as_json)
+    if command == "select":
+        return cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted)
+    return cmd_explain(loaded, complexity, repo, as_json, exhausted)
 
 
 if __name__ == "__main__":
