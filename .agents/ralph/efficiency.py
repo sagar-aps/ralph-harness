@@ -6,6 +6,10 @@ each role draws from, the window caps / avoid-windows that make a pool
 ineligible, the reserves to keep for higher-value work, and which rungs each
 complexity tier is allowed to use.
 
+Since #63 the reserves are keyed by the control-plane ROLE (manager /
+orchestrator), not by pool: each role is resolved to the pool it actually runs on
+and its reserve lands there, stacking when two roles share a pool.
+
 It parses, validates, explains and — since #54 step 4c — SELECTS: `select_rung`
 computes the rung a complexity tier would use, enforcing the pool caps, the
 avoid windows, the #28 circuit and the weekly reserves in code. This module
@@ -41,6 +45,13 @@ import os
 import sys
 
 TIERS = ("trivial", "small", "medium", "large")
+
+# The control-plane ROLES that hold a weekly reserve (#63), in the order they are
+# reported. A reserve belongs to the ROLE, not to a pool: it is applied to whatever
+# pool that role currently runs on, and two roles sharing a pool STACK there.
+ROLES = ("manager", "orchestrator")
+ROLE_RESERVE_KEY = {"manager": "manager_pct", "orchestrator": "orchestrator_pct"}
+ROLE_RESERVE_KEYS = tuple(ROLE_RESERVE_KEY[role] for role in ROLES)
 
 STATUS_VALID = "valid"
 STATUS_NOT_CONFIGURED = "not_configured"
@@ -291,7 +302,7 @@ def validate_profile(raw):
         errors.append("reserves: must be an object")
     else:
         for key, val in reserves.items():
-            if key.endswith("_weekly_pct"):
+            if key in ROLE_RESERVE_KEYS:
                 if not _is_pct(val):
                     errors.append("reserves.{}: must be a number 0-100 (got {!r})".format(key, val))
             elif key == "near_weekly_reset_hours":
@@ -299,10 +310,17 @@ def validate_profile(raw):
                     errors.append(
                         "reserves.near_weekly_reset_hours: must be a number >= 0 "
                         "(got {!r})".format(val))
+            elif key.endswith("_weekly_pct"):
+                # #63 retired the pool-keyed spelling: a reserve now follows the
+                # ROLE onto whatever pool that role runs on.
+                errors.append(
+                    "reserves.{}: pool-keyed reserves were replaced by role-keyed ones "
+                    "(#63) — use {} instead; the reserve then follows the role onto "
+                    "whichever pool it runs on".format(key, " / ".join(ROLE_RESERVE_KEYS)))
             else:
                 errors.append(
-                    "reserves.{}: unknown key — expected <pool>_weekly_pct or "
-                    "near_weekly_reset_hours".format(key))
+                    "reserves.{}: unknown key — expected {} or "
+                    "near_weekly_reset_hours".format(key, " / ".join(ROLE_RESERVE_KEYS)))
 
     # -- tiers -------------------------------------------------------------
     tiers = raw.get("tiers")
@@ -573,10 +591,11 @@ def _pct_provenance(pool_usage, field):
 #     percentage (usage-state.py never invents one), and a missing number must
 #     never freeze the ladder: the pool stays eligible and the #28 circuit is the
 #     real gate. The caps are a local estimate; the circuit is fact.
-#   * The RESERVES are enforced HERE, in code. The profile supplies the numbers
-#     (validation has already rejected malformed ones), but a profile that simply
-#     omits reserves.anthropic_weekly_pct does NOT switch that reserve off — the
-#     code default below applies. Reserve policy is not bypassable by profile data.
+#   * The RESERVES are enforced HERE, in code, and they follow the ROLE (#63). The
+#     profile supplies the numbers (validation has already rejected malformed ones),
+#     but a profile that simply omits reserves.manager_pct does NOT switch that
+#     reserve off — the code default below applies. Reserve policy is not bypassable
+#     by profile data.
 #
 # When no rung of the tier is eligible the always-on backstop rung is used even if
 # the tier does not list it; when even that is unavailable the result is a
@@ -589,12 +608,16 @@ SELECT_SELECTED = "selected"
 SELECT_PAUSED = "paused"
 SELECT_INERT = "inert"
 
-# Pools whose weekly reserve is enforced by CODE, with the share of the weekly
-# window to keep unspent when the profile does not name one. The finalized policy
-# (#54): keep a quarter of the manager's (anthropic) week and a bit over half of
-# zai's week for higher-value work.
-DEFAULT_RESERVE_WEEKLY_PCT = {"anthropic": 25, "zai": 55}
+# The share of the weekly window each control-plane ROLE keeps unspent, enforced by
+# CODE when the profile does not name it. The finalized policy (#54, re-keyed by
+# #63): a quarter of the week for the manager, half of it for the orchestrator —
+# wherever those roles happen to run.
+DEFAULT_ROLE_RESERVE_PCT = {"manager": 25, "orchestrator": 50}
 DEFAULT_NEAR_WEEKLY_RESET_HOURS = 5
+
+# The manager runs on the strongest Claude by charter, so it draws on the anthropic
+# pool unless RALPH_MANAGER_POOL moves it.
+DEFAULT_MANAGER_POOL = "anthropic"
 
 # A bounded PAUSE never waits longer than the shortest window the harness models
 # (the rolling 5h one) — after that there is always new information to re-evaluate.
@@ -602,18 +625,175 @@ PAUSE_MAX_SECONDS = 5 * 3600
 PAUSE_MIN_SECONDS = 60
 
 
-def reserve_weekly_pct(pool, reserves):
-    """(reserve pct, source) for a pool — the profile's number, else the code default.
+def role_reserve_pct(role, reserves):
+    """(reserve pct, source) for a control-plane role.
 
-    Returns (None, None) for a pool with neither, which is how a pool opts out of
-    reserves entirely (e.g. a provider-metered one).
+    The profile's number when it has one, else the code default: omitting the key
+    supplies no number, it does not switch the reserve off.
     """
-    value = reserves.get("{}_weekly_pct".format(pool)) if isinstance(reserves, dict) else None
+    key = ROLE_RESERVE_KEY[role]
+    value = reserves.get(key) if isinstance(reserves, dict) else None
     if _is_pct(value):
         return value, "from the profile"
-    if pool in DEFAULT_RESERVE_WEEKLY_PCT:
-        return DEFAULT_RESERVE_WEEKLY_PCT[pool], "code default, not set in the profile"
-    return None, None
+    return DEFAULT_ROLE_RESERVE_PCT[role], "code default, not set in the profile"
+
+
+def backend_pools(profile):
+    """backend name -> credential pool, learned from the profile's own rungs."""
+    mapping = {}
+    for rung in profile.get("rungs", []):
+        if not isinstance(rung, dict):
+            continue
+        for role in ("builder", "reviewer"):
+            spec = rung.get(role)
+            if not isinstance(spec, dict):
+                continue
+            backend, pool = spec.get("backend"), spec.get("pool")
+            if _nonempty_str(backend) and _nonempty_str(pool):
+                mapping.setdefault(backend, pool)
+    return mapping
+
+
+def profile_pools(profile):
+    """Every credential pool the profile names, in first-seen order."""
+    pools = []
+    for rung in profile.get("rungs", []):
+        if not isinstance(rung, dict):
+            continue
+        for role in ("builder", "reviewer"):
+            spec = rung.get(role)
+            pool = spec.get("pool") if isinstance(spec, dict) else None
+            if _nonempty_str(pool) and pool not in pools:
+                pools.append(pool)
+        caps = rung.get("caps")
+        if isinstance(caps, dict):
+            for pool in caps:
+                if _nonempty_str(pool) and pool not in pools:
+                    pools.append(pool)
+    return pools
+
+
+def pool_for_backend(name, mapping, pools):
+    """The pool a backend/provider name draws on, or None when nothing maps it."""
+    if not _nonempty_str(name):
+        return None
+    if name in mapping:
+        return mapping[name]
+    # A normalized provider spelling (RALPH_CRON_DRIVER_PROVIDER=zai) often names the
+    # pool itself rather than a backend the ladder happens to list.
+    if name in pools:
+        return name
+    return None
+
+
+# Ask agents.sh what RALPH_CRON_DRIVER currently resolves to. The resolution rules
+# (and the default when nothing is set) live exactly once, in #52's
+# ralph_resolve_cron_driver — this never re-implements them, it only reads the
+# answer out of a throwaway shell so nothing leaks into the caller's environment.
+# Three candidates come back, best first: the normalized provider spelling (which
+# names a vendor directly, where the resolved backend would be the synthetic
+# "ralph-cron"), the backend the resolver settled on, and the raw name it was given
+# — the last one still identifies the vendor when that backend has no command
+# defined in this shell, which must not cost the orchestrator its reserve.
+CRON_DRIVER_PROBE = (
+    '. "$1" >/dev/null 2>&1 || exit 0\n'
+    'ralph_resolve_cron_driver >/dev/null 2>&1\n'
+    'printf "%s\\n" "${RALPH_CRON_DRIVER_PROVIDER:-}"\n'
+    'printf "%s\\n" "${RALPH_CRON_DRIVER_BACKEND:-}"\n'
+    'printf "%s\\n" "${RALPH_CRON_DRIVER:-${RALPH_CRON_DRIVER_DEFAULT:-${DEFAULT_AGENT:-}}}"\n'
+)
+
+
+def cron_driver_candidates():
+    """Names the #52 cron-driver resolver yields for the orchestrator, best first."""
+    agents_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents.sh")
+    if not os.path.isfile(agents_sh):
+        return []
+    import subprocess
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-c", CRON_DRIVER_PROBE, "ralph-efficiency", agents_sh],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        # Bounded: a shell that will not answer must not freeze the selection.
+        out = proc.communicate(timeout=15)[0]
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        return []
+    names = []
+    for line in (out or "").splitlines():
+        name = line.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def resolve_role_pools(profile):
+    """Which credential pool each control-plane ROLE draws on right now (#63).
+
+    Returns {role: {pool, backend, source}}; `pool` is None when nothing maps the
+    role to one of the profile's pools, in which case that role holds no reserve
+    anywhere (rather than silently reserving on some arbitrary pool).
+    """
+    mapping = backend_pools(profile)
+    pools = profile_pools(profile)
+    roles = {}
+
+    override = os.environ.get("RALPH_MANAGER_POOL", "").strip()
+    roles["manager"] = {
+        "pool": override or DEFAULT_MANAGER_POOL,
+        "backend": None,
+        "source": ("RALPH_MANAGER_POOL" if override else
+                   "default {} pool (the manager runs on the strongest Claude by "
+                   "charter; set RALPH_MANAGER_POOL to move it)".format(
+                       DEFAULT_MANAGER_POOL)),
+    }
+
+    candidates = cron_driver_candidates()
+    backend = candidates[0] if candidates else None
+    pool = None
+    for name in candidates:
+        resolved = pool_for_backend(name, mapping, pools)
+        if resolved is not None:
+            backend, pool = name, resolved
+            break
+    if pool is not None:
+        source = "RALPH_CRON_DRIVER resolves to {!r}".format(backend)
+    elif backend:
+        source = ("RALPH_CRON_DRIVER resolves to {!r}, which no rung maps to a "
+                  "pool — no orchestrator reserve applies".format(backend))
+    else:
+        source = ("the cron driver could not be resolved (agents.sh unavailable) — "
+                  "no orchestrator reserve applies")
+    roles["orchestrator"] = {"pool": pool, "backend": backend, "source": source}
+    return roles
+
+
+def effective_reserves(profile, roles):
+    """pool -> {pct, parts}: the SUM of the reserves of every role on that pool.
+
+    Stacking is the point: when the manager and the orchestrator share a pool, that
+    pool has to carry both of their weeks.
+    """
+    reserves = profile.get("reserves") or {}
+    effective = {}
+    for role in ROLES:
+        pool = (roles.get(role) or {}).get("pool")
+        if not _nonempty_str(pool):
+            continue
+        pct, source = role_reserve_pct(role, reserves)
+        entry = effective.setdefault(pool, {"pct": 0, "parts": []})
+        entry["pct"] += pct
+        entry["parts"].append({"role": role, "pct": pct, "source": source})
+    return effective
+
+
+def _reserve_parts_label(entry):
+    """Name every role stacked into one pool's reserve, and where its number came from."""
+    return " + ".join("{} {}% [{}]".format(part["role"], part["pct"], part["source"])
+                      for part in entry["parts"])
 
 
 def near_weekly_reset_hours(reserves):
@@ -634,7 +814,7 @@ def backstop_rung_name(profile):
     return None
 
 
-def _evaluate_rung(rung, reserves, usage, now, exhausted, in_tier):
+def _evaluate_rung(rung, policy, usage, now, exhausted, in_tier):
     """Evaluate one rung: its avoid windows, then every pool it draws on."""
     checks = []
     eligible = True
@@ -660,7 +840,7 @@ def _evaluate_rung(rung, reserves, usage, now, exhausted, in_tier):
         if pool not in pools:
             pools.append(pool)
 
-    near_hours, near_source = near_weekly_reset_hours(reserves)
+    near_hours, near_source = policy["near_hours"], policy["near_source"]
 
     for pool in pools:
         cap = rung["caps"][pool]
@@ -724,13 +904,17 @@ def _evaluate_rung(rung, reserves, usage, now, exhausted, in_tier):
                 if over and not lifted:
                     eligible = False
 
-        # (c) The reserve — enforced here, in code, from the profile's numbers.
-        reserve, reserve_source = reserve_weekly_pct(pool, reserves)
+        # (c) The reserve — enforced here, in code, from the profile's numbers. It
+        # belongs to the control-plane ROLE, so it sits on whatever pool that role
+        # runs on today, and stacks when the manager and the orchestrator share one.
+        stacked = policy["effective"].get(pool)
+        reserve = stacked["pct"] if stacked else None
+        reserve_source = _reserve_parts_label(stacked) if stacked else None
         if reserve is None:
             checks.append({
                 "kind": "reserve", "pool": pool, "ok": True,
-                "detail": "pool {}: no reserve configured ({}_weekly_pct unset and the pool "
-                          "has no code-enforced reserve)".format(pool, pool),
+                "detail": "pool {}: no reserve — no control-plane role runs on this "
+                          "pool".format(pool),
             })
         elif used_weekly is None:
             checks.append({
@@ -800,23 +984,33 @@ def _pause_signal(evaluated, now):
     }
 
 
-def select_rung(profile, complexity, usage, now, exhausted_pools=()):
+def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None):
     """Pick the (builder, reviewer) rung for one complexity tier.
 
     Returns {status, rung_name, builder, reviewer, reason, ...}: status is
     "selected" (rung_name/builder/reviewer are set) or "paused" (they are None and
     `pause` carries the bounded retry hint). Pure and read-only — it inspects the
     already-loaded profile plus the usage read by #60 and decides nothing else.
+
+    `roles` overrides the resolved control-plane role -> pool map (tests/ops); by
+    default it is resolved from RALPH_CRON_DRIVER / RALPH_MANAGER_POOL.
     """
     rungs = {r["name"]: r for r in profile["rungs"]}
     order = list(profile["tiers"][complexity])
     reserves = profile.get("reserves", {})
     exhausted = set(exhausted_pools or ())
 
+    if roles is None:
+        roles = resolve_role_pools(profile)
+    effective = effective_reserves(profile, roles)
+    near_hours, near_source = near_weekly_reset_hours(reserves)
+    policy = {"effective": effective, "near_hours": near_hours,
+              "near_source": near_source}
+
     evaluated = []
     chosen = None
     for name in order:
-        entry = _evaluate_rung(rungs[name], reserves, usage, now, exhausted, True)
+        entry = _evaluate_rung(rungs[name], policy, usage, now, exhausted, True)
         evaluated.append(entry)
         if entry["eligible"] and chosen is None:
             chosen = entry
@@ -832,7 +1026,7 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=()):
                 entry = candidate
                 break
         if entry is None:
-            entry = _evaluate_rung(rungs[backstop_name], reserves, usage, now, exhausted, False)
+            entry = _evaluate_rung(rungs[backstop_name], policy, usage, now, exhausted, False)
             evaluated.append(entry)
         if entry["eligible"]:
             chosen = entry
@@ -847,6 +1041,14 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=()):
         "backstop_rung": backstop_name,
         "pause": None,
         "enforced": False,
+        # Which role sits on which pool, and the reserve each pool therefore carries.
+        "reserves": {
+            "roles": roles,
+            "effective": dict((pool, entry["pct"]) for pool, entry in effective.items()),
+            "stacked": effective,
+            "near_weekly_reset_hours": near_hours,
+            "near_weekly_reset_hours_source": near_source,
+        },
     }
 
     if chosen is None:
@@ -1012,6 +1214,22 @@ def _local_window_line(record):
     return line
 
 
+def _reserve_summary_lines(block):
+    """Human lines for the role -> pool -> reserve resolution (#63)."""
+    lines = []
+    for role in ROLES:
+        entry = block["roles"].get(role, {})
+        lines.append("  reserve: {} -> pool {} ({})".format(
+            role, entry.get("pool") or "none", entry.get("source", "")))
+    effective = block["effective"]
+    lines.append("  reserve: effective per pool: {} (near_weekly_reset_hours={}, {})".format(
+        "; ".join("{} {}% = {}".format(
+            pool, effective[pool], _reserve_parts_label(block["stacked"][pool]))
+            for pool in sorted(effective)) or "none",
+        block["near_weekly_reset_hours"], block["near_weekly_reset_hours_source"]))
+    return lines
+
+
 def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
     now = now_utc()
 
@@ -1059,6 +1277,8 @@ def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
     print("  now (UTC): {}".format(now.strftime("%Y-%m-%dT%H:%M:%SZ")))
     for note in usage["notes"]:
         print("  usage: {}".format(note))
+    for line in _reserve_summary_lines(result["reserves"]):
+        print(line)
     print("  tier {} allows (in order): {}".format(
         complexity, " -> ".join(result["order"])))
     print("")
@@ -1191,6 +1411,8 @@ def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted):
     print("efficiency select — complexity: {}".format(complexity))
     print("  profile: {} (VALID)".format(loaded["path"]))
     print("  now (UTC): {}".format(now.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    for line in _reserve_summary_lines(result["reserves"]):
+        print(line)
     if exhausted:
         print("  #28 open quota circuits: {}".format(", ".join(sorted(exhausted))))
     if result["status"] == SELECT_PAUSED:

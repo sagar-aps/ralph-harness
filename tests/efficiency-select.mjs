@@ -2,8 +2,9 @@
 //
 // This slice is the ENFORCEMENT keystone, so the fixtures below pin the decisions
 // rather than the prose: tier order, per-pool caps, avoid windows, the #28 quota
-// circuit, the manager(25%)/zai(55%) weekly reserves enforced in CODE, the
-// near-WEEKLY-reset relaxation that lifts the weekly gates, the deepseek backstop,
+// circuit, the ROLE-based weekly reserves enforced in CODE (#63 — manager 25% and
+// orchestrator 50%, each on whatever pool that role runs on, stacking when shared),
+// the near-WEEKLY-reset relaxation that lifts the weekly gates, the deepseek backstop,
 // the bounded PAUSE when even the backstop is gone, and FAIL-OPEN on unknown usage.
 //
 // It still governs nothing: nothing here dispatches, and the last section proves a
@@ -49,6 +50,11 @@ const cleanEnv = (env = {}) => ({
   BUILDER: "", REVIEWER: "", RALPH_PROFILE: "",
   RALPH_EFFICIENCY: "", RALPH_EFFICIENCY_PROFILE: "", RALPH_EFFICIENCY_NOW: "",
   RALPH_QUOTA_OPEN_CIRCUITS: "",
+  // #63: the reserves follow the control-plane roles, so these knobs decide which
+  // pool carries them. Pin them off unless a case sets one; with the driver unset
+  // agents.sh resolves the orchestrator to $DEFAULT_AGENT (codex -> openai).
+  RALPH_CRON_DRIVER: "", RALPH_CRON_DRIVER_DEFAULT: "", RALPH_CRON_DRIVER_PROVIDER: "",
+  RALPH_CRON_DRIVER_MODEL: "", RALPH_CRON_DRIVER_EFFORT: "", RALPH_MANAGER_POOL: "",
   ...env,
 });
 
@@ -142,8 +148,11 @@ console.log("2) the anthropic 25% weekly reserve blocks claude at 76% weekly");
     check(claude.checks.some((c) => !c.ok && /vs cap 75% — OVER CAP/.test(c.detail)),
       "the 75% weekly cap is reported as breached");
     check(claude.checks.some((c) => !c.ok
-      && /24\.0% of the weekly window left .*vs reserve 25% .*BELOW RESERVE/.test(c.detail)),
-      "the 25% weekly reserve is reported as breached (24% left)");
+      && /24\.0% of the weekly window left .*vs reserve 25% \(manager 25% .*BELOW RESERVE/.test(c.detail)),
+      "the manager's 25% weekly reserve is reported as breached (24% left)");
+    check(blocked.reserves.roles.manager.pool === "anthropic"
+      && blocked.reserves.effective.anthropic === 25,
+      "the manager's reserve lands on the anthropic pool by default");
 
     // 3h before the weekly reset the SAME numbers pass: expiring quota is spendable.
     const lifted = selectJson(target, "large", { now: NEAR_RESET });
@@ -173,7 +182,7 @@ console.log("2) the anthropic 25% weekly reserve blocks claude at 76% weekly");
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
-// ── 3) zai: the 45% cap / 55% reserve, and the avoid window ───────────────
+// ── 3) zai: the 45% cap (no role on it -> plain caps), and the avoid window ─
 console.log("3) zai is blocked at 46% weekly and inside its avoid window");
 {
   const target = makeTarget(example, [quotaLine(
@@ -184,8 +193,13 @@ console.log("3) zai is blocked at 46% weekly and inside its avoid window");
     check(data.rung_name === "codex", "small skips zlaude and takes codex");
     check(zlaude.checks.some((c) => !c.ok && /weekly window 46\.0% vs cap 45% — OVER CAP/.test(c.detail)),
       "46% breaches the 45% weekly cap");
-    check(zlaude.checks.some((c) => !c.ok && /vs reserve 55% \(from the profile\) — BELOW RESERVE/.test(c.detail)),
-      "…and the 55% weekly reserve (read from the profile)");
+    // With the orchestrator on codex (the default driver) no role runs on zai, so
+    // the pool is governed by its plain caps alone (#63).
+    check(zlaude.checks.some((c) => c.kind === "reserve" && c.ok
+      && /no reserve — no control-plane role runs on this pool/.test(c.detail)),
+      "…while the reserve check is a no-op: no role runs on zai here");
+    check(data.reserves.effective.zai === undefined,
+      "no effective reserve is computed for zai when no role runs on it");
 
     // Well under both, but inside 06:00-10:00 Mon-Fri: the window alone blocks it.
     const rested = makeTarget(example, [quotaLine(
@@ -209,8 +223,8 @@ console.log("3) zai is blocked at 46% weekly and inside its avoid window");
 console.log("4) reserves are enforced in code (profile omission does not disable them)");
 {
   // A profile that names NO reserves at all. The code still keeps 25% of the
-  // anthropic week and 55% of the zai week; a pool with no code reserve and no
-  // profile reserve (openai/deepseek) has none.
+  // manager's week (anthropic by default) and 50% of the orchestrator's; a pool no
+  // control-plane role runs on (zai/deepseek here) has none.
   const noReserves = JSON.parse(JSON.stringify(example));
   noReserves.reserves = {};
   const target = makeTarget(noReserves, [quotaLine(
@@ -219,10 +233,11 @@ console.log("4) reserves are enforced in code (profile omission does not disable
   try {
     const data = selectJson(target, "large");
     const claude = data.rungs.find((r) => r.name === "claude");
-    check(data.rung_name === "deepseek", "the code-default anthropic reserve still blocks claude");
+    check(data.rung_name === "deepseek", "the code-default manager reserve still blocks claude");
     check(claude.checks.some((c) => !c.ok
-      && /vs reserve 25% \(code default, not set in the profile\) — BELOW RESERVE/.test(c.detail)),
-      "the check names the code default it enforced");
+      && /vs reserve 25% \(manager 25% \[code default, not set in the profile\]\) — BELOW RESERVE/
+        .test(c.detail)),
+      "the check names the role and the code default it enforced");
 
     // …and the code default for near_weekly_reset_hours (5) still relaxes it.
     const lifted = selectJson(target, "large", { now: NEAR_RESET });
@@ -231,7 +246,7 @@ console.log("4) reserves are enforced in code (profile omission does not disable
 
     // An operator's own number wins over the default (this is config, not policy).
     const strict = JSON.parse(JSON.stringify(example));
-    strict.reserves.anthropic_weekly_pct = 90;   // keep 90% of the week unspent
+    strict.reserves.manager_pct = 90;            // keep 90% of the week unspent
     strict.reserves.near_weekly_reset_hours = 1; // …and barely ever relax it
     const strictTarget = makeTarget(strict, [quotaLine(
       { pool: "anthropic", window_5h_pct: 5, window_weekly_pct: 15, weekly_reset_at: RESET },
@@ -241,13 +256,95 @@ console.log("4) reserves are enforced in code (profile omission does not disable
       check(s.rung_name === "deepseek",
         "a stricter profile reserve is honoured (15% used, only 85% left vs a 90% reserve)");
       check(s.rungs.find((r) => r.name === "claude").checks.some(
-        (c) => !c.ok && /vs reserve 90% \(from the profile\)/.test(c.detail)),
+        (c) => !c.ok && /vs reserve 90% \(manager 90% \[from the profile\]\)/.test(c.detail)),
         "the profile's number is used when it is present");
       const near = selectJson(strictTarget, "large", { now: NEAR_RESET });
       check(near.rung_name === "deepseek",
         "3h out is no longer 'near' when the profile sets near_weekly_reset_hours=1");
     } finally { rmSync(strictTarget, { recursive: true, force: true }); }
   } finally { rmSync(target, { recursive: true, force: true }); }
+}
+
+// ── 4b) The reserve follows the ROLE onto whatever pool it runs on (#63) ──
+console.log("4b) reserves follow the manager/orchestrator ROLE and stack when shared");
+{
+  // zai at 40% weekly leaves 60% — comfortably under the 45% weekly cap? No: the
+  // cap bites first at 40 < 45, so use 40% (under the cap) and let the RESERVE be
+  // the only thing that can block the rung. 60% left vs an orchestrator reserve of
+  // 50% passes; vs a stacked 75% it does not.
+  const ledger = (pct, reset = RESET) => [quotaLine(
+    { pool: "zai", window_5h_pct: 5, window_weekly_pct: pct, weekly_reset_at: reset })];
+
+  // (a) orchestrator on zai: the 50% reserve moves onto zai.
+  const onZai = makeTarget(example, ledger(40));
+  try {
+    const data = selectJson(onZai, "small", { env: { RALPH_CRON_DRIVER: "zlaude" } });
+    check(data.reserves.roles.orchestrator.pool === "zai"
+      && data.reserves.effective.zai === 50,
+      "RALPH_CRON_DRIVER=zlaude puts the orchestrator's 50% reserve on the zai pool");
+    check(data.rung_name === "zlaude", "60% of the week left clears a 50% reserve");
+
+    // 60% left no longer clears it once the reserve is 65%.
+    const stricter = JSON.parse(JSON.stringify(example));
+    stricter.reserves.orchestrator_pct = 65;
+    const strictTarget = makeTarget(stricter, ledger(40));
+    try {
+      const s = selectJson(strictTarget, "small", { env: { RALPH_CRON_DRIVER: "zlaude" } });
+      check(s.rung_name === "codex" && s.rungs.find((r) => r.name === "zlaude").checks.some(
+        (c) => !c.ok && /vs reserve 65% \(orchestrator 65% \[from the profile\]\) — BELOW RESERVE/
+          .test(c.detail)),
+        "the orchestrator reserve on zai blocks zlaude and names the role");
+    } finally { rmSync(strictTarget, { recursive: true, force: true }); }
+
+    // (b) the SAME numbers with the orchestrator on codex: zai reverts to plain
+    // caps and the 50% reserve re-targets onto codex's pool.
+    const onCodex = selectJson(onZai, "small", { env: { RALPH_CRON_DRIVER: "codex" } });
+    check(onCodex.reserves.roles.orchestrator.pool === "openai"
+      && onCodex.reserves.effective.openai === 50
+      && onCodex.reserves.effective.zai === undefined,
+      "RALPH_CRON_DRIVER=codex re-targets the same 50% reserve onto the openai pool");
+    check(onCodex.rungs.find((r) => r.name === "zlaude").checks.some(
+      (c) => c.kind === "reserve" && c.ok
+        && /no reserve — no control-plane role runs on this pool/.test(c.detail)),
+      "with no role on zai the pool is governed by its plain caps alone");
+
+    // A normalized provider spelling names the vendor directly (#52 precedence 1).
+    const viaProvider = selectJson(onZai, "small",
+      { env: { RALPH_CRON_DRIVER_PROVIDER: "zai", RALPH_CRON_DRIVER_MODEL: "glm-4.5-air" } });
+    check(viaProvider.reserves.effective.zai === 50,
+      "RALPH_CRON_DRIVER_PROVIDER=zai targets the zai pool too");
+
+    // (c) manager + orchestrator on the SAME pool: the reserves STACK (25 + 50).
+    const shared = selectJson(onZai, "small",
+      { env: { RALPH_CRON_DRIVER: "zlaude", RALPH_MANAGER_POOL: "zai" } });
+    check(shared.reserves.effective.zai === 75,
+      "a shared pool carries the SUM of both roles' reserves (25 + 50 = 75)");
+    check(shared.rung_name === "codex" && shared.rungs.find((r) => r.name === "zlaude").checks.some(
+      (c) => !c.ok && /vs reserve 75% \(manager 25% .* \+ orchestrator 50% .*\) — BELOW RESERVE/
+        .test(c.detail)),
+      "60% left no longer clears the stacked 75% reserve, and the check names both roles");
+
+    // (d) the near-weekly-reset relaxation still lifts the stacked reserve.
+    const nearTarget = makeTarget(example, ledger(40, "2026-08-10T14:00:00Z"));
+    try {
+      const lifted = selectJson(nearTarget, "small",
+        { env: { RALPH_CRON_DRIVER: "zlaude", RALPH_MANAGER_POOL: "zai" } });
+      check(lifted.rung_name === "zlaude" && /near-weekly-reset relaxation/.test(lifted.reason),
+        "3h before the weekly reset the stacked reserve is lifted again");
+      check(lifted.rungs.find((r) => r.name === "zlaude").checks.some(
+        (c) => c.ok && /reserve 75% RELAXED/.test(c.detail)),
+        "the relaxation names the stacked reserve it lifted");
+    } finally { rmSync(nearTarget, { recursive: true, force: true }); }
+
+    // (e) a driver nothing maps to a pool costs the orchestrator its reserve
+    // rather than parking it on an arbitrary pool.
+    const unmapped = selectJson(onZai, "small", { env: { RALPH_CRON_DRIVER: "some-wrapper" } });
+    check(unmapped.reserves.roles.orchestrator.pool === null
+      && Object.keys(unmapped.reserves.effective).join(",") === "anthropic",
+      "an unmappable driver leaves only the manager's reserve, and says why");
+    check(/which no rung maps to a pool/.test(unmapped.reserves.roles.orchestrator.source),
+      "the unresolved orchestrator pool is explained, not silently dropped");
+  } finally { rmSync(onZai, { recursive: true, force: true }); }
 }
 
 // ── 5) Backstop fallback and the bounded PAUSE ───────────────────────────
@@ -350,8 +447,12 @@ console.log("7) unknown pool usage fails open (eligible), never frozen");
     check(zlaude.checks.filter((c) => c.kind === "cap").every((c) => c.ok
       && /FAIL-OPEN: no usage data for this pool/.test(c.detail)),
       "both cap checks pass and say they failed open");
-    check(zlaude.checks.some((c) => c.kind === "reserve" && c.ok
-      && /weekly usage unknown, FAIL-OPEN/.test(c.detail)),
+    // The reserve fails open the same way — on a pool that actually carries one
+    // (anthropic holds the manager's, and this fixture knows no usage at all).
+    const anthropic = selectJson(target, "large");
+    check(anthropic.rung_name === "claude"
+      && anthropic.rungs.find((r) => r.name === "claude").checks.some(
+        (c) => c.kind === "reserve" && c.ok && /weekly usage unknown, FAIL-OPEN/.test(c.detail)),
       "the reserve check fails open too, and names the #28 circuit as the real gate");
 
     // A ledger with spend but no quota block and no budget: same conclusion.

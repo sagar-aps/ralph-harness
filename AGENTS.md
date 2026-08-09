@@ -53,8 +53,13 @@ Keep this file short. It is always loaded into context.
   select` (#61): first eligible rung of the tier, where a pool is eligible unless an
   avoid window is active, its #28 circuit is open (reused from `agents.sh`, never
   re-implemented), or it breaches its cap/weekly reserve. The reserves are enforced in
-  CODE (anthropic 25 %, zai 55 % by default even if the profile omits them; the profile
-  only supplies the numbers), the near-WEEKLY-reset relaxation lifts the weekly cap +
+  CODE and follow the control-plane ROLE (#63): `reserves.manager_pct` (25) and
+  `reserves.orchestrator_pct` (50) apply to whatever pool that role runs on — the
+  orchestrator's is `RALPH_CRON_DRIVER` resolved via `ralph_resolve_cron_driver` then
+  mapped backend→pool through the rungs, the manager's is `RALPH_MANAGER_POOL` or the
+  anthropic pool — and they STACK when a pool carries both. The defaults apply even if
+  the profile omits them; the profile only supplies the numbers. The near-WEEKLY-reset
+  relaxation lifts the weekly cap +
   reserve, unknown usage FAILS OPEN, deepseek is the always-on backstop, and an
   unusable backstop returns a bounded PAUSE (rc 3; rc 4 = inert) instead of crashing.
   Dispatch (#62) applies that decision per TICKET, and ONLY under the opt-in

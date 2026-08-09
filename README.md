@@ -682,13 +682,24 @@ one; a rung is eligible only if every pool it draws on is:
 - **outside an avoid window** right now (current UTC day + time);
 - **not tripped in the hard quota circuit** — the `ralph_quota_pool_is_exhausted`
   circuit from the provider-exhaustion path, reused as-is (an elapsed reset closes it);
-- **under its window caps** and **above its weekly reserve**.
+- **under its window caps** and **above the weekly reserve it carries** (the sum of
+  the reserves of every control-plane role that runs on it — see below).
 
-Two rules are deliberate:
+Three rules are deliberate:
 
+- **The reserves follow the control-plane ROLE, not the pool.** `reserves` is keyed
+  by role — `manager_pct` (25) and `orchestrator_pct` (50) — and each role's reserve
+  is applied to whichever pool that role actually runs on: the **orchestrator**'s
+  pool is the one behind `RALPH_CRON_DRIVER` (resolved by `ralph_resolve_cron_driver`,
+  then mapped backend → pool through the profile's own rungs), the **manager**'s is
+  `RALPH_MANAGER_POOL` or, unset, the `anthropic` pool (it runs on the strongest
+  Claude by charter). Point the driver at zai and zai carries the 50 %; point it at
+  codex and the openai pool does instead, while zai reverts to its plain caps. When
+  both roles share a pool their reserves **stack** on it (25 + 50 = 75 %). A pool no
+  role runs on has no reserve at all.
 - **The reserves are enforced in code.** The profile supplies the numbers, but
-  omitting `reserves.anthropic_weekly_pct` / `zai_weekly_pct` does not switch the
-  reserve off — the built-in 25 % / 55 % (and `near_weekly_reset_hours` of 5) apply.
+  omitting `reserves.manager_pct` / `orchestrator_pct` does not switch the reserve
+  off — the built-in 25 % / 50 % (and `near_weekly_reset_hours` of 5) apply.
   Within that many hours of the **weekly** reset both weekly gates (cap and reserve)
   are relaxed: quota about to expire is quota you may as well spend. The rolling 5 h
   cap is never relaxed.

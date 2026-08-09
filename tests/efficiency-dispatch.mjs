@@ -51,6 +51,9 @@ const cleanEnv = (env = {}) => ({
   BUILDER_PROVIDER: "", BUILDER_MODEL: "", REVIEWER_PROVIDER: "", REVIEWER_MODEL: "",
   RALPH_EFFICIENCY: "", RALPH_EFFICIENCY_PROFILE: "",
   RALPH_EFFICIENCY_DISPATCH_STATE: "", RALPH_QUOTA_OPEN_CIRCUITS: "",
+  // #63: the role-based reserves land wherever these knobs point them.
+  RALPH_CRON_DRIVER: "", RALPH_CRON_DRIVER_DEFAULT: "", RALPH_CRON_DRIVER_PROVIDER: "",
+  RALPH_CRON_DRIVER_MODEL: "", RALPH_CRON_DRIVER_EFFORT: "", RALPH_MANAGER_POOL: "",
   RALPH_EFFICIENCY_NOW: NOW,
   ...BACKEND_ENV,
   ...env,
@@ -84,7 +87,9 @@ const PROFILE = {
       caps: { deepseek: { backstop: true } },
     },
   ],
-  reserves: { anthropic_weekly_pct: 25, zai_weekly_pct: 55, near_weekly_reset_hours: 5 },
+  // Role-keyed since #63: the manager sits on anthropic by default; the fixture
+  // backends are not the cron driver, so no orchestrator reserve lands here.
+  reserves: { manager_pct: 25, orchestrator_pct: 50, near_weekly_reset_hours: 5 },
   tiers: {
     trivial: ["backstop", "cheap"],
     small: ["cheap", "mid"],

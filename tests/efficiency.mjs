@@ -52,6 +52,14 @@ function ralph(args, env = {}) {
       RALPH_EFFICIENCY: "",
       RALPH_EFFICIENCY_PROFILE: "",
       RALPH_EFFICIENCY_NOW: "",
+      // #63: the reserves follow the control-plane roles, so the driver/manager
+      // knobs decide which pool carries them. Pin them off unless a case sets one.
+      RALPH_CRON_DRIVER: "",
+      RALPH_CRON_DRIVER_DEFAULT: "",
+      RALPH_CRON_DRIVER_PROVIDER: "",
+      RALPH_CRON_DRIVER_MODEL: "",
+      RALPH_CRON_DRIVER_EFFORT: "",
+      RALPH_MANAGER_POOL: "",
       ...env,
     },
   });
@@ -85,10 +93,17 @@ console.log("1) efficiency.json.example encodes the finalized policy");
     && byName.claude.caps.anthropic.window_weekly_pct === 75, "anthropic caps: 80% / 5h, 75% / week");
   check(byName.deepseek.caps.deepseek.backstop === true, "deepseek cap: {backstop: true}");
 
-  check(example.reserves.anthropic_weekly_pct === 25
-    && example.reserves.zai_weekly_pct === 55
+  // #63: reserves are keyed by the control-plane ROLE, never by pool.
+  check(example.reserves.manager_pct === 25
+    && example.reserves.orchestrator_pct === 50
     && example.reserves.near_weekly_reset_hours === 5,
-    "reserves: anthropic 25%, zai 55%, near_weekly_reset 5h");
+    "reserves: manager 25%, orchestrator 50%, near_weekly_reset 5h");
+  check(Object.keys(example.reserves).every((k) => !k.endsWith("_weekly_pct")),
+    "no pool-keyed reserve numbers remain in the example");
+  check(example.rungs.every((r) => Object.values(r.caps).every((cap) => "backstop" in cap
+    || "source" in cap || (typeof cap.window_5h_pct === "number"
+      && typeof cap.window_weekly_pct === "number"))),
+    "the per-rung window caps are kept as they are");
 
   check(example.tiers.trivial.join(",") === "deepseek,zlaude", "tier trivial = deepseek, zlaude");
   check(example.tiers.small.join(",") === "zlaude,codex", "tier small = zlaude, codex");
@@ -198,10 +213,10 @@ console.log("5) ledger usage drives caps / reserves / near-weekly-reset relaxati
     check(/^CHOSEN: codex$/m.test(overOut), "an over-cap pool is skipped");
     check(/ledger shows 1 record\(s\)/.test(overOut), "reports the ledger-observed spend for the pool");
 
-    // The reserve is a SECOND gate, independent of the cap. In the shipped policy the
-    // two coincide (cap = 100 - reserve), so exercise it with a profile whose reserve
-    // bites first: cap 90%/week, reserve 55% -> 50% used is under the cap but leaves
-    // only 50% against a 55% reserve.
+    // The reserve is a SECOND gate, independent of the cap. Exercise it with a
+    // profile whose reserve bites first: cap 90%/week, and the MANAGER (55%) parked
+    // on the zai pool via RALPH_MANAGER_POOL (#63) -> 50% used is under the cap but
+    // leaves only 50% against a 55% reserve.
     const reserveFirst = {
       rungs: [
         {
@@ -217,7 +232,7 @@ console.log("5) ledger usage drives caps / reserves / near-weekly-reset relaxati
           caps: { openai: { source: "provider" } },
         },
       ],
-      reserves: { zai_weekly_pct: 55, near_weekly_reset_hours: 5 },
+      reserves: { manager_pct: 55, near_weekly_reset_hours: 5 },
       tiers: {
         trivial: ["zlaude", "codex"], small: ["zlaude", "codex"],
         medium: ["zlaude", "codex"], large: ["zlaude", "codex"],
@@ -227,12 +242,14 @@ console.log("5) ledger usage drives caps / reserves / near-weekly-reset relaxati
     writeFileSync(profilePath, JSON.stringify(reserveFirst, null, 2));
     writeFileSync(path.join(target, ".ralph", "ledger.jsonl"),
       ledgerLine({ pool: "zai", window_5h_pct: 5, window_weekly_pct: 50 }) + "\n");
-    const reserve = ralph(["explain", "--repo", target, "--complexity", "small"],
-      { RALPH_EFFICIENCY_NOW: "2026-08-10T11:00:00Z" });
+    const onZai = { RALPH_EFFICIENCY_NOW: "2026-08-10T11:00:00Z", RALPH_MANAGER_POOL: "zai" };
+    const reserve = ralph(["explain", "--repo", target, "--complexity", "small"], onZai);
     const reserveOut = `${reserve.stdout}`;
     check(/under cap/.test(reserveOut), "the cap itself is not breached at 50% of a 90% cap");
     check(/BELOW RESERVE/.test(reserveOut), "flags the reserve breach (50% left vs 55% reserve)");
     check(/^CHOSEN: codex$/m.test(reserveOut), "a below-reserve pool is skipped");
+    check(/reserve: manager -> pool zai \(RALPH_MANAGER_POOL\)/.test(reserveOut),
+      "explain names the pool the manager's reserve followed it onto");
 
     // Same usage, but the weekly window resets in 4h (<= near_weekly_reset_hours=5)
     // -> the reserve is relaxed and zlaude becomes eligible again.
@@ -241,15 +258,14 @@ console.log("5) ledger usage drives caps / reserves / near-weekly-reset relaxati
         pool: "zai", window_5h_pct: 5, window_weekly_pct: 50,
         weekly_reset_at: "2026-08-10T15:00:00Z",
       }) + "\n");
-    const relaxed = ralph(["explain", "--repo", target, "--complexity", "small"],
-      { RALPH_EFFICIENCY_NOW: "2026-08-10T11:00:00Z" });
+    const relaxed = ralph(["explain", "--repo", target, "--complexity", "small"], onZai);
     const relaxedOut = `${relaxed.stdout}`;
     check(/reserve 55% RELAXED/.test(relaxedOut), "relaxes the reserve near the weekly reset");
     check(/^CHOSEN: zlaude$/m.test(relaxedOut), "the relaxed rung is chosen again");
 
     // Far from the reset, the same numbers block again (the relaxation is not sticky).
     const farFromReset = ralph(["explain", "--repo", target, "--complexity", "small"],
-      { RALPH_EFFICIENCY_NOW: "2026-08-10T09:00:00Z" });
+      { ...onZai, RALPH_EFFICIENCY_NOW: "2026-08-10T09:00:00Z" });
     check(/^CHOSEN: codex$/m.test(`${farFromReset.stdout}`),
       "6h before the reset (> 5h) the reserve still applies");
 
@@ -324,6 +340,24 @@ console.log("6) malformed / invalid profile -> rejected to safe (never crashes)"
       }],
       reserves: {},
       tiers: { trivial: ["a"] },
+    }],
+    // #63 retired the pool-keyed spelling; a profile still using it is rejected to
+    // safe rather than half-honoured.
+    ["pool-keyed reserve", {
+      rungs: [{
+        name: "a", builder: { backend: "x", pool: "p" }, reviewer: { backend: "x", pool: "p" },
+        caps: { p: { backstop: true } },
+      }],
+      reserves: { anthropic_weekly_pct: 25, near_weekly_reset_hours: 5 },
+      tiers: { trivial: ["a"], small: ["a"], medium: ["a"], large: ["a"] },
+    }],
+    ["unknown reserve role", {
+      rungs: [{
+        name: "a", builder: { backend: "x", pool: "p" }, reviewer: { backend: "x", pool: "p" },
+        caps: { p: { backstop: true } },
+      }],
+      reserves: { builder_pct: 10 },
+      tiers: { trivial: ["a"], small: ["a"], medium: ["a"], large: ["a"] },
     }],
   ];
   for (const [label, profile] of cases) {
