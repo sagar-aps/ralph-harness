@@ -320,6 +320,25 @@ console.log("7) env-prefixed claude aliases: the flag lands after the REAL execu
   } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
 }
 {
+  // #73: a FULL absolute PATH to the claude binary behind env — the exec token has
+  // slashes (`/Users/e/.local/bin/claude`), so the pre-#72 space-anchored regex missed
+  // it and the flag landed after env (env: claude: No such file, exit 127). The
+  // basename-based detection must recognise the path's tail as claude-family.
+  const t = makeTarget();
+  const plan = onePlan();
+  try {
+    ralph(["batch", "--repo", t, "--plan", plan, "--builder", "claude-sonnet", "--reviewer", "claude-sonnet",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_DRY_RUN: "1", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(t),
+        AGENT_CLAUDE_SONNET_CMD:
+          'env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL /Users/e/.local/bin/claude --model sonnet -p "$(cat {prompt})"' });
+    const bcmd = (cfg(t).match(/^BUILDER_CMD=(.*)$/m) || [])[1] || "";
+    check(/\/Users\/e\/\.local\/bin\/claude --output-format json --model sonnet\b/.test(bcmd),
+      `full-path exe: flag inserted after the absolute-path claude, ahead of --model (${bcmd})`);
+    check(!/\benv\s+--output-format/.test(bcmd), "full-path form does not put the flag on env either (#73)");
+  } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
+}
+{
   // Already instrumented by the operator -> left exactly as configured.
   const t = makeTarget();
   const plan = onePlan();
