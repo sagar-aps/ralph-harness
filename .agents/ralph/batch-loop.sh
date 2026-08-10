@@ -382,17 +382,40 @@ efficiency_restore_defaults() {
 # usage JSON flag) so a rung-dispatched task is instrumented like any other. The
 # provider/model pins are cleared: they were aimed at the backend the rung replaced,
 # and reporting them here would misattribute the run.
+#
+# A rung the machine cannot run (unknown backend name, or a command whose executable
+# is not installed) is a LAUNCH failure like any other: it returns non-zero with the
+# reason in RUNG_BIND_ERROR instead of dying, so #75's escalation can climb past it
+# (see launch_escalate). Nothing is assigned until every check has passed, so a
+# refused rung leaves the previous selection intact.
+RUNG_BIND_ERROR=""
 efficiency_apply_rung() {
-  BUILDER="$RALPH_EFFICIENCY_SELECT_BUILDER"
-  REVIEWER="$RALPH_EFFICIENCY_SELECT_REVIEWER"
-  BUILDER_CMD="$(builder_cmd_for "$BUILDER")"
-  REVIEWER_CMD="$(reviewer_cmd_for "$REVIEWER")"
-  [[ -n "$BUILDER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown builder backend: $BUILDER"
-  [[ -n "$REVIEWER_CMD" ]] || die "Efficiency rung $RALPH_EFFICIENCY_SELECT_RUNG names an unknown reviewer backend: $REVIEWER"
-  if declare -F add_json_flag >/dev/null 2>&1; then
-    BUILDER_CMD="$(add_json_flag "$BUILDER_CMD" "$BUILDER")"
-    REVIEWER_CMD="$(add_json_flag "$REVIEWER_CMD" "$REVIEWER")"
+  local new_builder="$RALPH_EFFICIENCY_SELECT_BUILDER"
+  local new_reviewer="$RALPH_EFFICIENCY_SELECT_REVIEWER"
+  local new_builder_cmd new_reviewer_cmd spec bin
+  RUNG_BIND_ERROR=""
+  new_builder_cmd="$(builder_cmd_for "$new_builder")"
+  new_reviewer_cmd="$(reviewer_cmd_for "$new_reviewer")"
+  if [[ -z "$new_builder_cmd" ]]; then
+    RUNG_BIND_ERROR="names an unknown builder backend: $new_builder"; return 1
   fi
+  if [[ -z "$new_reviewer_cmd" ]]; then
+    RUNG_BIND_ERROR="names an unknown reviewer backend: $new_reviewer"; return 1
+  fi
+  if declare -F add_json_flag >/dev/null 2>&1; then
+    new_builder_cmd="$(add_json_flag "$new_builder_cmd" "$new_builder")"
+    new_reviewer_cmd="$(add_json_flag "$new_reviewer_cmd" "$new_reviewer")"
+  fi
+  if [[ "$DRY_RUN" != "1" ]]; then
+    for spec in "$new_builder_cmd" "$new_reviewer_cmd"; do
+      bin="${spec%% *}"
+      if ! command -v "$bin" >/dev/null 2>&1; then
+        RUNG_BIND_ERROR="backend not found on PATH: $bin"; return 1
+      fi
+    done
+  fi
+  BUILDER="$new_builder"; REVIEWER="$new_reviewer"
+  BUILDER_CMD="$new_builder_cmd"; REVIEWER_CMD="$new_reviewer_cmd"
   BUILDER_PROVIDER=""; REVIEWER_PROVIDER=""; BUILDER_MODEL=""; REVIEWER_MODEL=""
   BUILDER_REQUESTED_MODEL="$(ralph_command_model_values "$BUILDER_CMD" | head -n1)"
   REVIEWER_REQUESTED_MODEL="$(ralph_command_model_values "$REVIEWER_CMD" | head -n1)"
@@ -406,8 +429,72 @@ efficiency_apply_rung() {
   RALPH_BUILDER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_BUILDER_POOL"
   RALPH_REVIEWER_CREDENTIAL_POOL="$RALPH_EFFICIENCY_SELECT_REVIEWER_POOL"
   export RALPH_BUILDER_CREDENTIAL_POOL RALPH_REVIEWER_CREDENTIAL_POOL
-  require_backend "builder ($BUILDER)" "$BUILDER_CMD"
-  require_backend "reviewer ($REVIEWER)" "$REVIEWER_CMD"
+  return 0
+}
+
+# ---- Launch-failure escalation (#75) — efficiency only ----------------------
+# A backend that never RAN is not a verdict: nothing was built and nothing was
+# reviewed, so #64's review-failure escalation (which triggers on a spent iteration
+# budget) can never see it. Before this, one unlaunchable backend halted the WHOLE
+# batch as BUILDER_UNAVAILABLE/REVIEWER_UNAVAILABLE even when the efficiency ladder
+# still had stronger, perfectly healthy rungs to try.
+#
+# Under efficiency mode a launch failure therefore PROMOTES the task to the next
+# stronger ELIGIBLE rung and the caller retries the failed role there. BOUNDED by
+# construction: the promotion only ever looks ABOVE the rung it is standing on
+# (efficiency.py select --after-rung), so every hop shortens the remaining ladder and
+# the backstop is the last rung that can be tried; a rung that cannot even be BOUND
+# is climbed past rather than halted on. When nothing is left, the caller halts as it
+# always did — with the rungs it tried named in the terminal status.
+#
+# Returns 0 when a promotion happened (retry the role) and 1 when the caller must
+# halt: efficiency off, no rung ladder for this task, a provider quota wall (which
+# keeps its own reactive #28 terminal path — a stronger rung sits behind the same
+# wall), or the ladder is out. It prints NOTHING on the first two, so a run without
+# efficiency mode is byte-for-byte the halt it is today.
+launch_escalate() {  # <role> <iteration> <why>
+  local role="$1" iteration="${2:-}" why="${3:-}" rc=0
+  [[ "$EFFICIENCY_ON" == "true" && -n "$TASK_RUNG" ]] || return 1
+  [[ -z "$QUOTA_ROLE" ]] || return 1
+  declare -F ralph_efficiency_launch_escalate_select >/dev/null 2>&1 || return 1
+  echo "    ⚠ $role backend failed to LAUNCH on rung $TASK_RUNG ($why) — escalating instead of halting the batch."
+  while :; do
+    rc=0
+    ralph_efficiency_launch_escalate_select "$TASK_COMPLEXITY" "$TARGET_REPO" \
+      "$TASK_RUNG" "task $IDX" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      LAUNCH_ESCALATION_EXHAUSTED="true"
+      LAUNCH_ESCALATION_ROLE="$role"
+      LAUNCH_ESCALATION_RUNGS="$TASK_RUNGS_TRIED"
+      LAUNCH_ESCALATION_REASON="${RALPH_ESCALATE_REASON:-no stronger rung is available}"
+      echo "    no launchable rung left (tried: $TASK_RUNGS_TRIED) — $LAUNCH_ESCALATION_REASON" >&2
+      return 1
+    fi
+    LAUNCH_ESCALATIONS=$((LAUNCH_ESCALATIONS + 1))
+    TASK_LAUNCH_ESCALATIONS=$((TASK_LAUNCH_ESCALATIONS + 1))
+    # Which ROLE could not launch where. The rung owns BOTH roles, so a promotion
+    # rebinds the builder too even when it was the reviewer that failed — this trail
+    # is what keeps the provenance honest about who actually did the work.
+    TASK_LAUNCH_TRIGGERS="${TASK_LAUNCH_TRIGGERS:+$TASK_LAUNCH_TRIGGERS, }$role@$TASK_RUNG"
+    TASK_RUNGS_TRIED="$TASK_RUNGS_TRIED -> $RALPH_ESCALATE_TO"
+    LAUNCH_ESCALATION_RUNGS="$TASK_RUNGS_TRIED"
+    ralph_efficiency_escalation_record "$RUN_DIR" "$TARGET_REPO" "batch-$TS" \
+      "task $IDX" "$TASK_RUNG" "$RALPH_ESCALATE_TO" "$RALPH_ESCALATE_REASON" \
+      "$iteration" "${role}_launch_failure"
+    TASK_RUNG="$RALPH_ESCALATE_TO"
+    if ! efficiency_apply_rung; then
+      # The promotion named a rung this machine cannot launch either. Climb on from
+      # IT — still bounded, because the ladder above it only ever gets shorter.
+      echo "    ⚠ rung $TASK_RUNG is unusable here — $RUNG_BIND_ERROR; climbing further." >&2
+      continue
+    fi
+    # The rung the task is ON changed, so the line every consumer prints (result
+    # file, report, ledger) has to follow it, or the task is reported against a rung
+    # it stopped using.
+    EFFICIENCY_SUMMARY="$(ralph_efficiency_dispatch_summary)"
+    echo "    escalated (launch failure): $RALPH_ESCALATE_FROM -> $TASK_RUNG (builder $BUILDER, reviewer $REVIEWER) — $RALPH_ESCALATE_REASON"
+    return 0
+  done
 }
 
 # ---- Efficiency mode (#59/#62) — opt-in; OFF leaves dispatch untouched ------
@@ -1069,6 +1156,14 @@ write_last_run() {
       ralph_env_assignment EFFICIENCY_REASON "${RALPH_EFFICIENCY_SELECT_REASON:-}"
       ralph_env_assignment EFFICIENCY_PAUSE_UNTIL "${RALPH_EFFICIENCY_SELECT_PAUSE_UNTIL:-}"
     fi
+    # #75 — written only when a launch failure actually escalated, so a run without
+    # efficiency mode gains no new fields at all.
+    if [[ "${LAUNCH_ESCALATIONS:-0}" -gt 0 || "${LAUNCH_ESCALATION_EXHAUSTED:-false}" == "true" ]]; then
+      ralph_env_assignment LAUNCH_ESCALATIONS "${LAUNCH_ESCALATIONS:-0}"
+      ralph_env_assignment LAUNCH_ESCALATION_RUNGS "${LAUNCH_ESCALATION_RUNGS:-}"
+      ralph_env_assignment LAUNCH_ESCALATION_ROLE "${LAUNCH_ESCALATION_ROLE:-}"
+      ralph_env_assignment LAUNCH_ESCALATION_REASON "${LAUNCH_ESCALATION_REASON:-}"
+    fi
     ralph_env_assignment PROVIDER_QUOTA_PROVIDER "${RALPH_QUOTA_PROVIDER:-}"
     ralph_env_assignment PROVIDER_QUOTA_CREDENTIAL_POOL "${RALPH_QUOTA_CREDENTIAL_POOL:-}"
     ralph_env_assignment PROVIDER_QUOTA_SCOPE "${RALPH_QUOTA_SCOPE:-}"
@@ -1151,6 +1246,7 @@ echo "  builder:       $BUILDER   -> $BUILDER_CMD"
 echo "  reviewer:      $REVIEWER (read-only) -> $REVIEWER_CMD"
 if [[ "$EFFICIENCY_ON" == "true" ]]; then
   echo "  efficiency:    ON (${RALPH_EFFICIENCY_STATE:-unknown} profile) — a task with a complexity:<tier> overrides the two lines above"
+  echo "                 a rung whose backend fails to LAUNCH is promoted to the next stronger eligible rung (bounded by the ladder), not halted on"
 fi
 echo "  check:         $CHECK_CMD"
 echo "  verify:        ${VERIFY_CMD:-(none)}"
@@ -1196,6 +1292,16 @@ BUDGET_REACHED="false"
 EFFICIENCY_PAUSED="false"   # #62: a bounded PAUSE from ralph_efficiency_select
 EFFICIENCY_PAUSED_TASK=""
 EFFICIENCY_SUMMARY=""       # per-task line for the result file / report (empty when off)
+# #75 launch-failure escalation. All inert unless efficiency mode promoted a task off
+# an unlaunchable rung, so the no-efficiency run records and prints exactly what it
+# does today.
+LAUNCH_ESCALATIONS=0          # promotions in this batch (all tasks)
+LAUNCH_ESCALATION_EXHAUSTED="false"   # the ladder ran out => own terminal status
+LAUNCH_ESCALATION_ROLE=""     # role whose backend could not launch anywhere
+LAUNCH_ESCALATION_RUNGS=""    # rungs tried for the task that halted, in order
+LAUNCH_ESCALATION_REASON=""
+TASK_RUNG=""; TASK_RUNGS_TRIED=""; TASK_COMPLEXITY=""
+TASK_LAUNCH_ESCALATIONS=0; TASK_LAUNCH_TRIGGERS=""
 RALPH_BUDGET_CONFIGURED="false"; RALPH_BUDGET_REACHED="false"
 RALPH_BUDGET_TOKENS="${RALPH_ORCHESTRATOR_BUDGET_TOKENS:-}"
 RALPH_BUDGET_STOP_PCT="${RALPH_ORCHESTRATOR_STOP_PCT:-100}"
@@ -1234,6 +1340,11 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   echo ""
   echo "── Task $IDX/$TASK_TOTAL: $TITLE  (up to $MAX_ITERATIONS attempt(s)) ──"
 
+  # One task's rung — and its launch-failure escalation trail (#75) — must never leak
+  # into the next, or a later task would be escalated off a rung it never ran on.
+  TASK_RUNG=""; TASK_RUNGS_TRIED=""; TASK_COMPLEXITY=""
+  TASK_LAUNCH_ESCALATIONS=0; TASK_LAUNCH_TRIGGERS=""
+
   # Per-task efficiency rung (#62) — opt-in only. With the mode off this block never
   # executes, so dispatch below is exactly today's --builder/--reviewer path. With it
   # on, the task's own complexity:<tier> picks the rung; anything unusable (no tier,
@@ -1256,8 +1367,18 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
       break
     fi
     if [[ "$EFFICIENCY_RC" -eq 0 ]]; then
-      efficiency_apply_rung
+      TASK_RUNG="$RALPH_EFFICIENCY_SELECT_RUNG"
+      TASK_RUNGS_TRIED="$TASK_RUNG"
       echo "    $EFFICIENCY_SUMMARY"
+      # A rung whose backends are not installed here has already failed to launch
+      # (#75): escalate past it rather than killing the run. Only when the ladder has
+      # nothing launchable left does the task halt — and then it halts on the same
+      # HALTED path as any other backend outage, below.
+      if ! efficiency_apply_rung; then
+        if ! launch_escalate "builder" "0" "$RUNG_BIND_ERROR"; then
+          AGENT_ERROR_ROLE="builder"; HALTED_TASK="$IDX"
+        fi
+      fi
     fi
   fi
 
@@ -1279,6 +1400,10 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   REVIEWER_OUT="$RUN_DIR/task-$IDX-reviewer.md"
 
   for ITER in $(seq 1 "$MAX_ITERATIONS"); do
+    # #75: a dispatch-time rung that could not be bound, and that escalation could not
+    # rescue, has already halted this task — launch nothing, and fall through to the
+    # ordinary HALTED handling below.
+    [[ -z "$AGENT_ERROR_ROLE" ]] || break
     ITERS_USED="$ITER"
     echo "  • attempt $ITER/$MAX_ITERATIONS"
     BUILDER_PROMPT_R="$RUN_DIR/task-$IDX-iter-$ITER-builder-prompt.md"
@@ -1305,17 +1430,30 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     # A concurrent snapshotter is therefore the only thing that can protect work in
     # this window, which is exactly where observed SIGTERMs landed.
     render_prompt "$BUILDER_PROMPT" "$BUILDER_PROMPT_R"
-    echo "    builder ($BUILDER)..."
-    start_snapshotter
-    # Keep the `if !` CONDITION form: run_builder_attempt re-enables `set -e`
-    # internally (its retry loop does `set +e; ...; set -e`), so wrapping the call
-    # in a plain `set +e` does NOT protect it — its final `return 1` would trip
-    # errexit and kill the batch instead of halting it as BUILDER_UNAVAILABLE.
-    # A condition context suspends errexit for the whole call, which does.
     BUILDER_RC=0
-    if ! run_builder_attempt "$BUILDER_PROMPT_R" "$BUILDER_LOG"; then BUILDER_RC=1; fi
-    stop_snapshotter
-    wip_snapshot "post-builder"   # before the check, so a kill during it is covered
+    # The loop body is one builder LAUNCH. It runs exactly once unless #75 escalation
+    # promotes the task off an unlaunchable rung, in which case the same attempt is
+    # re-launched on the stronger rung (bounded by the ladder) — so without efficiency
+    # mode this is byte-for-byte the single launch it has always been.
+    while :; do
+      echo "    builder ($BUILDER)..."
+      start_snapshotter
+      # Keep the `if !` CONDITION form: run_builder_attempt re-enables `set -e`
+      # internally (its retry loop does `set +e; ...; set -e`), so wrapping the call
+      # in a plain `set +e` does NOT protect it — its final `return 1` would trip
+      # errexit and kill the batch instead of halting it as BUILDER_UNAVAILABLE.
+      # A condition context suspends errexit for the whole call, which does.
+      BUILDER_RC=0
+      if ! run_builder_attempt "$BUILDER_PROMPT_R" "$BUILDER_LOG"; then BUILDER_RC=1; fi
+      stop_snapshotter
+      wip_snapshot "post-builder"   # before the check, so a kill during it is covered
+      [[ "$BUILDER_RC" -eq 0 ]] && break
+      launch_escalate "builder" "$ITER" \
+        "exit ${AGENT_ERROR_EXIT:-?} on all $AGENT_ERROR_ATTEMPTS attempt(s)" || break
+      # Keep the failed rung's log: the new rung writes its own, so an operator can see
+      # both what did not launch and what ran instead.
+      BUILDER_LOG="$RUN_DIR/task-$IDX-iter-$ITER-builder-rung-$TASK_RUNG.log"
+    done
     if [[ "$BUILDER_RC" -ne 0 ]]; then
       AGENT_ERROR_ROLE="builder"; HALTED_TASK="$IDX"
       break
@@ -1362,8 +1500,16 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     export R_CHECK_STATUS="$CHECK_STATUS" R_DIFF_FILE="$ITER_DIFF" \
            R_CHECK_FILE="$ITER_CHECK_LOG" R_HANDOFF_FILE="$ITER_HANDOFF"
     render_prompt "$REVIEWER_PROMPT" "$REVIEWER_PROMPT_R"
-    echo "    reviewer ($REVIEWER, read-only)..."
-    run_reviewer_attempt "$REVIEWER_PROMPT_R" "$ITER_REVIEWER_OUT" || true
+    # As with the builder above: one reviewer LAUNCH, repeated only when #75 promotes
+    # the task off a reviewer backend that could not run at all.
+    while :; do
+      echo "    reviewer ($REVIEWER, read-only)..."
+      run_reviewer_attempt "$REVIEWER_PROMPT_R" "$ITER_REVIEWER_OUT" || true
+      [[ "$REVIEWER_OUTCOME" == "ERROR" ]] || break
+      launch_escalate "reviewer" "$ITER" \
+        "exit ${AGENT_ERROR_EXIT:-?} or no VERDICT on all $AGENT_ERROR_ATTEMPTS attempt(s)" || break
+      ITER_REVIEWER_OUT="$RUN_DIR/task-$IDX-iter-$ITER-reviewer-rung-$TASK_RUNG.md"
+    done
 
     # Point the canonical per-task artifacts at this (latest) attempt.
     cp "$ITER_CHECK_LOG" "$CHECK_LOG" 2>/dev/null || true
@@ -1431,7 +1577,11 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
   # Unrecoverable agent (builder/reviewer) ERROR → halt: do not commit, do not
   # count this task as PASS/FAIL.
   if [[ -n "$AGENT_ERROR_ROLE" ]]; then
-    echo "Task $IDX HALTED — $AGENT_ERROR_ROLE backend unavailable (ERROR after $AGENT_ERROR_ATTEMPTS attempts)."
+    if [[ "$LAUNCH_ESCALATION_EXHAUSTED" == "true" ]]; then
+      echo "Task $IDX HALTED — no launchable rung left for the $AGENT_ERROR_ROLE backend (rungs tried: $LAUNCH_ESCALATION_RUNGS)."
+    else
+      echo "Task $IDX HALTED — $AGENT_ERROR_ROLE backend unavailable (ERROR after $AGENT_ERROR_ATTEMPTS attempts)."
+    fi
     break
   fi
 
@@ -1459,6 +1609,7 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     echo "- Reviewer verdict: $VERDICT"
     echo "- PR provenance (paste into the PR): builder: $BUILDER (provider: $BUILDER_RESOLVED_PROVIDER, model: $BUILDER_RESOLVED_MODEL), reviewer: $REVIEWER (provider: $REVIEWER_RESOLVED_PROVIDER, model: $REVIEWER_RESOLVED_MODEL), iterations: $ITERS_USED"
     [[ -n "$EFFICIENCY_SUMMARY" ]] && echo "- $EFFICIENCY_SUMMARY"
+    [[ "$TASK_LAUNCH_ESCALATIONS" -gt 0 ]] && echo "- Launch-failure escalation (#75): rungs tried $TASK_RUNGS_TRIED ($TASK_LAUNCH_ESCALATIONS escalation(s); could not launch: $TASK_LAUNCH_TRIGGERS — promoted rather than retried)"
     echo "- Commit: $HEAD_BEFORE -> $HEAD_AFTER"
     echo ""
     echo "## Files changed"
@@ -1530,6 +1681,11 @@ fi
 # COMPLETED_WITH_FAILURES (which means tasks ran and some failed review).
 if [[ -n "$AGENT_ERROR_ROLE" ]]; then
   if [[ -n "$QUOTA_ROLE" ]]; then OUTCOME="PROVIDER_QUOTA_EXHAUSTED"
+  elif [[ "$LAUNCH_ESCALATION_EXHAUSTED" == "true" ]]; then
+    # #75: efficiency mode climbed the whole ladder and every rung failed to LAUNCH.
+    # Its own terminal state, so a total tooling outage is never confused with the
+    # single-backend halt below (which is what a run WITHOUT a rung ladder still gets).
+    OUTCOME="LAUNCH_ESCALATION_EXHAUSTED"
   elif [[ "$AGENT_ERROR_ROLE" == "reviewer" ]]; then OUTCOME="REVIEWER_UNAVAILABLE"
   else OUTCOME="BUILDER_UNAVAILABLE"; fi
 elif [[ "$EFFICIENCY_PAUSED" == "true" ]]; then
@@ -1607,7 +1763,29 @@ REPORT="$RUN_DIR/final-report.md"
     echo ""
     echo "$PRIMER_WARNING"
   fi
-  if [[ -n "$AGENT_ERROR_ROLE" ]]; then
+  if [[ "$LAUNCH_ESCALATIONS" -gt 0 ]]; then
+    echo ""
+    echo "## ⚙ Launch-failure escalations (#75)"
+    echo ""
+    echo "- $LAUNCH_ESCALATIONS rung promotion(s) because a backend could not LAUNCH (not because a"
+    echo "  reviewer failed a task). Last trail: ${LAUNCH_ESCALATION_RUNGS:-(none)}"
+    echo "- Per-escalation records: $RUN_DIR/escalations.jsonl (and the ledger, as \`event\` lines)"
+  fi
+  if [[ -n "$AGENT_ERROR_ROLE" && "$LAUNCH_ESCALATION_EXHAUSTED" == "true" ]]; then
+    echo ""
+    echo "## ⚠ Halted: no launchable rung left ($AGENT_ERROR_ROLE)"
+    echo ""
+    echo "Efficiency mode climbed the whole rung ladder for task $HALTED_TASK and the"
+    echo "**$AGENT_ERROR_ROLE** backend failed to LAUNCH on every rung tried:"
+    echo "\`$LAUNCH_ESCALATION_RUNGS\` (up to the backstop). Escalation stopped because:"
+    echo "$LAUNCH_ESCALATION_REASON"
+    echo ""
+    echo "That is a tooling outage across the ladder, NOT a task failure: no builder"
+    echo "attempt was consumed and no error output was fed back as feedback. Fix or"
+    echo "re-authenticate those backends (or widen the tier in the efficiency profile),"
+    echo "then RESUME — already-PASSed tasks stay committed and are skipped:"
+    echo "  ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --efficiency --resume"
+  elif [[ -n "$AGENT_ERROR_ROLE" ]]; then
     echo ""
     echo "## ⚠ Halted: $AGENT_ERROR_ROLE backend unavailable"
     echo ""
@@ -1727,11 +1905,18 @@ echo "────────────────────────�
 echo "  Branch:    $BRANCH (NOT merged)"
 echo "  Worktree:  $WORKDIR"
 echo "  Report:    $REPORT"
+if [[ "$LAUNCH_ESCALATIONS" -gt 0 ]]; then
+  echo "  Launch-failure escalations: $LAUNCH_ESCALATIONS (rungs tried: $LAUNCH_ESCALATION_RUNGS)"
+fi
 if [[ -n "$AGENT_ERROR_ROLE" ]]; then
   agent_name="$([[ "$AGENT_ERROR_ROLE" == reviewer ]] && echo "$REVIEWER" || echo "$BUILDER")"
   if [[ -n "$QUOTA_ROLE" ]]; then
     echo "  ⏸ PROVIDER_QUOTA_EXHAUSTED — $QUOTA_ROLE provider '$RALPH_QUOTA_PROVIDER' paused${RALPH_QUOTA_RESET_AT:+ until $RALPH_QUOTA_RESET_AT}."
     echo "  After the provider recovers, resume (completed tasks are skipped):"
+  elif [[ "$LAUNCH_ESCALATION_EXHAUSTED" == "true" ]]; then
+    echo "  ⚠ Halted: no launchable rung left — the $AGENT_ERROR_ROLE backend failed to LAUNCH on every rung tried: $LAUNCH_ESCALATION_RUNGS."
+    echo "  $LAUNCH_ESCALATION_REASON"
+    echo "  Fix/re-authenticate those backends (or widen the tier), then resume (completed tasks are skipped):"
   else
     echo "  ⚠ Halted: $AGENT_ERROR_ROLE backend ($agent_name) unavailable after $AGENT_ERROR_ATTEMPTS attempts (last exit ${AGENT_ERROR_EXIT:-?})."
     echo "  Re-authenticate that CLI, then resume (completed tasks are skipped):"
