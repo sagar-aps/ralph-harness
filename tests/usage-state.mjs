@@ -103,6 +103,8 @@ const cleanEnv = (env = {}) => ({
   TARGET_REPO: "", PRD_PATH: "", TASK_ID: "", TASK_INDEX: "", BRANCH: "",
   BUILDER: "", REVIEWER: "", RALPH_PROFILE: "",
   RALPH_EFFICIENCY: "", RALPH_EFFICIENCY_PROFILE: "", RALPH_EFFICIENCY_NOW: "",
+  AGENT_ZLAUDE_CMD: "fixture-zlaude {prompt}",
+  AGENT_DLAUDE_CMD: "fixture-deepseek {prompt}",
   ...env,
 });
 

@@ -369,6 +369,11 @@ the `--builder`/`--reviewer` path (pinned by `tests/efficiency-select.mjs`).
 `ralph_efficiency_select <tier> [repo]` (`efficiency.sh`) / `efficiency.py select` walks the
 tier's rungs and takes the **first eligible** one. A pool is ineligible when an avoid window is
 active, its quota circuit (§9) is open, or it breaches its cap / weekly reserve.
+At boot, each rung's builder and reviewer are checked through the canonical
+`resolve_backend_cmd`: unresolvable names produce a warning and make that rung ineligible for
+dispatch, allowing selection to fall through. `ralph explain` reports the same rung as
+`UNRESOLVABLE` and names the backend. The standalone Python policy seam remains independent of
+installed agent configuration unless its caller supplies resolvability results.
 
 - **Reserves follow the control-plane ROLE, not the pool.** `manager_pct` (**25**) applies to
   `RALPH_MANAGER_POOL` or, unset, the `anthropic` pool; `orchestrator_pct` (**50**) applies to

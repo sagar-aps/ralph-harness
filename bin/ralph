@@ -95,6 +95,29 @@ function exists(p) {
   }
 }
 
+// Ask the canonical shell resolver whether a backend is bindable. Efficiency
+// policy must not grow a second, subtly different AGENT_*_CMD name mapping here.
+function efficiencyUnresolvableBackends(templateDir, profilePath) {
+  let profile;
+  try { profile = JSON.parse(fs.readFileSync(profilePath, "utf8")); } catch { return []; }
+  const names = [...new Set((profile.rungs || []).flatMap((rung) =>
+    [rung.builder?.backend, rung.reviewer?.backend]).filter((name) => typeof name === "string"))];
+  const probe = [
+    'source "$RALPH_RESOLVE_DIR/agents.sh"',
+    '[[ -f "$RALPH_RESOLVE_DIR/config.sh" ]] && source "$RALPH_RESOLVE_DIR/config.sh"',
+    '[[ -f "$RALPH_RESOLVE_DIR/review-config.sh" ]] && source "$RALPH_RESOLVE_DIR/review-config.sh"',
+    'if [[ "${RALPH_NO_LOCAL_CONFIG:-}" != "1" && -f "$RALPH_RESOLVE_DIR/config.local.sh" ]]; then source "$RALPH_RESOLVE_DIR/config.local.sh"; fi',
+    'resolve_backend_cmd "$RALPH_RESOLVE_BACKEND"',
+  ].join("\n");
+  return names.filter((backend) => {
+    const result = spawnSync("bash", ["-c", probe], {
+      encoding: "utf8",
+      env: { ...process.env, RALPH_RESOLVE_DIR: templateDir, RALPH_RESOLVE_BACKEND: backend },
+    });
+    return result.status !== 0 || !result.stdout.trim();
+  });
+}
+
 // Load the interactive-prompt dependency, auto-installing it the first time if it
 // is missing (it ships as a declared dependency, but a freshly linked clone may
 // not have run `npm install` yet). Falls back to a clear instruction if that fails.
@@ -1890,7 +1913,13 @@ async function main() {
     // On `explain`, --profile is the efficiency profile PATH (see the review object).
     const profilePath = review.efficiencyProfile || review.profile;
     const pyArgs = [explainScript, "explain", "--complexity", complexity, "--repo", repo];
-    if (profilePath) pyArgs.push("--profile", path.resolve(process.cwd(), profilePath));
+    const resolvedProfilePath = profilePath
+      ? path.resolve(process.cwd(), profilePath)
+      : path.join(repo, ".agents", "ralph", "efficiency.json");
+    if (profilePath) pyArgs.push("--profile", resolvedProfilePath);
+    for (const backend of efficiencyUnresolvableBackends(explainTemplateDir, resolvedProfilePath)) {
+      pyArgs.push("--unresolvable-backend", backend);
+    }
     if (review.reportJson) pyArgs.push("--json");
     const result = spawnSync("python3", pyArgs, { stdio: "inherit" });
     process.exit(result.status ?? 1);

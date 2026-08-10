@@ -45,11 +45,35 @@ ralph_efficiency_profile_path() {  # <target-repo>
   fi
 }
 
+# Print backend names in a valid profile that resolve_backend_cmd cannot bind.
+# agents.sh owns backend naming and operator AGENT_*_CMD overrides; do not duplicate
+# that mapping in Python. Invalid JSON is ignored here because validate reports it.
+ralph_efficiency_unresolvable_backends() {  # <profile-path>
+  local profile="$1" backend cmd seen=""
+  declare -f resolve_backend_cmd >/dev/null 2>&1 || return 0
+  while IFS= read -r backend; do
+    [[ -n "$backend" ]] || continue
+    case " $seen " in *" $backend "*) continue ;; esac
+    seen="$seen $backend"
+    cmd="$(resolve_backend_cmd "$backend" 2>/dev/null)" || cmd=""
+    [[ -n "$cmd" ]] || printf '%s\n' "$backend"
+  done <<EOF
+$(python3 -c 'import json,sys
+try:
+ p=json.load(open(sys.argv[1]))
+ for r in p.get("rungs",[]):
+  for role in ("builder","reviewer"):
+   b=r.get(role,{}).get("backend")
+   if isinstance(b,str): print(b)
+except Exception: pass' "$profile" 2>/dev/null)
+EOF
+}
+
 # Parse + validate the profile at boot. Sets RALPH_EFFICIENCY_STATE to
 # valid | not_configured | rejected and returns 0 only when a valid profile is
 # active. NEVER exits; a caller under `set -e` must use it in a conditional.
 ralph_efficiency_boot_validate() {  # <target-repo>
-  local repo="${1:-$PWD}" script json rc=0 status=""
+  local repo="${1:-$PWD}" script json rc=0 status="" backend=""
   script="$(ralph_efficiency_script_path)"
   RALPH_EFFICIENCY_PROFILE_PATH="$(ralph_efficiency_profile_path "$repo")"
   RALPH_EFFICIENCY_STATE="rejected"
@@ -72,6 +96,12 @@ ralph_efficiency_boot_validate() {  # <target-repo>
   case "$status" in
     valid)
       RALPH_EFFICIENCY_STATE="valid"
+      while IFS= read -r backend; do
+        [[ -n "$backend" ]] || continue
+        echo "⚠⚠ ralph: efficiency profile rung backend '$backend' is UNRESOLVABLE via resolve_backend_cmd; selection will skip every rung that uses it." >&2
+      done <<EOF
+$(ralph_efficiency_unresolvable_backends "$RALPH_EFFICIENCY_PROFILE_PATH")
+EOF
       echo "efficiency: profile $RALPH_EFFICIENCY_PROFILE_PATH is VALID — tickets carrying a complexity:<tier> label/field are right-sized from it (run 'ralph explain --complexity <level>' to read the policy)."
       return 0
       ;;
@@ -142,7 +172,8 @@ EOF
 # NEVER exits; a caller under `set -e` must use it in a conditional.
 ralph_efficiency_select() {  # <complexity> [target-repo] [after-rung]
   local complexity="${1:-}" repo="${2:-$PWD}" after="${3:-}" script profile pool rc=0
-  local assignments="" after_args=""
+  local assignments="" after_args="" backend=""
+  local unresolved_args=()
   local pool_args="" open_pools=""
   RALPH_EFFICIENCY_SELECT_STATUS="inert"
   RALPH_EFFICIENCY_SELECT_COMPLEXITY="$complexity"
@@ -173,6 +204,17 @@ ralph_efficiency_select() {  # <complexity> [target-repo] [after-rung]
   fi
   profile="$(ralph_efficiency_profile_path "$repo")"
 
+  # Only boot-validated dispatch enables this hard gate. Pure selection fixtures
+  # deliberately use symbolic undefined backends to test usage policy in isolation.
+  if [[ "${RALPH_EFFICIENCY_STATE:-}" == "valid" ]]; then
+    while IFS= read -r backend; do
+      [[ -n "$backend" ]] || continue
+      unresolved_args+=(--unresolvable-backend "$backend")
+    done <<EOF
+$(ralph_efficiency_unresolvable_backends "$profile")
+EOF
+  fi
+
   # Feed the #28 circuit state in; efficiency.py never derives it itself.
   open_pools="$(ralph_efficiency_open_circuit_pools)"
   while IFS= read -r pool; do
@@ -189,11 +231,12 @@ EOF
   if [[ -n "$after" ]]; then
     # shellcheck disable=SC2086
     assignments="$(python3 "$script" select --complexity "$complexity" --repo "$repo" \
-      --profile "$profile" --shell --after-rung "$after" $pool_args)" || rc=$?
+      --profile "$profile" --shell --after-rung "$after" $pool_args \
+      "${unresolved_args[@]}")" || rc=$?
   else
     # shellcheck disable=SC2086
     assignments="$(python3 "$script" select --complexity "$complexity" --repo "$repo" \
-      --profile "$profile" --shell $pool_args)" || rc=$?
+      --profile "$profile" --shell $pool_args "${unresolved_args[@]}")" || rc=$?
   fi
   if [[ -z "$assignments" ]]; then
     RALPH_EFFICIENCY_SELECT_REASON="could not run $script (exit $rc)"

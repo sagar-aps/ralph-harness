@@ -914,10 +914,21 @@ def backstop_rung_name(profile):
     return None
 
 
-def _evaluate_rung(rung, policy, usage, now, exhausted, in_tier):
+def _evaluate_rung(rung, policy, usage, now, exhausted, in_tier,
+                   unresolvable_backends=()):
     """Evaluate one rung: its avoid windows, then every pool it draws on."""
     checks = []
     eligible = True
+    unresolved = set(unresolvable_backends or ())
+    for role in ("builder", "reviewer"):
+        backend = rung[role]["backend"]
+        if backend in unresolved:
+            checks.append({
+                "kind": "backend", "role": role, "backend": backend, "ok": False,
+                "detail": "{} backend '{}' is UNRESOLVABLE (resolve_backend_cmd returned no command)".format(
+                    role, backend),
+            })
+            eligible = False
     lifted_any = False  # did the near-weekly-reset relaxation lift a weekly gate?
     unblocks = []  # aware datetimes at which one of this rung's blocks could lift
 
@@ -1087,7 +1098,7 @@ def _pause_signal(evaluated, now):
 
 
 def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None,
-                after_rung=None):
+                after_rung=None, unresolvable_backends=()):
     """Pick the (builder, reviewer) rung for one complexity tier.
 
     Returns {status, rung_name, builder, reviewer, reason, ...}: status is
@@ -1128,7 +1139,8 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None,
     evaluated = []
     chosen = None
     for name in order:
-        entry = _evaluate_rung(rungs[name], policy, usage, now, exhausted, True)
+        entry = _evaluate_rung(rungs[name], policy, usage, now, exhausted, True,
+                               unresolvable_backends)
         evaluated.append(entry)
         if entry["eligible"] and chosen is None:
             chosen = entry
@@ -1147,7 +1159,8 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None,
                 entry = candidate
                 break
         if entry is None:
-            entry = _evaluate_rung(rungs[backstop_name], policy, usage, now, exhausted, False)
+            entry = _evaluate_rung(rungs[backstop_name], policy, usage, now, exhausted, False,
+                                   unresolvable_backends)
             evaluated.append(entry)
         if entry["eligible"]:
             chosen = entry
@@ -1390,7 +1403,7 @@ def _reserve_summary_lines(block):
     return lines
 
 
-def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
+def cmd_explain(loaded, complexity, repo, as_json, exhausted=(), unresolvable=()):
     now = now_utc()
 
     if loaded["status"] != STATUS_VALID:
@@ -1414,7 +1427,8 @@ def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
 
     profile = loaded["profile"]
     usage = read_ledger_usage(repo, now, profile)
-    result = select_rung(profile, complexity, usage, now, exhausted)
+    result = select_rung(profile, complexity, usage, now, exhausted,
+                         unresolvable_backends=unresolvable)
 
     if as_json:
         payload = dict(result)
@@ -1460,7 +1474,13 @@ def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
                 local = pool_usage.get("local_{}".format(window))
                 if local:
                     print("     [--] {}".format(_local_window_line(local)))
-        print("     => {}".format("ELIGIBLE" if rung["eligible"] else "NOT ELIGIBLE"))
+        backend_checks = [c for c in rung["checks"]
+                          if c.get("kind") == "backend" and not c["ok"]]
+        if backend_checks:
+            print("     => UNRESOLVABLE ({})".format(
+                ", ".join(dict.fromkeys(c["backend"] for c in backend_checks))))
+        else:
+            print("     => {}".format("ELIGIBLE" if rung["eligible"] else "NOT ELIGIBLE"))
         print("")
     print("CHOSEN: {}".format(result["rung_name"] or "none"))
     print("WHY: {}".format(result["reason"]))
@@ -1521,7 +1541,8 @@ def _select_shell_payload(result, loaded, now):
     ]
 
 
-def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted, after_rung=None):
+def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted, after_rung=None,
+               unresolvable=()):
     now = now_utc()
 
     if loaded["status"] != STATUS_VALID:
@@ -1555,7 +1576,8 @@ def cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted, after_run
 
     usage = read_ledger_usage(repo, now, loaded["profile"])
     result = select_rung(loaded["profile"], complexity, usage, now, exhausted,
-                         after_rung=after_rung)
+                         after_rung=after_rung,
+                         unresolvable_backends=unresolvable)
     code = {SELECT_SELECTED: 0, SELECT_EXHAUSTED: EXIT_EXHAUSTED}.get(
         result["status"], EXIT_PAUSED)
 
@@ -1634,6 +1656,7 @@ def main(argv):
     exhausted = []
     # #64: the rung a failed run is escalating ABOVE. None = ordinary selection.
     after_rung = None
+    unresolvable = []
     rest = argv[1:]
     i = 0
     while i < len(rest):
@@ -1643,7 +1666,7 @@ def main(argv):
         elif arg == "--shell":
             as_shell = True
         elif arg in ("--profile", "--repo", "--complexity", "--exhausted-pool",
-                     "--after-rung"):
+                     "--after-rung", "--unresolvable-backend"):
             if i + 1 >= len(rest):
                 print("ralph: {} needs a value".format(arg), file=sys.stderr)
                 return 2
@@ -1657,6 +1680,8 @@ def main(argv):
                 exhausted.append(value)
             elif arg == "--after-rung":
                 after_rung = value
+            elif arg == "--unresolvable-backend":
+                unresolvable.append(value)
             else:
                 complexity = value
         elif arg.startswith("--profile="):
@@ -1669,6 +1694,8 @@ def main(argv):
             exhausted.append(arg.split("=", 1)[1])
         elif arg.startswith("--after-rung="):
             after_rung = arg.split("=", 1)[1]
+        elif arg.startswith("--unresolvable-backend="):
+            unresolvable.append(arg.split("=", 1)[1])
         else:
             print("ralph: unknown efficiency option {!r}".format(arg), file=sys.stderr)
             print(USAGE, file=sys.stderr)
@@ -1702,11 +1729,11 @@ def main(argv):
         return 2
     if command == "select":
         return cmd_select(loaded, complexity, repo, as_json, as_shell, exhausted,
-                          after_rung)
+                          after_rung, unresolvable)
     if after_rung is not None:
         print("ralph: --after-rung applies to `select` only", file=sys.stderr)
         return 2
-    return cmd_explain(loaded, complexity, repo, as_json, exhausted)
+    return cmd_explain(loaded, complexity, repo, as_json, exhausted, unresolvable)
 
 
 if __name__ == "__main__":

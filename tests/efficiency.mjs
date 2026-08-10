@@ -60,6 +60,11 @@ function ralph(args, env = {}) {
       RALPH_CRON_DRIVER_MODEL: "",
       RALPH_CRON_DRIVER_EFFORT: "",
       RALPH_MANAGER_POOL: "",
+      // The shipped policy expects operator-defined zlaude/dlaude backends.
+      // Bind them in hermetic tests so only fixtures intentionally named undefined
+      // exercise the resolvability diagnostics.
+      AGENT_ZLAUDE_CMD: "fixture-zlaude {prompt}",
+      AGENT_DLAUDE_CMD: "fixture-deepseek {prompt}",
       ...env,
     },
   });
@@ -158,6 +163,47 @@ console.log("3) valid profile -> explain picks sensibly per complexity");
     ralph(["explain", "--repo", target, "--complexity", "large"], clock);
     const after = readFileSync(path.join(target, ".agents", "ralph", "efficiency.json"), "utf-8");
     check(before === after, "explain is read-only (profile unchanged)");
+  } finally { rmSync(target, { recursive: true, force: true }); }
+}
+
+// ── 3b) Backend resolvability is checked before dispatch ──────────────────
+console.log("3b) undefined rung backends are diagnosed and skipped after boot validation");
+{
+  const profile = JSON.parse(JSON.stringify(example));
+  profile.rungs.find((r) => r.name === "zlaude").builder.backend = "undefined-fixture";
+  const target = makeTarget(profile);
+  try {
+    const explained = ralph(["explain", "--repo", target, "--complexity", "small"],
+      { RALPH_EFFICIENCY_NOW: "2026-08-09T12:00:00Z" });
+    const explainOut = `${explained.stdout}${explained.stderr}`;
+    check(/UNRESOLVABLE \(undefined-fixture\)/.test(explainOut),
+      "explain marks the rung UNRESOLVABLE and names its backend");
+    check(/^CHOSEN: codex$/m.test(explainOut),
+      "explain falls through to the next resolvable rung");
+
+    const shell = `
+source "${path.join(repoRoot, ".agents", "ralph", "agents.sh")}"
+source "${path.join(repoRoot, ".agents", "ralph", "config.sh")}"
+source "${path.join(repoRoot, ".agents", "ralph", "efficiency.sh")}"
+RALPH_EFFICIENCY_PROFILE="${path.join(target, ".agents", "ralph", "efficiency.json")}"
+ralph_efficiency_boot_validate "${target}"
+ralph_efficiency_select small "${target}"
+printf 'SELECTED=%s\\nWHY=%s\\n' "$RALPH_EFFICIENCY_SELECT_RUNG" "$RALPH_EFFICIENCY_SELECT_REASON"
+`;
+    const selected = spawnSync("bash", ["-c", shell], {
+      encoding: "utf-8",
+      env: { ...process.env, RALPH_NO_LOCAL_CONFIG: "1",
+        AGENT_ZLAUDE_CMD: "fixture-zlaude {prompt}",
+        AGENT_DLAUDE_CMD: "fixture-deepseek {prompt}",
+        RALPH_EFFICIENCY_NOW: "2026-08-09T12:00:00Z" },
+    });
+    const selectOut = `${selected.stdout}${selected.stderr}`;
+    check(selected.status === 0 && /SELECTED=codex/.test(selectOut),
+      "boot-validated selection skips the unresolvable rung");
+    check(/backend 'undefined-fixture' is UNRESOLVABLE/.test(selectOut),
+      "boot validation warns on stderr and names the backend");
+    check(/zlaude was skipped/.test(selectOut),
+      "selection gives a clear fall-through reason");
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
@@ -460,6 +506,8 @@ console.log("9) --efficiency on a story with no complexity: dispatch is UNCHANGE
       RALPH_WORKTREE_DIR: worktreeFor(target),
       AGENT_FIXTURE_BUILD_CMD: "opencode run {prompt}",
       AGENT_FIXTURE_REVIEW_CMD: "claude -p",
+      AGENT_ZLAUDE_CMD: "fixture-zlaude {prompt}",
+      AGENT_DLAUDE_CMD: "fixture-deepseek {prompt}",
       ...env,
     },
   );
