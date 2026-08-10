@@ -114,7 +114,9 @@ of the design — one high-judgment loop above, one high-throughput loop below.
 
 **The Orchestrator's loop** (hourly, autonomous):
 1. Read the Manager's comments on its open PRs and any answered `blocked:manager` items first.
-2. Select treatable tickets — `now` + `spec:ready` + `## Acceptance`, label-mechanical.
+2. Select treatable tickets — `now` + `spec:ready` + `## Acceptance`, label-mechanical; then skip
+   any candidate an **open PR already references** (any author) — the duplicate-work guard in
+   `ORCHESTRATOR.md` step 2, distinct from the `blocked:orchestrator` handback in step 1.
 3. Assign to a builder; the in-loop reviewer returns PASS/FAIL; iterate.
 4. Verify on **dev** (deploy dev locally, run the acceptance).
 5. File a PR (noting dev-verified vs. needs-prod); move to the next ticket.

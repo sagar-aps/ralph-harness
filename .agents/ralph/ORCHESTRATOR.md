@@ -173,6 +173,50 @@ boot). Each pass:
    excluded HERE only because step 1 already owns it — skip it in step 1 as well and you are
    skipping your own inbox, which is how an answered arbitration sits untouched for a day. No
    acceptance section → not eligible (adding it is the Manager's job, not yours).
+
+   **Then apply the duplicate-work guard — SKIP any candidate that an OPEN PR already
+   references, REGARDLESS of author.** This is not a label state: it is a per-candidate
+   precondition you check on top of the label-mechanical eligible set, immediately before you
+   dispatch a builder in step 3. A round can take anywhere from a minute to well over half an
+   hour, so a cadence shorter than the round — or a second driver, or a human who filed a PR by
+   hand — will happily re-select the same ticket and produce a second PR for work that is
+   already in flight. Author does not matter: yours, another driver's, the Manager's, a human's.
+   An open PR against the ticket means the work exists; selecting it again duplicates it.
+
+   **This is DISTINCT from the `blocked:orchestrator` sweep in step 1.** That sweep covers your
+   own PRs the Manager has *already reviewed* and handed back with feedback — reviewed work you
+   must resume. This guard covers the opposite case: a PR **no human and no Manager has even
+   looked at yet**, which carries no label at all and therefore appears nowhere in step 1.
+   Waiting on review is not a blocker and never gets a `blocked:*` label, so without this check
+   an unreviewed PR is invisible to your loop and the ticket looks untouched.
+
+   Run all three checks per candidate issue number — a mention, an explicit closing keyword, and
+   the head branch. Use `-R <owner>/<repo>`: you boot *above* the target, so an unqualified
+   `gh pr list` resolves against the wrong (or no) repo. These are reads, so the floor guard
+   (which refuses only merge/approve/default-push) permits them.
+
+   ```bash
+   N=123                       # the candidate issue number
+   R=<owner>/<repo>            # the target repo — never rely on the cwd
+
+   # 1. any open PR whose body mentions the issue
+   gh pr list -R "$R" --state open --search "$N in:body" --json number,author,headRefName
+
+   # 2. any open PR that declares it closes the issue
+   gh pr list -R "$R" --state open --search "\"Fixes #$N\" in:body" \
+     --json number,author,headRefName
+
+   # 3. any open PR whose head branch carries the issue number
+   N="$N" gh pr list -R "$R" --state open --limit 100 --json number,author,headRefName \
+     --jq 'env.N as $n | map(select(.headRefName | test("(^|[^0-9])" + $n + "([^0-9]|$)")))'
+   ```
+
+   **A non-empty result from ANY of the three → the ticket is NOT eligible this pass. Skip it
+   and move to the next candidate.** Do not comment and do not apply a label: the open PR *is*
+   the trail, and the ticket is neither parked nor blocked — it is in flight. Note the skip and
+   the PR number in the pass log so the round's decision is reconstructable. If the open PR
+   turns out to be one of yours carrying `blocked:orchestrator`, step 1 already owns it — you
+   push a fix onto that PR's branch, you never open a second PR for the same ticket.
 3. **Assign to a builder.** Dispatch the ticket through the harness (`ralph review <task>` /
    `ralph batch`). The builder implements; the in-loop **reviewer** returns PASS/FAIL; iterate
    under the harness until the check and reviewer pass.
