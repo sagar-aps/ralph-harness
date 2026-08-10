@@ -78,6 +78,12 @@ const review = {
   provider: null,
   round: null,
   runId: null,
+  // pick-driver (#76) — usage-aware driver selection. Read-only, operator-invoked;
+  // forwarded verbatim to pick-driver.py.
+  candidates: [],
+  exhaustedPools: [],
+  pickDefault: null,
+  shellOut: false,
 };
 
 function exists(p) {
@@ -500,6 +506,10 @@ Commands:
   explain --complexity <level>        Explain which efficiency-profile rung WOULD be used
                                       for a complexity tier (trivial|small|medium|large).
                                       Read-only: dispatches nothing, changes no selection.
+  pick-driver [--candidates a,b]      Print the candidate DRIVER whose credential pool has
+                                      the most live headroom (usage-state + #68 adapters vs
+                                      the profile's caps/reserves); fails open to the
+                                      RALPH_CRON_DRIVER default. Read-only (see below)
   help                                Show this message
 
 Options:
@@ -601,6 +611,23 @@ log-usage options (ralph log-usage) — the driver/orchestrator ingestion hook:
   --run-id <id>                       Record the run this pass belongs to
   --repo <path>                       Target repo (default: TARGET_REPO, else cwd)
   --json                              Print the appended record instead of a summary
+
+pick-driver options (ralph pick-driver) — usage-aware DRIVER selection, read-only:
+  --candidates <a,b> | --candidate <name[=pool]>
+                                      Candidate drivers, best-liked first (repeatable; a
+                                      pool is looked up in the efficiency profile's rungs
+                                      unless you spell it as name=pool). Unset =>
+                                      RALPH_CRON_DRIVER_CANDIDATES, else every backend the
+                                      profile's rungs declare (cheapest rung first)
+  --default <name>                    Fallback when no candidate has usable live usage
+                                      (e.g. your calendar rule's answer). Unset => whatever
+                                      RALPH_CRON_DRIVER resolves to
+  --exhausted-pool <pool>             Hold back candidates on this pool (#28 circuit open);
+                                      repeatable (feed it ralph_efficiency_open_circuit_pools)
+  --efficiency-profile <path>         Profile path; plain --profile means this path too
+  --json | --shell                    Full record as JSON, or eval-able RALPH_PICK_DRIVER_*
+                                      assignments (plain mode prints ONLY the driver name on
+                                      stdout, the reasoning on stderr)
 
 Preflight options (build / review / batch / preflight):
   --no-preflight | --skip-preflight   Skip the repo-contract preflight phase
@@ -704,6 +731,27 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     i += 1;
     continue;
   }
+  // --- Repeatable flags (pick-driver): each occurrence appends ---------------
+  const repeatableFlags = {
+    "--candidate": "candidates",
+    "--candidates": "candidates",
+    "--exhausted-pool": "exhaustedPools",
+  };
+  let matchedRepeatable = false;
+  for (const [flag, key] of Object.entries(repeatableFlags)) {
+    if (arg === flag) {
+      if (rawArgs[i + 1] !== undefined) review[key].push(rawArgs[i + 1]);
+      i += 1;
+      matchedRepeatable = true;
+      break;
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      review[key].push(arg.slice(flag.length + 1));
+      matchedRepeatable = true;
+      break;
+    }
+  }
+  if (matchedRepeatable) continue;
   // --- Review loop flags (--flag value and --flag=value forms) ---
   const reviewFlags = {
     "--repo": "repo",
@@ -740,6 +788,7 @@ for (let i = 0; i < rawArgs.length; i += 1) {
     "--provider": "provider",
     "--round": "round",
     "--run-id": "runId",
+    "--default": "pickDefault",
   };
   let matchedReviewFlag = false;
   for (const [flag, key] of Object.entries(reviewFlags)) {
@@ -818,6 +867,10 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--json") {
     review.reportJson = true;
+    continue;
+  }
+  if (arg === "--shell") {
+    review.shellOut = true;
     continue;
   }
   if (arg === "--efficiency") {
@@ -1839,6 +1892,38 @@ async function main() {
     const pyArgs = [explainScript, "explain", "--complexity", complexity, "--repo", repo];
     if (profilePath) pyArgs.push("--profile", path.resolve(process.cwd(), profilePath));
     if (review.reportJson) pyArgs.push("--json");
+    const result = spawnSync("python3", pyArgs, { stdio: "inherit" });
+    process.exit(result.status ?? 1);
+  }
+
+  // `pick-driver` (#76): read-only, usage-aware DRIVER selection. It prints the
+  // candidate driver whose credential pool has the most live headroom (per-pool
+  // usage from #60/#68 vs the profile's caps and the reserves other control-plane
+  // roles hold), and FAILS OPEN to the documented default when no candidate has
+  // usable usage. Dispatches nothing; an operator/cron decides what to do with it.
+  // stdout is only the driver name, so `RALPH_CRON_DRIVER="$(ralph pick-driver …)"`
+  // works; the reasoning goes to stderr (or use --json / --shell).
+  if (cmd === "pick-driver") {
+    const targetRepo = review.repo || process.env.TARGET_REPO || process.cwd();
+    const repo = path.resolve(process.cwd(), targetRepo);
+    const pickTemplateDir = exists(localDir) ? localDir : globalDir;
+    const pickScript = path.join(pickTemplateDir, "pick-driver.py");
+    if (!exists(pickScript)) {
+      console.error(`pick-driver.py not found at ${pickScript}`);
+      process.exit(1);
+    }
+    // As on `explain`, a plain --profile here means the efficiency PROFILE PATH.
+    const profilePath = review.efficiencyProfile || review.profile;
+    const pyArgs = [pickScript, "--repo", repo];
+    if (profilePath) pyArgs.push("--profile", path.resolve(process.cwd(), profilePath));
+    // Forwarded as --candidates (not --candidate) so one comma/space-separated
+    // value stays a LIST: `--candidates codex,zlaude` and repeated `--candidate x`
+    // both arrive as the individual names, in the order they were given.
+    for (const candidate of review.candidates) pyArgs.push("--candidates", candidate);
+    for (const pool of review.exhaustedPools) pyArgs.push("--exhausted-pool", pool);
+    if (review.pickDefault) pyArgs.push("--default", review.pickDefault);
+    if (review.reportJson) pyArgs.push("--json");
+    if (review.shellOut) pyArgs.push("--shell");
     const result = spawnSync("python3", pyArgs, { stdio: "inherit" });
     process.exit(result.status ?? 1);
   }

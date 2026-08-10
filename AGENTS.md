@@ -116,6 +116,18 @@ change a flag.
   FAILS OPEN (pct=unknown, #28 circuit is the gate) and never crashes. Contract + working
   implementation:
   `usage_provider.example.sh`.
+  Usage-aware DRIVER choice (#76, **opt-in, read-only**): `ralph pick-driver`
+  (`pick-driver.py`) prints which candidate driver's pool has the most live HEADROOM —
+  `min(5h cap - 5h used, weekly ceiling - weekly used)` over the same readers, where the
+  weekly ceiling subtracts only the reserves of the OTHER control-plane roles (the driver
+  IS the orchestrator, so its own 50% is not charged) and the near-weekly-reset
+  relaxation applies as in `select`. Candidates: `--candidates` >
+  `RALPH_CRON_DRIVER_CANDIDATES` > the profile's rung backends. stdout is ONLY the name
+  (reasoning on stderr; `--json`/`--shell` for the record), so
+  `RALPH_CRON_DRIVER="$(ralph pick-driver …)"` works. Unmeasurable/held-back candidates
+  are skipped, and when NONE can be ranked it FAILS OPEN to `--default` or whatever
+  `RALPH_CRON_DRIVER` resolves to — always exit 0 (2 only for bad CLI usage). Nothing
+  calls it automatically; see docs/OPERATING.md §4.2.
 
 ## Token economics (read before reasoning about cost or caching)
 

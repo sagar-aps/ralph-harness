@@ -30,6 +30,7 @@ contract: an unset flag means the code path does not run.
 | Credential-pool identity | `RALPH_BUILDER_CREDENTIAL_POOL` / `RALPH_REVIEWER_CREDENTIAL_POOL` | provider name | `batch` |
 | Identity wrapper | `ralph.target.json` `identity.enabled` / `RALPH_IDENTITY_WRAPPER` / `.agents/ralph/identity.sh` | **no marker → ambient `gh`** | Manager / Orchestrator |
 | Cron/orchestrator driver | `RALPH_CRON_DRIVER` (or `_PROVIDER`/`_MODEL`/`_EFFORT`) | `RALPH_CRON_DRIVER_DEFAULT` → `$DEFAULT_AGENT` → `codex` | orchestrator loop |
+| Usage-aware driver choice | `ralph pick-driver` (+ `--candidates` / `RALPH_CRON_DRIVER_CANDIDATES`) | **nothing picks the driver by usage automatically** — fails open to the `RALPH_CRON_DRIVER` default | `ralph pick-driver` (§4.2) |
 | Manager role | `ralph init-target` installs it; boot `/manager` in the target repo | not booted | target repo session |
 | Verify gate | `--verify <cmd>` / `ralph.target.json` `.verify` | empty = disabled | `batch` |
 | Primer | `--primer <file>` / `ralph.target.json` `.primer` | unset (soft warning) | `batch` |
@@ -269,6 +270,71 @@ Persistent=true
 
 The wrapper takes a `mkdir`-based lock in `.ralph/loop.lock`, so a cadence shorter than one
 pass skips rather than stacking two drivers on the same worktree — on any scheduler.
+
+### 4.2 Picking the driver by LIVE usage — `ralph pick-driver`
+
+**Opt-in and read-only.** Nothing calls it: an operator or a cron wrapper does, and then does
+what it likes with the answer. This is the **supported way to pick a driver by live usage** —
+the alternative operators reach for otherwise is a clock rule (`if hour < 12 then codex`), a
+static proxy for "which pool is cheaper now" that keeps picking a pool at 95 % while another
+sits at 10 %.
+
+```bash
+# The whole point, in a cron wrapper:
+export RALPH_CRON_DRIVER="$(ralph pick-driver --repo "$TARGET_REPO" \
+  --candidates codex,zlaude --default codex)"
+```
+
+- **What it prints**: on stdout, **only** the driver name — so `$(...)` capture is the intended
+  use. The reasoning (every candidate's numbers, the notes, the verdict) goes to **stderr**, so
+  it is visible in a log and never contaminates the value. `--json` prints the full record,
+  `--shell` prints eval-able `RALPH_PICK_DRIVER_*` assignments (`_STATUS`, `_DRIVER`, `_POOL`,
+  `_HEADROOM_PCT`, `_DEFAULT`, `_REASON`, …).
+- **Candidates**, in precedence order: `--candidates a,b` / repeated `--candidate <name>`
+  (best-liked first), then `RALPH_CRON_DRIVER_CANDIDATES` (comma/space separated), then **every
+  backend the efficiency profile's rungs declare**, cheapest rung first. A candidate is a
+  backend name whose pool is looked up in the profile's rungs, or `name=pool` when the profile
+  does not map it.
+- **How it ranks them** — the distance to the first gate that would stop the driver:
+
+  ```text
+  headroom = min( 5h ceiling - 5h used , weekly ceiling - weekly used )
+  ```
+
+  The **5 h ceiling** is the pool's `window_5h_pct` cap (100 % if it declares none) and is never
+  relaxed — it is a rate limit. The **weekly ceiling** is its `window_weekly_pct` cap, further
+  reduced by the weekly **reserve other control-plane roles** hold on that pool (§5): the
+  manager's, typically. The **orchestrator's own reserve is deliberately not charged** — the
+  driver *is* the orchestrator, so that share is quota set aside for this very run. Near the
+  weekly reset (`reserves.near_weekly_reset_hours`) the weekly cap **and** the reserve are
+  lifted, exactly as `efficiency.py select` lifts them. Most headroom wins; a tie keeps the
+  order you gave.
+- **Where the numbers come from**: the same readers as everything else —
+  `efficiency.read_ledger_usage` → `usage-state.py`, i.e. ledger tokens vs the pool's
+  `window_*_budget_tokens`, a ledger `quota` block, or the pool's own `usage_provider` adapter
+  (§5/#68) for a %-only plan. Nothing is re-implemented here and **no percentage is invented**.
+- **Held back rather than ranked**: a candidate whose pool has an **open quota circuit** (pass
+  the pools with `--exhausted-pool <pool>`, repeatable — `ralph_efficiency_open_circuit_pools`
+  in `efficiency.sh` prints exactly that list) or an **active avoid window**.
+- **FAIL-OPEN, always exit 0**: a candidate with no usable percentage for either window is
+  reported *unavailable* and left out of the ranking. When **no** candidate can be ranked — no
+  usage data anywhere, a missing or rejected profile, a broken/slow adapter, no candidates at
+  all — it prints the **documented default** and says it is a fallback: `--default <name>`
+  (your own rule, e.g. the calendar rule you are replacing), else whatever `RALPH_CRON_DRIVER`
+  resolves to right now (`ralph_resolve_cron_driver`, including its documented default chain).
+  The only non-zero exit is **2, for bad CLI usage** (an unknown option) — never a runtime miss.
+- **Read-only**: it opens the ledger and the profile, runs each pool's own usage adapter (what
+  that adapter is for), and writes nothing — no ledger mutation, no dispatch, no agent started.
+  `--efficiency` does not have to be on: the profile is read as *data* here.
+
+```bash
+ralph pick-driver --repo <target> --candidates codex,zlaude --json   # the full record
+ralph pick-driver --repo <target> --candidate zlaude=zai --default codex --shell
+```
+
+Its own gitignored profile applies: with no `efficiency.json` there are no pools, caps or
+reserves to read, so every candidate is unavailable and you always get the default — configure
+the profile (§5) first if you want this to do anything.
 
 ---
 
@@ -646,6 +712,10 @@ what makes reserves land on the right pool: change the driver and the 50 % orche
 **moves with it**, while the pool it left reverts to its plain caps. Share a pool between both
 control-plane roles and their reserves stack to 75 %.
 
+That is also why `ralph pick-driver` (§4.2) charges a candidate only the reserves of the *other*
+control-plane roles: the driver is the orchestrator, so its own 50 % is the quota it is about to
+spend, not quota it must leave alone.
+
 ### 13.5 Terminal statuses and exit codes
 
 Both loops end **0** only on `READY_FOR_HUMAN_REVIEW` and **2** on anything else, except
@@ -681,7 +751,7 @@ with §1 this is the complete flag surface; `ralph help` is the authoritative li
 
 | Flag | Commands | Meaning / default |
 |---|---|---|
-| `--repo <path>` | `review`, `batch`, `preflight`, `status`, `integrate`, `cleanup`, `init-target`, `report`, `explain` | Target repo. Falls back to `TARGET_REPO`; **required** for `review`/`batch`, defaults to cwd for `report`/`explain`. |
+| `--repo <path>` | `review`, `batch`, `preflight`, `status`, `integrate`, `cleanup`, `init-target`, `report`, `explain`, `pick-driver` | Target repo. Falls back to `TARGET_REPO`; **required** for `review`/`batch`, defaults to cwd for `report`/`explain`/`pick-driver`. |
 | `--prd <path>` | `build`, `prd`, `review` | Override the PRD JSON. Unset → prompts among `.agents/tasks/*.json`. |
 | `--out <path>` | `prd` | PRD output path. Default `.agents/tasks/`. |
 | `--progress <path>` | `build` | Override the progress log. Default `.ralph/progress.md`. |
@@ -695,7 +765,11 @@ with §1 this is the complete flag surface; `ralph help` is the authoritative li
 | `--max-tasks <n>` | `batch` | Cap how many tasks run. Default: all. |
 | `--run latest\|<run-id>` | `status`, `integrate`, `cleanup` | Which run to act on. Default `latest`. |
 | `--watch` | `status` | Poll to a terminal status (see §13.5 for exit codes). |
-| `--json` | `report`, `explain` | Machine-readable output. Default: human text. |
+| `--json` | `report`, `explain`, `pick-driver` | Machine-readable output. Default: human text (on `pick-driver`, the bare driver name). |
+| `--candidates <a,b>` / `--candidate <name[=pool]>` | `pick-driver` | Candidate drivers, best-liked first; repeatable. Unset → `RALPH_CRON_DRIVER_CANDIDATES`, else the profile's rung backends (§4.2). |
+| `--default <name>` | `pick-driver` | Fallback when no candidate has usable live usage. Unset → whatever `RALPH_CRON_DRIVER` resolves to. |
+| `--exhausted-pool <pool>` | `pick-driver` | Hold back candidates on a pool whose quota circuit is open; repeatable. |
+| `--shell` | `pick-driver` | Print eval-able `RALPH_PICK_DRIVER_*` assignments instead of the bare name. |
 | `--pr` | `integrate` | Push the branch + `gh pr create` instead of merging main. `Fixes #N` from the branch name; `RALPH_FIXES="1 3 4"` closes several. Keeps the branch, removes the worktree, needs `gh`. |
 | `--merged` | `cleanup` | Sweep every worktree whose PR is already merged (needs `gh`). |
 | `--delete-branch` | `cleanup`, `integrate` | Also delete the run branch. Default: branch kept. |
@@ -707,7 +781,7 @@ with §1 this is the complete flag surface; `ralph help` is the authoritative li
 | `--keep-preview-on-fail` | `review` | Leave the preview running after a failed run. Default: torn down. |
 | `--complexity trivial\|small\|medium\|large` | `explain` | Which tier to explain. Required (or as a bare positional). |
 | `--builder-provider` / `--builder-model` / `--builder-effort` (and `--reviewer-*`) | `review`, `batch` | Normalized selection — see §2. |
-| `--profile cheap\|balanced\|max` | `review`, `batch` | Agent preset (see §2). **On `explain` only**, `--profile` instead means the efficiency profile *path*. |
+| `--profile cheap\|balanced\|max` | `review`, `batch` | Agent preset (see §2). **On `explain` and `pick-driver` only**, `--profile` instead means the efficiency profile *path*. |
 
 Also worth knowing: `RALPH_WORKTREE_DIR` moves the worktree base (default
 `<target-parent>/.ralph-worktrees`), and `RALPH_DRY_RUN=1` is the test suite's hook for
@@ -720,7 +794,7 @@ running the loops without invoking a real agent.
 `ralph help` prints the authoritative flag list. Everything above is enforced by the hermetic
 suite — `npm test` — with the mode-specific gates in `tests/efficiency.mjs`,
 `tests/efficiency-select.mjs`, `tests/efficiency-dispatch.mjs`, `tests/auto-escalate.mjs`,
-`tests/usage-state.mjs`, `tests/report.mjs`, `tests/log-usage.mjs`, `tests/cron-driver.mjs`, `tests/usage.mjs`,
+`tests/usage-state.mjs`, `tests/pick-driver.mjs`, `tests/report.mjs`, `tests/log-usage.mjs`, `tests/cron-driver.mjs`, `tests/usage.mjs`,
 `tests/usage-per-backend.mjs`, `tests/agent-selection.mjs` and `tests/integrate-identity.mjs`
 (§12's PR-filing identity). The default-OFF contracts in §5
 and §6 are pinned as explicit regression tests, so if a default in this document ever drifts,
