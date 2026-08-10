@@ -71,9 +71,11 @@ Owner and the Manager.
 
 Run every GitHub-writing command through the resolved wrapper as
 `.agents/ralph/identity.sh orchestrator <command…>` (or
-`"$RALPH_IDENTITY_WRAPPER" orchestrator <command…>` when the override won) — including
-`ralph integrate --pr`, whose `git push` and `gh pr create` inherit the identity from the
-environment.
+`"$RALPH_IDENTITY_WRAPPER" orchestrator <command…>` when the override won).
+`ralph integrate --pr` does this for you (#71): it resolves the identity itself with the
+same helper and runs its `git push` and `gh pr create` as
+`"$RESOLVED_WRAPPER" <role> git push …` / `… gh pr create …`, so the PR is authored by the
+App. It never falls back silently — see DEGRADED mode below.
 
 **DEGRADED mode**: When the ralph.target.json marker says `identity.enabled=true` but no
 wrapper resolves (doesn't exist, not executable, or fails), the orchestrator **MUST** flag
@@ -85,7 +87,9 @@ this loudly:
   will be a review comment, not formal approval.
 
 Never treat a missing or failed identity wrapper as a blocker — the loop must run either way.
-**Absent the marker**, silent fallback to ambient `gh auth` is correct (no degraded warning).
+**Absent the marker**, falling back to ambient `gh auth` is correct, not an error — but it is
+never *silent* on a write: `ralph integrate --pr` still states in the PR body and on stderr
+that the PR was filed under the ambient account, so an Owner-authored PR is always disclosed.
 **With the marker**, degraded mode is an error condition that must be visible.
 
 **The floor below is charter-enforced, and mechanically backstopped.** GitHub's
