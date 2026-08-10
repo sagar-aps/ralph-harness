@@ -52,7 +52,6 @@ timestamp so avoid-window evaluation is deterministic.
 import datetime
 import json
 import os
-import subprocess
 import sys
 
 TIERS = ("trivial", "small", "medium", "large")
@@ -915,63 +914,12 @@ def backstop_rung_name(profile):
     return None
 
 
-BACKEND_PROBE = r'''set -e
-dir="$1"; shift
-. "$dir/agents.sh"
-[[ -f "$dir/config.sh" ]] && . "$dir/config.sh"
-[[ -f "$dir/review-config.sh" ]] && . "$dir/review-config.sh"
-if [[ "${RALPH_NO_LOCAL_CONFIG:-}" != "1" && -f "$dir/config.local.sh" ]]; then
-  . "$dir/config.local.sh"
-fi
-for backend in "$@"; do
-  cmd="$(resolve_backend_cmd "$backend")" || cmd=""
-  [[ -n "$cmd" ]] || printf '%s\n' "$backend"
-done
-'''
-
-
-def unresolvable_backends(profile):
-    """Backend names which the dispatch resolver cannot turn into a command."""
-    names = []
-    for rung in profile.get("rungs", []):
-        for role in ("builder", "reviewer"):
-            name = rung[role]["backend"]
-            if name not in names:
-                names.append(name)
-    if not names:
-        return []
-    directory = os.path.dirname(os.path.abspath(__file__))
-    try:
-        proc = subprocess.Popen(
-            ["bash", "-c", BACKEND_PROBE, "ralph-backend-probe", directory] + names,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        out, _ = proc.communicate(timeout=15)
-        if proc.returncode != 0:
-            return names
-    except Exception:
-        if 'proc' in locals() and proc.poll() is None:
-            proc.kill()
-            proc.communicate()
-        return names
-    return [line.strip() for line in out.splitlines() if line.strip()]
-
-
-def _evaluate_rung(rung, policy, usage, now, exhausted, in_tier, unresolvable=()):
+def _evaluate_rung(rung, policy, usage, now, exhausted, in_tier):
     """Evaluate one rung: its avoid windows, then every pool it draws on."""
     checks = []
     eligible = True
     lifted_any = False  # did the near-weekly-reset relaxation lift a weekly gate?
     unblocks = []  # aware datetimes at which one of this rung's blocks could lift
-
-    for role in ("builder", "reviewer"):
-        backend = rung[role]["backend"]
-        if backend in unresolvable:
-            checks.append({
-                "kind": "backend", "pool": None, "ok": False,
-                "detail": "{} backend '{}' is UNRESOLVABLE via resolve_backend_cmd".format(
-                    role, backend),
-            })
-            eligible = False
 
     for win in rung.get("avoid_windows", []):
         active = window_active(win, now)
@@ -1169,7 +1117,6 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None,
     order = tier_order[len(below):] if escalating else tier_order
     reserves = profile.get("reserves", {})
     exhausted = set(exhausted_pools or ())
-    unresolved = set(unresolvable_backends(profile))
 
     if roles is None:
         roles = resolve_role_pools(profile)
@@ -1181,7 +1128,7 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None,
     evaluated = []
     chosen = None
     for name in order:
-        entry = _evaluate_rung(rungs[name], policy, usage, now, exhausted, True, unresolved)
+        entry = _evaluate_rung(rungs[name], policy, usage, now, exhausted, True)
         evaluated.append(entry)
         if entry["eligible"] and chosen is None:
             chosen = entry
@@ -1200,8 +1147,7 @@ def select_rung(profile, complexity, usage, now, exhausted_pools=(), roles=None,
                 entry = candidate
                 break
         if entry is None:
-            entry = _evaluate_rung(rungs[backstop_name], policy, usage, now, exhausted, False,
-                                   unresolved)
+            entry = _evaluate_rung(rungs[backstop_name], policy, usage, now, exhausted, False)
             evaluated.append(entry)
         if entry["eligible"]:
             chosen = entry
@@ -1337,12 +1283,6 @@ def describe_profile(profile):
 
 
 def cmd_validate(loaded, as_json):
-    unresolved = (unresolvable_backends(loaded["profile"])
-                  if loaded["status"] == STATUS_VALID else [])
-    if unresolved:
-        print("⚠⚠ ralph: efficiency profile {} has UNRESOLVABLE rung backend(s) via "
-              "resolve_backend_cmd: {} — those rungs will be skipped during selection.".format(
-                  loaded["path"], ", ".join(unresolved)), file=sys.stderr)
     if as_json:
         payload = {"status": loaded["status"], "profile_path": loaded["path"],
                    "errors": loaded["errors"], "enforced": False}
@@ -1350,7 +1290,6 @@ def cmd_validate(loaded, as_json):
             payload["rungs"] = [r["name"] for r in loaded["profile"]["rungs"]]
             payload["tiers"] = loaded["profile"]["tiers"]
             payload["reserves"] = loaded["profile"]["reserves"]
-            payload["unresolvable_backends"] = unresolved
         if loaded["status"] == STATUS_REJECTED:
             warn_rejected(loaded)
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
@@ -1521,12 +1460,7 @@ def cmd_explain(loaded, complexity, repo, as_json, exhausted=()):
                 local = pool_usage.get("local_{}".format(window))
                 if local:
                     print("     [--] {}".format(_local_window_line(local)))
-        unresolved = [c for c in rung["checks"]
-                      if c["kind"] == "backend" and not c["ok"]]
-        print("     => {}".format(
-            "UNRESOLVABLE ({})".format(", ".join(
-                c["detail"].split("'")[1] for c in unresolved))
-            if unresolved else ("ELIGIBLE" if rung["eligible"] else "NOT ELIGIBLE")))
+        print("     => {}".format("ELIGIBLE" if rung["eligible"] else "NOT ELIGIBLE"))
         print("")
     print("CHOSEN: {}".format(result["rung_name"] or "none"))
     print("WHY: {}".format(result["reason"]))

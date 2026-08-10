@@ -55,7 +55,6 @@ const cleanEnv = (env = {}) => ({
   // agents.sh resolves the orchestrator to $DEFAULT_AGENT (codex -> openai).
   RALPH_CRON_DRIVER: "", RALPH_CRON_DRIVER_DEFAULT: "", RALPH_CRON_DRIVER_PROVIDER: "",
   RALPH_CRON_DRIVER_MODEL: "", RALPH_CRON_DRIVER_EFFORT: "", RALPH_MANAGER_POOL: "",
-  AGENT_ZLAUDE_CMD: "zlaude -p", AGENT_DLAUDE_CMD: "dlaude -p",
   ...env,
 });
 

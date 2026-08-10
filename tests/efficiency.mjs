@@ -60,10 +60,6 @@ function ralph(args, env = {}) {
       RALPH_CRON_DRIVER_MODEL: "",
       RALPH_CRON_DRIVER_EFFORT: "",
       RALPH_MANAGER_POOL: "",
-      // The shipped policy's operator wrappers are resolvable in production via
-      // config.local.sh; keep the general fixtures hermetic and explicitly seed them.
-      AGENT_ZLAUDE_CMD: "zlaude -p",
-      AGENT_DLAUDE_CMD: "dlaude -p",
       ...env,
     },
   });
@@ -188,33 +184,6 @@ console.log("4) avoid_windows are evaluated against the current UTC time");
       { RALPH_EFFICIENCY_NOW: "2026-08-08T07:30:00Z" });
     check(/^CHOSEN: zlaude$/m.test(`${weekend.stdout}`),
       "the Mon-Fri window does not apply at the same time on Saturday");
-  } finally { rmSync(target, { recursive: true, force: true }); }
-}
-
-// ── 4b) Undefined rung backends are warned about and skipped ──────────────
-console.log("4b) unresolvable rung backend -> warn, flag, and fall through");
-{
-  const profile = structuredClone(example);
-  const zlaude = profile.rungs.find((r) => r.name === "zlaude");
-  zlaude.builder.backend = "undefined-fixture";
-  const target = makeTarget(profile);
-  try {
-    const explained = ralph(["explain", "--repo", target, "--complexity", "small"],
-      { RALPH_EFFICIENCY_NOW: "2026-08-10T11:00:00Z" });
-    const out = `${explained.stdout}${explained.stderr}`;
-    check(/UNRESOLVABLE \(undefined-fixture\)/.test(out),
-      "explain flags the rung UNRESOLVABLE and names its backend");
-    check(/^CHOSEN: codex$/m.test(out),
-      "selection skips the unresolvable rung and falls through to codex");
-
-    const validated = spawnSync("python3", [path.join(repoRoot, ".agents", "ralph", "efficiency.py"),
-      "validate", "--repo", target, "--json"], {
-      encoding: "utf-8",
-      env: { ...process.env, RALPH_NO_LOCAL_CONFIG: "1", AGENT_ZLAUDE_CMD: "zlaude -p",
-        AGENT_DLAUDE_CMD: "dlaude -p" },
-    });
-    check(/UNRESOLVABLE rung backend.*undefined-fixture/.test(`${validated.stderr}`),
-      "boot validation warns on stderr before dispatch");
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
@@ -514,8 +483,7 @@ console.log("9) --efficiency on a story with no complexity: dispatch is UNCHANGE
     check(/is VALID/.test(bOut), "the opt-in run boot-validates the profile");
     check(/carries no complexity:<tier> label\/field/.test(bOut),
       "the opt-in run says loudly why it could not right-size this story");
-    check(!/efficiency (mode|profile)|RALPH_EFFICIENCY/i.test(aOut),
-      "without the opt-in nothing about efficiency mode is printed");
+    check(!/efficiency/i.test(aOut), "without the opt-in nothing about efficiency is printed");
     check(selection(aOut) !== "" && selection(aOut) === selection(bOut),
       "builder/reviewer selection is identical with and without --efficiency");
     check(a.status === b.status && /READY_FOR_HUMAN_REVIEW/.test(bOut),
