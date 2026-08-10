@@ -289,9 +289,90 @@ function doCleanup(repo, runId, meta, deleteBranch, force) {
   return 0;
 }
 
+// --- Identity resolution (#53) for the GitHub write path (#71) --------------
+// Every GitHub WRITE `integrate --pr` performs (git push, gh pr create) must run
+// under the identity resolved by .agents/ralph/resolve-identity.sh, or the PR is
+// authored by whatever ambient `gh` happens to be (the Owner). The resolution
+// ORDER is the charter's (docs/OPERATING.md §12) and lives in that script — we
+// source it and read its exports, never re-implement it here.
+function resolveIdentityScript(repo) {
+  for (const p of [
+    path.join(repo, ".agents", "ralph", "resolve-identity.sh"),
+    path.join(localDir, "resolve-identity.sh"),
+    path.join(globalDir, "resolve-identity.sh"),
+  ]) {
+    if (exists(p)) return p;
+  }
+  return null;
+}
+
+// -> { wrapper, status: resolved|degraded|fallback, source, role, script }
+function resolveIdentity(repo) {
+  const script = resolveIdentityScript(repo);
+  if (!script) return { wrapper: "", status: "fallback", source: "resolver-not-found", role: "orchestrator", script: null };
+  const r = spawnSync(
+    "bash",
+    [
+      "-c",
+      'source "$1" && printf "WRAPPER=%s\\nSTATUS=%s\\nSOURCE=%s\\nROLE=%s\\n" ' +
+        '"$RESOLVED_WRAPPER" "$IDENTITY_STATUS" "$IDENTITY_SOURCE" "$IDENTITY_MARKER_ROLE"',
+      "resolve-identity",
+      script,
+    ],
+    { cwd: repo, encoding: "utf-8", env: { ...process.env, TARGET_REPO: repo } },
+  );
+  if (r.status !== 0) {
+    return { wrapper: "", status: "fallback", source: "resolver-failed", role: "orchestrator", script };
+  }
+  const field = (k) => ((r.stdout || "").match(new RegExp(`^${k}=(.*)$`, "m")) || [])[1] || "";
+  const wrapper = field("WRAPPER");
+  const status = field("STATUS") || "fallback";
+  return {
+    wrapper: status === "resolved" ? wrapper : "",
+    // A "resolved" status with no wrapper would be a silent Owner PR — treat it as unresolved.
+    status: status === "resolved" && !wrapper ? "fallback" : status,
+    source: field("SOURCE"),
+    role: field("ROLE") || "orchestrator",
+    script,
+  };
+}
+
+// Run one git/gh command UNDER the resolved wrapper when there is one, following
+// ORCHESTRATOR.md's convention: `"$RESOLVED_WRAPPER" <role> <command…>` (the
+// wrapper sets GH_TOKEN + git auth, so the write is authored by the App).
+// With nothing resolved this is a plain ambient invocation — see identityNotice().
+function runAsIdentity(identity, repo, cmd, args, opts = {}) {
+  const underWrapper = Boolean(identity && identity.status === "resolved" && identity.wrapper);
+  const bin = underWrapper ? identity.wrapper : cmd;
+  const argv = underWrapper ? [identity.role, cmd, ...args] : args;
+  return spawnSync(bin, argv, { cwd: repo, encoding: "utf-8", ...opts });
+}
+
+// One-line description of who the writes run as (stdout + PR body when resolved).
+function identityLine(identity) {
+  return `resolved wrapper ${identity.wrapper} (role: ${identity.role}, source: ${identity.source || "unknown"})`;
+}
+
+// The LOUD degraded-mode notice for an unresolved identity: null when resolved,
+// otherwise the text that goes to stderr AND into the PR body. Never silent.
+function identityNotice(identity) {
+  if (identity.status === "resolved") return null;
+  const markered = identity.status === "degraded";
+  const head = markered
+    ? "⚠️  DEGRADED MODE: running under Owner identity instead of orchestrator — identity wrapper failed to resolve."
+    : "⚠️  DEGRADED MODE: no identity wrapper resolved — running under the ambient `gh` account (typically the Owner), not the orchestrator identity.";
+  const detail = `Identity status: ${identity.status} (source: ${identity.source || "unknown"}).`;
+  const why = markered
+    ? "ralph.target.json declares identity.enabled=true, but no usable wrapper was found: this push/PR is NOT authored by the orchestrator identity."
+    : "Configure ralph.target.json `identity`, $RALPH_IDENTITY_WRAPPER, or .agents/ralph/identity.sh so writes are authored by the orchestrator identity.";
+  return `${head}\n${detail}\n${why}`;
+}
+
 // --- PR-integration helpers (used by `integrate --pr` and `cleanup --merged`) ---
-function ghAvailable() {
-  return spawnSync("gh", ["--version"], { encoding: "utf-8" }).status === 0;
+// `identity` (optional): probe through the resolved wrapper, since that — not the
+// ambient login — is the `gh` that will actually do the writing.
+function ghAvailable(repo = process.cwd(), identity = null) {
+  return runAsIdentity(identity, repo, "gh", ["--version"], { encoding: "utf-8" }).status === 0;
 }
 
 // The remote's default branch (PR base), e.g. "main". Falls back sensibly.
@@ -332,11 +413,15 @@ function prTitle(meta, branch) {
 }
 
 // The existing PR (any state) for a head branch, or null.
-function prForBranch(repo, branch) {
-  const r = spawnSync(
+// Queried under the resolved identity when there is one, so the lookup uses the
+// same credentials as the write that follows it.
+function prForBranch(repo, branch, identity = null) {
+  const r = runAsIdentity(
+    identity,
+    repo,
     "gh",
     ["pr", "list", "--head", branch, "--state", "all", "--json", "url,state", "-q", ".[0]"],
-    { cwd: repo, encoding: "utf-8" },
+    { encoding: "utf-8" },
   );
   if (r.status !== 0 || !r.stdout.trim()) return null;
   try {
@@ -1399,7 +1484,11 @@ async function main() {
     // lives on origin afterwards, so the worktree is removed here (branch kept for
     // the PR). Never touches the local main branch.
     if (review.pr) {
-      if (!ghAvailable()) {
+      // Who files the PR (#71): resolve the identity FIRST, then run every write
+      // below through runAsIdentity() so a resolved wrapper actually authors them.
+      const identity = resolveIdentity(repo);
+      const notice = identityNotice(identity);
+      if (!ghAvailable(repo, identity)) {
         console.error("`--pr` needs the GitHub CLI. Install `gh` and run `gh auth login`, or integrate without --pr.");
         process.exit(1);
       }
@@ -1416,12 +1505,19 @@ async function main() {
       console.log(`Opening PR for run ${runId}`);
       console.log(`- Head branch: ${branch}`);
       console.log(`- Base branch: ${base}`);
+      console.log(`- Identity:    ${notice ? `AMBIENT gh (${identity.status}) — see the degraded notice below` : identityLine(identity)}`);
+      // LOUD on stderr before anything is written, so an unattended loop's log
+      // shows who filed the PR even if nobody reads the body.
+      if (notice) console.error(`\n${notice}\n`);
 
-      const existing = prForBranch(repo, branch);
+      const existing = prForBranch(repo, branch, identity);
       if (existing && existing.url) {
         console.log(`\nA PR already exists for ${branch}: ${existing.url} (${existing.state}). Skipping create.`);
       } else {
-        const push = git(repo, ["push", "-u", "origin", branch], { stdio: "inherit", encoding: undefined });
+        const push = runAsIdentity(identity, repo, "git", ["-C", repo, "push", "-u", "origin", branch], {
+          stdio: "inherit",
+          encoding: undefined,
+        });
         if (push.status !== 0) {
           console.error("git push failed; nothing was opened.");
           process.exit(push.status ?? 1);
@@ -1433,10 +1529,14 @@ async function main() {
           `Builder: ${agentAttribution(meta, "builder")} · Reviewer: ${agentAttribution(meta, "reviewer")} (read-only).`,
           "Reviewed in-loop (READY_FOR_HUMAN_REVIEW); NOT merged — human review required.",
         );
-        const create = spawnSync(
+        // Who filed this: stated in the body either way — never a silent Owner PR.
+        bodyLines.push("", notice ? notice : `Identity: ${identityLine(identity)}.`);
+        const create = runAsIdentity(
+          identity,
+          repo,
           "gh",
           ["pr", "create", "--base", base, "--head", branch, "--title", prTitle(meta, branch), "--body", bodyLines.join("\n")],
-          { cwd: repo, stdio: "inherit" },
+          { stdio: "inherit", encoding: undefined },
         );
         if (create.status !== 0) {
           console.error("`gh pr create` failed; the branch is pushed — open the PR manually.");

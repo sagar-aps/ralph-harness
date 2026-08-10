@@ -224,7 +224,8 @@ is a real failure mode with a real fix, and the template already applies all fou
    wrapper resolved the driver from a possibly different one. Worse, `config.local.sh` uses
    `: "${VAR:=value}"`, which **sets but does not export**: the values are visible to the
    wrapper and invisible to the `ralph` child process, so `ralph integrate --pr` cannot resolve
-   the identity wrapper (§12) and the PR is filed by whatever ambient `gh` account exists.
+   the identity wrapper (§12) and the PR is filed by whatever ambient `gh` account exists —
+   loudly (the degraded notice lands in the PR body and the log), but still as the Owner.
    **Fix:** the wrapper `cd`s into the target *first*, sources **both** `config.local.sh` files
    (harness, then target — target wins) inside `set -a` so everything is exported, then sources
    `resolve-identity.sh` and exports `RALPH_IDENTITY_WRAPPER` once. Driver launch and ralph's
@@ -569,7 +570,8 @@ unattended wrapper is the wrapper's job (§4.1); this command is what it — or 
   2. `RALPH_IDENTITY_WRAPPER` (when it names an executable file);
   3. `<target>/.agents/ralph/identity.sh` (when executable);
   4. ambient `gh auth`.
-- **Default**: no marker → step 4, and that silent fallback is **correct, not degraded**.
+- **Default**: no marker → step 4, and that fallback is **correct, not degraded** (it is still
+  disclosed on every write — see below).
 - **The marker changes the failure mode, which is the point**: with `identity.enabled=true` but
   no resolvable wrapper, the status is **`DEGRADED`** (loud warnings in PR bodies and to the
   Manager) rather than a quiet fallback. Without the marker, an unresolvable wrapper is just
@@ -577,6 +579,13 @@ unattended wrapper is the wrapper's job (§4.1); this command is what it — or 
 - Outputs (printed when run directly, exported when sourced): `RESOLVED_WRAPPER`,
   `IDENTITY_STATUS` (`resolved|degraded|fallback`), `IDENTITY_SOURCE`,
   `IDENTITY_MARKER_ENABLED`, `IDENTITY_MARKER_ROLE`.
+- **Who files the PR (#71)**: `ralph integrate --pr` resolves the identity with that script
+  (same order, never re-implemented) and, when it resolves, runs **both** GitHub writes under
+  the wrapper — `"$RESOLVED_WRAPPER" <role> git push …` and `… gh pr create …`, with `<role>`
+  from `identity.role` (default `orchestrator`) — so the PR is authored by the App. The
+  existing-PR lookup uses the same credentials. **Nothing resolved ⇒ ambient `gh`, but never
+  silently**: a `DEGRADED MODE` notice naming the status/source goes to **stderr and into the
+  PR body**, for `fallback` as well as `degraded`. Fixtures: `tests/integrate-identity.mjs`.
 - **Composition**: a *soft* dependency — absent or failing, the Manager works in fallback mode.
   Complementary to, and independent of, the **floor guard** (§4), which enforces the same floor
   mechanically under plain `gh auth`.
@@ -712,9 +721,10 @@ running the loops without invoking a real agent.
 suite — `npm test` — with the mode-specific gates in `tests/efficiency.mjs`,
 `tests/efficiency-select.mjs`, `tests/efficiency-dispatch.mjs`, `tests/auto-escalate.mjs`,
 `tests/usage-state.mjs`, `tests/report.mjs`, `tests/log-usage.mjs`, `tests/cron-driver.mjs`, `tests/usage.mjs`,
-`tests/usage-per-backend.mjs` and `tests/agent-selection.mjs`. The default-OFF contracts in §5
+`tests/usage-per-backend.mjs`, `tests/agent-selection.mjs` and `tests/integrate-identity.mjs`
+(§12's PR-filing identity). The default-OFF contracts in §5
 and §6 are pinned as explicit regression tests, so if a default in this document ever drifts,
 those tests fail first.
 
-Identity resolution (§12) has its own suite, `tests/identity-resolution.mjs`, which is **not**
-in the `npm test` list — run it directly with `node tests/identity-resolution.mjs`.
+Identity *resolution* itself (§12) has one more suite, `tests/identity-resolution.mjs`, which is
+**not** in the `npm test` list — run it directly with `node tests/identity-resolution.mjs`.
