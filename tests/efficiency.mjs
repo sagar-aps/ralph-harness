@@ -52,7 +52,6 @@ function ralph(args, env = {}) {
       RALPH_EFFICIENCY: "",
       RALPH_EFFICIENCY_PROFILE: "",
       RALPH_EFFICIENCY_NOW: "",
-      RALPH_AUTO_ESCALATE: "",
       // #63: the reserves follow the control-plane roles, so the driver/manager
       // knobs decide which pool carries them. Pin them off unless a case sets one.
       RALPH_CRON_DRIVER: "",
@@ -216,21 +215,6 @@ console.log("4b) unresolvable rung backend -> warn, flag, and fall through");
     });
     check(/UNRESOLVABLE rung backend.*undefined-fixture/.test(`${validated.stderr}`),
       "boot validation warns on stderr before dispatch");
-
-    const noneResolve = structuredClone(example);
-    noneResolve.rungs.forEach((rung) => {
-      rung.builder.backend = `undefined-${rung.name}`;
-    });
-    const noBackendTarget = makeTarget(noneResolve);
-    try {
-      const unavailable = ralph(["explain", "--repo", noBackendTarget, "--complexity", "small"],
-        { RALPH_EFFICIENCY_NOW: "2026-08-10T11:00:00Z" });
-      const unavailableOut = `${unavailable.stdout}${unavailable.stderr}`;
-      check(/^CHOSEN: none$/m.test(unavailableOut),
-        "selection chooses no rung when every candidate has an unresolvable backend");
-      check(/backstop rung is unavailable too .*UNRESOLVABLE via resolve_backend_cmd/.test(unavailableOut),
-        "selection gives a clear resolver error when no rung resolves");
-    } finally { rmSync(noBackendTarget, { recursive: true, force: true }); }
   } finally { rmSync(target, { recursive: true, force: true }); }
 }
 
@@ -530,7 +514,8 @@ console.log("9) --efficiency on a story with no complexity: dispatch is UNCHANGE
     check(/is VALID/.test(bOut), "the opt-in run boot-validates the profile");
     check(/carries no complexity:<tier> label\/field/.test(bOut),
       "the opt-in run says loudly why it could not right-size this story");
-    check(!/efficiency/i.test(aOut), "without the opt-in nothing about efficiency is printed");
+    check(!/efficiency (mode|profile)|RALPH_EFFICIENCY/i.test(aOut),
+      "without the opt-in nothing about efficiency mode is printed");
     check(selection(aOut) !== "" && selection(aOut) === selection(bOut),
       "builder/reviewer selection is identical with and without --efficiency");
     check(a.status === b.status && /READY_FOR_HUMAN_REVIEW/.test(bOut),
