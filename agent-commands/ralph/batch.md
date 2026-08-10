@@ -39,7 +39,8 @@ Steps:
    `<target>/.agent-run/batch-<timestamp>/final-report.md` (and `<target>/.ralph/last-run.env`)
    and summarize for the human:
    - outcome (READY_FOR_HUMAN_REVIEW / COMPLETED_WITH_FAILURES / COMPLETED_WITH_BLOCKERS /
-     STOPPED_ON_FAIL / REVIEWER_UNAVAILABLE / BUILDER_UNAVAILABLE)
+     STOPPED_ON_FAIL / REVIEWER_UNAVAILABLE / BUILDER_UNAVAILABLE /
+     LAUNCH_ESCALATION_EXHAUSTED)
    - tasks attempted / completed / failed / blocked
    - per-task verdicts and files changed
    - any failures/blockers and where their logs are
@@ -50,6 +51,12 @@ Steps:
      failed PRD. Tell the human to re-authenticate / check quota for that CLI, then
      resume with `/ralph-resume` (skips already-PASSed tasks). No builder attempt
      was consumed and no error text was fed back as feedback.
+   - **If the outcome is `LAUNCH_ESCALATION_EXHAUSTED`** (exit 4): under `--efficiency`
+     the batch promoted the task up the whole rung ladder and EVERY rung failed to
+     launch (`LAUNCH_ESCALATION_RUNGS` in `last-run.env` names them, in order). Same
+     class of problem as above — a tooling outage across several CLIs, not a failed
+     PRD. Relay which rungs were tried, tell the human to fix/re-authenticate those
+     backends (or widen the tier in `efficiency.json`), then `/ralph-resume`.
    - **If the outcome is `COMPLETED_WITH_BLOCKERS`** (exit 2): the reviewer judged
      one or more tasks BLOCKED — well-defined but not completable in scope
      (contradictory/impossible acceptance, needs access or a product decision, or an

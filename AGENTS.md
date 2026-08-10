@@ -37,7 +37,8 @@ change a flag.
   builder; reviewer always read-only. Never merges/pushes/deletes. Harness-detected
   agent ERROR (backend non-zero exit, or reviewer with no `VERDICT:`) is retried
   (`RALPH_AGENT_RETRIES`) then halts the batch with `REVIEWER_UNAVAILABLE` /
-  `BUILDER_UNAVAILABLE` (exit 4); `--resume` continues, skipping already-PASSed tasks.
+  `BUILDER_UNAVAILABLE` (exit 4) — unless efficiency mode has a rung ladder to promote
+  the task onto first (#75, below); `--resume` continues, skipping already-PASSed tasks.
 - Backends/roles: `.agents/ralph/agents.sh` (`resolve_backend_cmd`); prompts
   `PROMPT_builder.md` / `PROMPT_reviewer.md`; config `review-config.sh`. The
   cron/orchestrator loop DRIVER is a third, independent role:
@@ -103,6 +104,18 @@ change a flag.
   `ralph report`) and in the banner/`final_status.md`/`last-run.env`. Without the flag a
   spent budget is byte-for-byte today's `FAILED_MAX_ITERATIONS`; with the flag but no
   rung ladder it is a no-op plus a note.
+  Launch-failure escalation (#75, `ralph batch`, **no flag of its own — active whenever
+  `--efficiency` gave the task a rung**): a builder/reviewer backend that fails to LAUNCH
+  (backend-unavailable ERROR after the retries, or a rung whose backend is not installed) is
+  NOT a verdict, so #64 never sees it. Instead of halting the whole batch the TASK is promoted
+  to the next stronger eligible rung through the SAME rung-advance helper
+  (`ralph_efficiency_launch_escalate_select` -> `ralph_efficiency_advance_rung`) and the failed
+  role is re-launched there; a rung that cannot even be BOUND is climbed past. Bounded to the
+  backstop, then `LAUNCH_ESCALATION_EXHAUSTED` (exit 4, resumable) naming every rung tried.
+  Records carry `trigger: *_launch_failure` (vs #64's `iteration_budget`). A provider quota
+  wall never escalates (the same wall sits behind every rung). With no ladder it is
+  byte-for-byte today's `BUILDER_UNAVAILABLE`/`REVIEWER_UNAVAILABLE` halt
+  (`tests/launch-escalate.mjs` pins both halves).
   Per-pool usage comes from the read-only reader `usage-state.sh`/`usage-state.py` (#60): 5h + weekly token sums from
   `.ralph/ledger.jsonl`, converted to a pct ONLY when the profile sets that pool's
   `window_*_budget_tokens` (else pct=unknown, raw tokens still shown), plus reset
@@ -116,6 +129,18 @@ change a flag.
   FAILS OPEN (pct=unknown, #28 circuit is the gate) and never crashes. Contract + working
   implementation:
   `usage_provider.example.sh`.
+  Usage-aware DRIVER choice (#76, **opt-in, read-only**): `ralph pick-driver`
+  (`pick-driver.py`) prints which candidate driver's pool has the most live HEADROOM —
+  `min(5h cap - 5h used, weekly ceiling - weekly used)` over the same readers, where the
+  weekly ceiling subtracts only the reserves of the OTHER control-plane roles (the driver
+  IS the orchestrator, so its own 50% is not charged) and the near-weekly-reset
+  relaxation applies as in `select`. Candidates: `--candidates` >
+  `RALPH_CRON_DRIVER_CANDIDATES` > the profile's rung backends. stdout is ONLY the name
+  (reasoning on stderr; `--json`/`--shell` for the record), so
+  `RALPH_CRON_DRIVER="$(ralph pick-driver …)"` works. Unmeasurable/held-back candidates
+  are skipped, and when NONE can be ranked it FAILS OPEN to `--default` or whatever
+  `RALPH_CRON_DRIVER` resolves to — always exit 0 (2 only for bad CLI usage). Nothing
+  calls it automatically; see docs/OPERATING.md §4.2.
 
 ## Token economics (read before reasoning about cost or caching)
 

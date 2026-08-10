@@ -565,6 +565,10 @@ ralph batch \
   errors the **whole batch halts** with `REVIEWER_UNAVAILABLE` / `BUILDER_UNAVAILABLE`
   (exit 4, distinct from `COMPLETED_WITH_FAILURES`), a re-login hint, and a resume
   command. No builder attempt is consumed and the error output is never fed back.
+  Under `--efficiency` that halt is the **last** resort: a backend that fails to LAUNCH
+  first promotes the task to the next stronger eligible rung and retries there, and only
+  when the whole ladder (up to the backstop) has failed to launch does the batch stop, as
+  `LAUNCH_ESCALATION_EXHAUSTED` naming every rung tried. See docs/OPERATING.md §6.1.
   A terminal provider window instead halts immediately as
   `PROVIDER_QUOTA_EXHAUSTED`, recording its provider and reset time. The configurable
   `RALPH_QUOTA_REGEX` ERE defaults to explicit
