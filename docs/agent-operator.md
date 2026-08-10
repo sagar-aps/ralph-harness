@@ -162,6 +162,12 @@ Escalation needs the `--efficiency` rung ladder (the story must carry a
 `complexity:<tier>`). Without one, `--auto-escalate` is a no-op with a note and the
 run ends at `FAILED_MAX_ITERATIONS` exactly as it does today.
 
+`ralph batch` has a second, independent escalation trigger that needs **no flag beyond
+`--efficiency`**: a builder/reviewer backend that fails to LAUNCH (backend-unavailable
+ERROR, or a rung whose backend is not installed) promotes the TASK up the same ladder
+instead of halting the batch, and ends on `LAUNCH_ESCALATION_EXHAUSTED` (exit 4,
+resumable) only once every rung has failed to launch. See docs/OPERATING.md §6.1.
+
 ## Running a batch (many tasks, one shared worktree)
 
 For a backlog of tasks in one unattended run, use `ralph batch`. It creates ONE

@@ -380,25 +380,29 @@ ralph_auto_escalate_enabled() {
   esac
 }
 
-# Promote one ticket off the rung that just failed. Returns:
-#   0 = PROMOTED — the caller MUST rebind BUILDER/REVIEWER from
-#       RALPH_EFFICIENCY_SELECT_BUILDER/_REVIEWER and restart the iteration budget.
-#   4 = INERT    — auto-escalate is off, or there is no rung ladder to climb
-#                  (efficiency off/inert, or the current rung is unknown).
-#   5 = EXHAUSTED — the ladder has nothing stronger left; the caller must stop with
-#       a terminal status naming the rungs it tried. Never a crash, never a retry.
-# Sets RALPH_ESCALATE_STATE (off|inert|promoted|exhausted) plus _FROM / _TO /
-# _REASON for the run record, the ledger and the PR/handoff body.
-# NEVER exits; a caller under `set -e` must use it in a conditional.
-ralph_efficiency_escalate_select() {  # <complexity> <target-repo> <current-rung> [ticket]
-  local complexity="${1:-}" repo="${2:-$PWD}" current="${3:-}" ticket="${4:-ticket}" rc=0
+# Forget the previous promotion. Called by every escalation entry point BEFORE its
+# opt-in gate, so a run that never escalates cannot be reported against a stale one.
+ralph_efficiency_escalate_reset() {  # <current-rung>
   RALPH_ESCALATE_STATE="off"
-  RALPH_ESCALATE_FROM="$current"
+  RALPH_ESCALATE_FROM="${1:-}"
   RALPH_ESCALATE_TO=""
   RALPH_ESCALATE_REASON=""
   export RALPH_ESCALATE_STATE RALPH_ESCALATE_FROM RALPH_ESCALATE_TO RALPH_ESCALATE_REASON
+}
 
-  ralph_auto_escalate_enabled || return 4
+# The rung-advance core, shared by BOTH escalation kinds: #64's review-failure
+# escalation (a rung that spent its iteration budget without a PASS) and #75's
+# launch-failure escalation (a rung whose backend never even ran). Neither kind
+# relaxes eligibility — the promotion goes through ralph_efficiency_select, so caps,
+# avoid windows, the #28 circuit and the #63 reserves all still bind — and both are
+# bounded, because --after-rung only ever looks ABOVE <current-rung>.
+#
+# The OPT-IN GATE IS DELIBERATELY NOT HERE: each entry point owns its own flag
+# (--auto-escalate for #64, --efficiency for #75), which is what keeps the two
+# triggers independent. Returns 0 = promoted, 4 = inert, 5 = exhausted (see the
+# entry points below). NEVER exits.
+ralph_efficiency_advance_rung() {  # <complexity> <target-repo> <current-rung> <ticket>
+  local complexity="${1:-}" repo="${2:-$PWD}" current="${3:-}" ticket="${4:-ticket}" rc=0
 
   # No ladder, nothing to climb: without a valid profile, a tier and the rung the
   # run is standing on there is no next-stronger rung to name, so the caller keeps
@@ -439,22 +443,63 @@ ralph_efficiency_escalate_select() {  # <complexity> <target-repo> <current-rung
   esac
 }
 
+# REVIEW-failure escalation (#64) — the rung produced verdicts, just never a PASS.
+# Gated on --auto-escalate / RALPH_AUTO_ESCALATE. Returns:
+#   0 = PROMOTED — the caller MUST rebind BUILDER/REVIEWER from
+#       RALPH_EFFICIENCY_SELECT_BUILDER/_REVIEWER and restart the iteration budget.
+#   4 = INERT    — auto-escalate is off, or there is no rung ladder to climb
+#                  (efficiency off/inert, or the current rung is unknown).
+#   5 = EXHAUSTED — the ladder has nothing stronger left; the caller must stop with
+#       a terminal status naming the rungs it tried. Never a crash, never a retry.
+# Sets RALPH_ESCALATE_STATE (off|inert|promoted|exhausted) plus _FROM / _TO /
+# _REASON for the run record, the ledger and the PR/handoff body.
+# NEVER exits; a caller under `set -e` must use it in a conditional.
+ralph_efficiency_escalate_select() {  # <complexity> <target-repo> <current-rung> [ticket]
+  local complexity="${1:-}" repo="${2:-$PWD}" current="${3:-}" ticket="${4:-ticket}"
+  ralph_efficiency_escalate_reset "$current"
+  ralph_auto_escalate_enabled || return 4
+  ralph_efficiency_advance_rung "$complexity" "$repo" "$current" "$ticket"
+}
+
+# LAUNCH-failure escalation (#75) — the rung's backend never RAN (non-zero /
+# backend-unavailable ERROR after the harness retries, or a backend that is not
+# installed at all), so there is no verdict for #64 to react to and the batch would
+# otherwise halt with the whole ladder still untried.
+#
+# Gated on --efficiency ALONE: the ladder is the only thing a launch failure needs,
+# and --auto-escalate is about spending iterations on a rung that does work. Same
+# bounded rung-advance, same eligibility rules, same return codes as the review-
+# failure entry point above (4 here means efficiency is off or there is no ladder).
+# NEVER exits; a caller under `set -e` must use it in a conditional.
+ralph_efficiency_launch_escalate_select() {  # <complexity> <target-repo> <current-rung> [ticket]
+  local complexity="${1:-}" repo="${2:-$PWD}" current="${3:-}" ticket="${4:-ticket}"
+  ralph_efficiency_escalate_reset "$current"
+  ralph_efficiency_enabled || return 4
+  ralph_efficiency_advance_rung "$complexity" "$repo" "$current" "$ticket"
+}
+
 # Record ONE escalation, durably, in the two places an operator looks afterwards:
 # <run-dir>/escalations.jsonl (this run) and <target>/.ralph/ledger.jsonl (the
 # cross-run log). The ledger line is an EVENT record — it carries no token totals,
 # so `ralph report` skips it rather than inventing a ticket for it.
-ralph_efficiency_escalation_record() {  # <run-dir> <target-repo> <run-id> <ticket> <from> <to> <reason> <iteration>
+#
+# <trigger> says WHICH escalation this was: the default `iteration_budget` is #64's
+# review-failure promotion; #75 passes `builder_launch_failure` /
+# `reviewer_launch_failure` so a launch outage is never read as a weak model.
+ralph_efficiency_escalation_record() {  # <run-dir> <target-repo> <run-id> <ticket> <from> <to> <reason> <iteration> [trigger]
   local run_dir="${1:-}" repo="${2:-}" run_id="${3:-}" ticket="${4:-}"
   local from="${5:-}" to="${6:-}" reason="${7:-}" iteration="${8:-}"
+  local trigger="${9:-iteration_budget}"
   local stamp
   stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   python3 - "$run_dir" "$repo" "$run_id" "$ticket" "$from" "$to" "$reason" \
     "$iteration" "$stamp" "${RALPH_EFFICIENCY_DISPATCH_COMPLEXITY:-}" \
     "${RALPH_EFFICIENCY_SELECT_BUILDER:-}" "${RALPH_EFFICIENCY_SELECT_BUILDER_POOL:-}" \
-    "${RALPH_EFFICIENCY_SELECT_REVIEWER:-}" "${RALPH_EFFICIENCY_SELECT_REVIEWER_POOL:-}" <<'PY'
+    "${RALPH_EFFICIENCY_SELECT_REVIEWER:-}" "${RALPH_EFFICIENCY_SELECT_REVIEWER_POOL:-}" \
+    "$trigger" <<'PY'
 import json, os, sys
 (run_dir, repo, run_id, ticket, from_rung, to_rung, reason, iteration, stamp,
- complexity, builder, builder_pool, reviewer, reviewer_pool) = sys.argv[1:15]
+ complexity, builder, builder_pool, reviewer, reviewer_pool, trigger) = sys.argv[1:16]
 record = {
     "event": "efficiency_escalation",
     "timestamp": stamp,
@@ -463,6 +508,7 @@ record = {
     "from_rung": from_rung,
     "to_rung": to_rung,
     "reason": reason,
+    "trigger": trigger,
     "after_iteration": iteration,
     "builder": builder,
     "builder_pool": builder_pool,

@@ -444,6 +444,41 @@ provider usage API is called, and it writes nothing.
   flag, a spent budget is still `FAILED_MAX_ITERATIONS`, byte-for-byte
   (`tests/auto-escalate.mjs` pins both).
 
+### 6.1 Launch-failure escalation — `ralph batch`, part of `--efficiency`
+
+**No flag of its own: it is active exactly when `--efficiency` gave the task a rung** (and
+`ralph batch` only). Distinct trigger from §6: that one reacts to a *verdict*, this one to a
+backend that **never ran**.
+
+- **What it reacts to**: the builder or reviewer backend fails to LAUNCH — a non-zero /
+  backend-unavailable ERROR on all `RALPH_AGENT_RETRIES`+1 invocations (logged out,
+  rate-limited, wrong binary path, auth error), *or* a rung naming a backend that is not
+  installed on this machine. None of that is a `VERDICT: FAIL`, so `--auto-escalate` never
+  sees it.
+- **What it changes**: instead of halting the whole batch on one dead CLI, the **task** is
+  promoted to the next stronger **eligible** rung and the failed role is re-launched there
+  (the builder is not re-run when it was the reviewer that died). The rung owns both roles,
+  so a promotion rebinds both.
+- **Bounded by construction**: the same `efficiency.py select --after-rung` rung-advance
+  helper as §6 (`ralph_efficiency_launch_escalate_select` → `ralph_efficiency_advance_rung`),
+  so each hop only looks *above* the current rung, the ladder strictly shrinks, and the
+  backstop is the last rung that can be tried. A rung that cannot even be bound is climbed
+  past, not died on.
+- **Outcomes**: a launchable rung finishes the task normally; exhausting the ladder halts the
+  batch on `LAUNCH_ESCALATION_EXHAUSTED` (**exit 4**, resumable) naming every rung tried,
+  e.g. `cheap -> mid -> strong -> backstop`.
+- **Recorded in**: `<run>/escalations.jsonl` and `.ralph/ledger.jsonl` as an `event` record
+  with `trigger: builder_launch_failure|reviewer_launch_failure` (§6's promotions carry
+  `trigger: iteration_budget`), the per-task `task-NNN-result.md` PR body, `final-report.md`,
+  the run banner and `last-run.env` (`LAUNCH_ESCALATIONS`, `LAUNCH_ESCALATION_RUNGS`,
+  `LAUNCH_ESCALATION_ROLE`, `LAUNCH_ESCALATION_REASON`).
+- **Composition**: a **provider quota wall** keeps its own reactive path (§9) — a stronger
+  rung sits behind the same wall, so a quota ERROR still ends the batch as
+  `PROVIDER_QUOTA_EXHAUSTED` rather than escalating. Without a rung ladder (no
+  `--efficiency`, an inert profile, or a task with no `complexity:<tier>`) the halt is
+  byte-for-byte today's `BUILDER_UNAVAILABLE`/`REVIEWER_UNAVAILABLE`
+  (`tests/launch-escalate.mjs` pins both halves).
+
 ---
 
 ## 7. `--max-iterations`
@@ -509,7 +544,8 @@ provider usage API is called, and it writes nothing.
   as one of its eligibility gates — it never re-implements quota detection. It is also the
   "real gate" the fail-open rule in §5 defers to. Distinct from an *agent ERROR*
   (`RALPH_AGENT_RETRIES`, default 2, exponential backoff, then
-  `BUILDER_UNAVAILABLE`/`REVIEWER_UNAVAILABLE`, exit 4).
+  `BUILDER_UNAVAILABLE`/`REVIEWER_UNAVAILABLE`, exit 4) — which under `--efficiency` escalates
+  up the rung ladder first (§6.1), while a quota wall never does.
 
 ---
 
@@ -728,6 +764,7 @@ where a distinct code is listed below.
 | `FAILED_ESCALATION_EXHAUSTED` | 2 | — | ladder exhausted under `--auto-escalate` |
 | `PREFLIGHT_FAILED` | 3 | 3 | repo contract broke before any worktree/agent |
 | `BUILDER_UNAVAILABLE` / `REVIEWER_UNAVAILABLE` | 2 | **4** | agent ERROR survived `RALPH_AGENT_RETRIES`; `--resume` continues |
+| `LAUNCH_ESCALATION_EXHAUSTED` | — | **4** | `--efficiency`: every rung up to the backstop failed to LAUNCH (§6.1); `--resume` continues |
 | `PROVIDER_QUOTA_EXHAUSTED` | 2 | **4** | terminal provider window matched by `RALPH_QUOTA_REGEX` |
 | `EFFICIENCY_PAUSED` | **5** | **5** | no eligible rung, not even the backstop; artifacts kept |
 | `ORCHESTRATOR_BUDGET_REACHED` | — | 2 | token ceiling hit; usage flushed first |

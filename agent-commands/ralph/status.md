@@ -12,7 +12,7 @@ ralph status $ARGUMENTS
 
 Then summarize for the human in plain language:
 - the run outcome (READY_FOR_HUMAN_REVIEW / FAILED_MAX_ITERATIONS /
-  FAILED_ESCALATION_EXHAUSTED / RUNNING)
+  FAILED_ESCALATION_EXHAUSTED / LAUNCH_ESCALATION_EXHAUSTED / RUNNING)
 - the branch and worktree
 - the preview URL if one is available (offer to open it)
 - where the artifacts live
