@@ -280,5 +280,104 @@ console.log("6) GUARD: an unrecognised JSON shape must not break the verdict par
   }
 }
 
+console.log("7) env-prefixed claude aliases: the flag lands after the REAL executable, never after env (#72)");
+{
+  // `env --output-format json … claude-sonnet …` is not just ugly, it is UNRUNNABLE:
+  // BSD/macOS /usr/bin/env answers "illegal option -- o" and exits 1, so the builder
+  // fails three times and the batch halts with BUILDER_UNAVAILABLE. The flag belongs to
+  // the claude CLI, which means after env's own arguments.
+  const t = makeTarget();
+  const plan = onePlan();
+  try {
+    // Hyphenated alias: `claude-sonnet` is NOT the bare word `claude`.
+    ralph(["batch", "--repo", t, "--plan", plan, "--builder", "claude-sonnet", "--reviewer", "claude-sonnet",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_DRY_RUN: "1", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(t),
+        AGENT_CLAUDE_SONNET_CMD:
+          'env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL claude-sonnet -p "$(cat {prompt})"' });
+    const bcmd = (cfg(t).match(/^BUILDER_CMD=(.*)$/m) || [])[1] || "";
+    check(/\bclaude-sonnet --output-format json -p\b/.test(bcmd),
+      `hyphenated alias: flag inserted after claude-sonnet, before its args (${bcmd})`);
+    check(/-u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL claude-sonnet\b/.test(bcmd),
+      "env's own -u NAME pairs are stepped over intact, not split");
+    check(!/\benv\s+--output-format/.test(bcmd), "no `env --output-format` — the #72 breakage is gone");
+    check(!/--output-format[\s\S]*\bclaude-sonnet\b/.test(bcmd), "the flag is never ahead of the executable");
+  } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
+}
+{
+  // Bare form behind env: unchanged behaviour, flag still goes right after `claude`.
+  const t = makeTarget();
+  const plan = onePlan();
+  try {
+    ralph(["batch", "--repo", t, "--plan", plan, "--builder", "claude-sonnet", "--reviewer", "claude-sonnet",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_DRY_RUN: "1", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(t),
+        AGENT_CLAUDE_SONNET_CMD: 'env -u ANTHROPIC_API_KEY claude --model sonnet -p "$(cat {prompt})"' });
+    const bcmd = (cfg(t).match(/^BUILDER_CMD=(.*)$/m) || [])[1] || "";
+    check(/\bclaude --output-format json --model sonnet\b/.test(bcmd),
+      `bare form: flag inserted after claude, ahead of --model (${bcmd})`);
+    check(!/\benv\s+--output-format/.test(bcmd), "bare form does not put the flag on env either");
+  } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
+}
+{
+  // Already instrumented by the operator -> left exactly as configured.
+  const t = makeTarget();
+  const plan = onePlan();
+  try {
+    ralph(["batch", "--repo", t, "--plan", plan, "--builder", "claude-sonnet", "--reviewer", "claude-sonnet",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_DRY_RUN: "1", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(t),
+        AGENT_CLAUDE_SONNET_CMD: 'env -u ANTHROPIC_API_KEY claude-sonnet --output-format json -p "$(cat {prompt})"' });
+    const bcmd = (cfg(t).match(/^BUILDER_CMD=(.*)$/m) || [])[1] || "";
+    check((bcmd.match(/--output-format/g) || []).length === 1, `no double-injection (${bcmd})`);
+  } finally { cleanup(t); rmSync(plan, { recursive: true, force: true }); }
+}
+{
+  // MUTATION GUARD, in two halves.
+  // (a) The old code's env branch only matched the bare word `claude`, so a hyphenated
+  //     alias fell through to the backend-name `claude-*` branch, which inserted after
+  //     the FIRST token — `env`. Prove that regex really does miss `claude-sonnet`, and
+  //     that the command it would have produced cannot run.
+  const oldEnvBranch = /(^|\s)claude(\s|$)/;
+  const alias = "env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL claude-sonnet -p x";
+  check(!oldEnvBranch.test(alias), "the old bare-word `claude` match does NOT see claude-sonnet (root cause)");
+  check(oldEnvBranch.test("env -u ANTHROPIC_API_KEY claude --model sonnet -p x"),
+    "…while it did see the bare form — which is why only the hyphenated alias broke");
+  const bad = spawnSync("env", ["--output-format", "json", "true"], { encoding: "utf-8" });
+  check(bad.status !== 0, `env rejects --output-format as its own flag (status ${bad.status}) — the bug was fatal, not cosmetic`);
+
+  // (b) End to end through the REAL env(1): a stub named `claude-sonnet` records its
+  //     argv, so we see the flag arrive as the executable's FIRST argument.
+  const t = makeTarget();
+  const plan = onePlan();
+  const fixDir = mkdtempSync(path.join(tmpdir(), "ralph-usage72-"));
+  const argDump = path.join(fixDir, "argv.txt");
+  writeScript(path.join(fixDir, "claude-sonnet"), `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${argDump}
+cat <<'JSON'
+{"type":"result","subtype":"success","result":"### Must-fix issues\\n- none\\n\\nVERDICT: PASS","usage":{"input_tokens":7,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"num_turns":1,"duration_ms":10,"total_cost_usd":0.001}
+JSON
+`);
+  const FB = 'bash -c "echo x >> progress.txt; printf \\"# handoff\\n\\" > .agent-handoff.md"';
+  try {
+    const r = ralph(["batch", "--repo", t, "--plan", plan, "--builder", "fb", "--reviewer", "claude-sonnet",
+      "--auto-approve-builder", "--max-tasks", "1"],
+      { RALPH_AGENT_RETRY_DELAY: "0", RALPH_DRY_RUN: "", RALPH_USAGE: "1", RALPH_WORKTREE_DIR: wtBase(t),
+        PATH: `${fixDir}:${process.env.PATH}`, AGENT_FB_CMD: FB,
+        AGENT_CLAUDE_SONNET_CMD:
+          'env -u ANTHROPIC_API_KEY -u ANTHROPIC_DEFAULT_SONNET_MODEL claude-sonnet -p "$(cat {prompt})"' });
+    const out = `${r.stdout}${r.stderr}`;
+    check(r.status === 0 && /verdict: PASS/.test(out), "the env-prefixed hyphenated alias actually RUNS and passes");
+    check(!/backend unavailable/i.test(out), "no 'backend unavailable' (the #72 symptom)");
+    const argv = existsSync(argDump) ? readFileSync(argDump, "utf-8") : "";
+    check(/^--output-format json -p /m.test(argv),
+      `the executable received the flag as its first argument (${argv.trim().slice(0, 80)})`);
+    check(existsSync(path.join(runDirOf(t), "task-001-iter-1-reviewer.usage.json")),
+      "and the usage sidecar is written, so the instrumentation was worth injecting");
+  } finally {
+    cleanup(t); rmSync(plan, { recursive: true, force: true }); rmSync(fixDir, { recursive: true, force: true });
+  }
+}
+
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log("\nAll usage-per-backend checks passed");

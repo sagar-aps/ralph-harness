@@ -251,16 +251,60 @@ REVIEWER_RESOLVED_PROVIDER="${REVIEWER_RESOLVED_PROVIDER:-unknown}"
 RALPH_CLAUDE_LIKE="${RALPH_CLAUDE_LIKE:-claude rlaude zlaude}"
 RALPH_CODEX_LIKE="${RALPH_CODEX_LIKE:-codex}"
 if [[ "${RALPH_USAGE:-1}" == "1" ]]; then
+  # Is this executable (or backend) name a claude CLI? `claude*` covers the plain CLI
+  # AND the hyphenated model-pinned aliases (claude-sonnet, claude-haiku, …);
+  # RALPH_CLAUDE_LIKE covers the wrappers that do not carry the name (rlaude, zlaude,
+  # plus anything the operator configured).
+  claude_family_name() {
+    local n="${1:-}"
+    [[ -n "$n" ]] || return 1
+    case "$n" in claude*) return 0 ;; esac
+    case " $RALPH_CLAUDE_LIKE " in *" $n "*) return 0 ;; esac
+    return 1
+  }
+  # Model-pinned aliases commonly start with an env wrapper
+  # (`env -u ANTHROPIC_API_KEY … claude-sonnet -p …`). The flag belongs to the CLAUDE
+  # CLI, not to env, so walk past env's OWN arguments — `-u NAME`, the inline/long
+  # forms, `-i`, `-`, `VAR=value` assignments — to the real executable and inject
+  # immediately after it (before its args).
+  #
+  # Injecting after `env` instead is what broke #72: `claude-sonnet` never matched a
+  # bare-word `claude` regex, so it fell through to the backend-name `claude-*` branch
+  # and produced `env --output-format json -u … claude-sonnet …`. macOS/BSD
+  # /usr/bin/env rejects that ("illegal option -- o"), so every attempt exited 1 and
+  # the run died as `builder backend unavailable`.
+  env_inject_json_flag() {
+    local c="$1" backend="$2" pre="" rest ws tok base
+    rest="$c"
+    [[ "$rest" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]] || return 1
+    pre+="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; rest="${BASH_REMATCH[3]}"   # env itself
+    while [[ "$rest" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; do
+      ws="${BASH_REMATCH[1]}"; tok="${BASH_REMATCH[2]}"; rest="${BASH_REMATCH[3]}"
+      case "$tok" in
+        -u|--unset|-C|--chdir|-P|-S|--split-string)   # env option whose value is the NEXT token
+          pre+="$ws$tok"
+          if [[ "$rest" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; then
+            pre+="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; rest="${BASH_REMATCH[3]}"
+          fi ;;
+        -*|*=*) pre+="$ws$tok" ;;                     # env's own flags (incl. `-`), VAR=value
+        *)                                            # first non-option: the real executable
+          base="$(basename "$tok")"
+          claude_family_name "$base" || claude_family_name "$backend" || return 1
+          printf '%s%s%s --output-format json%s' "$pre" "$ws" "$tok" "$rest"
+          return 0 ;;
+      esac
+    done
+    return 1
+  }
   add_json_flag() {
-    local c="$1" backend="$2" first name rest
+    local c="$1" backend="$2" first name rest injected
     first="${c%% *}"; name="$(basename "$first")"
     [[ "$c" == *--output-format* || "$c" == *" --json"* ]] && { printf '%s' "$c"; return; }
-    # Model-pinned aliases commonly start with `env ... claude --model ...`, so
-    # neither the first command token (`env`) nor the backend name (`claude-sonnet`)
-    # is an exact RALPH_CLAUDE_LIKE member. Match the underlying executable on shell
-    # whitespace boundaries and insert the flag there, not after the env wrapper.
-    if [[ "$name" == "env" && "$c" =~ (^|[[:space:]])claude([[:space:]]|$) ]]; then
-      printf '%s' "$c" | sed -E 's/(^|[[:space:]])claude([[:space:]]|$)/\1claude --output-format json\2/'
+    if [[ "$name" == "env" ]]; then
+      # Behind env we either place the flag after the real claude executable, or leave
+      # the command completely alone — never after `env`, which is not valid there.
+      if injected="$(env_inject_json_flag "$c" "$backend")"; then printf '%s' "$injected"
+      else printf '%s' "$c"; fi
       return
     fi
     case " $RALPH_CODEX_LIKE " in

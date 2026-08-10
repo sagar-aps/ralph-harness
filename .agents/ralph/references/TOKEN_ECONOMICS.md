@@ -127,6 +127,15 @@ Two cautions:
    `cached_input_tokens` demonstrably grew. It is unpopulated on this path and carries
    **no information**. Do not conclude "nothing was cached" from it. (I made this
    mistake; `cached_input_tokens` is the load-bearing field.)
+3. **The flag belongs to the CLI, not to the `env` wrapper in front of it.** Model-pinned
+   aliases are usually `env -u ANTHROPIC_API_KEY … claude-sonnet -p …`, and injecting
+   after the first token yields `env --output-format json … claude-sonnet …`. GNU env
+   calls that an unrecognised option and macOS/BSD env calls it `illegal option -- o`;
+   either way the agent exits 1 every attempt and the run dies as
+   `builder backend unavailable`. `add_json_flag` therefore walks past env's own
+   arguments (`-u NAME`, `-i`, `-`, `VAR=value`, …) to the real executable and injects
+   after that — and if the executable behind `env` is not a claude CLI it injects
+   nothing at all (#72).
 
 **opencode is deliberately left uninstrumented.** It accepts `--format json`, but its
 usage field names are unverified while #44 blocks testing, and injecting a flag whose
