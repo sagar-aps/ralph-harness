@@ -68,7 +68,7 @@ git -C "$TARGET_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 # is the lock: the kernel releases it on every exit path, including SIGKILL. The
 # file intentionally remains as a harmless place to flock; its text is diagnostic
 # metadata only and can never make a future run look locked.
-if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" ]]; then
+if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" && "${RALPH_BATCH_LOCK_HELD:-}" != "1" ]]; then
   command -v flock >/dev/null 2>&1 || die "flock is required to run ralph batch safely."
   mkdir -p "$TARGET_REPO/.ralph"
   BATCH_LOCK_FILE="$TARGET_REPO/.ralph/batch.lock"
@@ -81,6 +81,18 @@ if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" ]]; then
     die "Another batch is already active for $TARGET_REPO ($active_batch). Refusing to run concurrently; use --allow-concurrent only with separate worktrees."
   fi
   printf 'run=batch-pending pid=%s\n' "$$" > "$BATCH_LOCK_FILE"
+  # Keep this process as the lock guardian and run the batch in a child whose fd
+  # 9 is closed before exec. No agent/check descendant can inherit the lock. If
+  # the batch child exits or is killed, wait returns and this guardian exits too.
+  export BATCH_LOCK_FILE
+  RALPH_BATCH_LOCK_HELD=1 bash "$0" "$@" 9>&- &
+  batch_pid=$!
+  trap 'kill -TERM "$batch_pid" 2>/dev/null || true' TERM INT HUP
+  wait "$batch_pid"
+  exit $?
+elif [[ "${RALPH_BATCH_LOCK_HELD:-}" == "1" ]]; then
+  # Defensive close if a caller enters the guarded path manually.
+  exec 9>&-
 fi
 
 PLAN="${PLAN:-}"

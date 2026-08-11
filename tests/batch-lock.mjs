@@ -17,7 +17,7 @@ function fixture() {
   for (const command of [["init", "-q"], ["config", "user.email", "t@e.com"], ["config", "user.name", "t"]]) spawnSync("git", command, { cwd: target });
   mkdirSync(path.join(target, "scripts"));
   writeFileSync(path.join(target, "README.md"), "# fixture\n");
-  writeFileSync(path.join(target, "scripts", "check.sh"), "#!/usr/bin/env bash\nsleep \"${LOCK_TEST_SLEEP:-0}\"\n");
+  writeFileSync(path.join(target, "scripts", "check.sh"), "#!/usr/bin/env bash\nif [[ -n \"${LOCK_TEST_CHILD_PID_FILE:-}\" ]]; then echo $$ > \"$LOCK_TEST_CHILD_PID_FILE\"; fi\nsleep \"${LOCK_TEST_SLEEP:-0}\"\n");
   chmodSync(path.join(target, "scripts", "check.sh"), 0o755);
   writeFileSync(path.join(target, "ralph.target.json"), JSON.stringify({ check: "./scripts/check.sh", preview: { enabled: false } }));
   writeFileSync(path.join(target, ".gitignore"), ".ralph/\n.agent-run/\n");
@@ -27,13 +27,21 @@ function fixture() {
   return { target, plan, worktrees: `${target}-worktrees` };
 }
 const args = (f) => [cli, "batch", "--repo", f.target, "--plan", f.plan, "--max-tasks", "1"];
-const env = (f, seconds = "0") => ({ ...process.env, BRANCH: "", RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", RALPH_DRY_RUN: "1", RALPH_PRIMER_OPTOUT: "1", RALPH_WORKTREE_DIR: f.worktrees, LOCK_TEST_SLEEP: seconds });
+const env = (f, seconds = "0", extra = {}) => ({ ...process.env, BRANCH: "", RALPH_SKIP_UPDATE_CHECK: "1", RALPH_NO_LOCAL_CONFIG: "1", RALPH_DRY_RUN: "1", RALPH_PRIMER_OPTOUT: "1", RALPH_WORKTREE_DIR: f.worktrees, LOCK_TEST_SLEEP: seconds, ...extra });
 async function waitForLock(f) {
   const lock = path.join(f.target, ".ralph", "batch.lock");
   for (let i = 0; i < 100; i++) {
     if (existsSync(lock) && /run=batch-.*pid=\d+/.test(readFileSync(lock, "utf8"))) return;
     await sleep(25);
   }
+  throw new Error(`batch lock was not acquired: ${lock}`);
+}
+async function waitForFile(file) {
+  for (let i = 0; i < 100; i++) {
+    if (existsSync(file) && readFileSync(file, "utf8").trim()) return;
+    await sleep(25);
+  }
+  throw new Error(`fixture child did not start: ${file}`);
 }
 function clean(f) {
   rmSync(f.target, { recursive: true, force: true });
@@ -57,16 +65,24 @@ console.log("batch target lock: overlapping, sequential, and override fixtures")
 }
 {
   const f = fixture();
+  const childPidFile = path.join(f.target, ".ralph", "check-child.pid");
+  let childPid;
   try {
-    const holder = spawn(process.execPath, args(f), { env: env(f, "20"), stdio: "ignore" });
+    const holder = spawn(process.execPath, args(f), { env: env(f, "20", { LOCK_TEST_CHILD_PID_FILE: childPidFile }), stdio: "ignore" });
     await waitForLock(f);
+    await waitForFile(childPidFile);
+    childPid = Number(readFileSync(childPidFile, "utf8").trim());
     const lockText = readFileSync(path.join(f.target, ".ralph", "batch.lock"), "utf8");
     const holderPid = Number((lockText.match(/pid=(\d+)/) || [])[1]);
     process.kill(holderPid, "SIGKILL");
     await waitChild(holder);
+    check(process.kill(childPid, 0) === true, "the killed batch leaves its check descendant running");
     const afterKill = spawnSync(process.execPath, args(f), { env: env(f), encoding: "utf8" });
-    check(afterKill.status === 0, "a killed holder leaves no stale lock");
-  } finally { clean(f); }
+    check(afterKill.status === 0, `a surviving descendant cannot retain the killed batch's lock${afterKill.status === 0 ? "" : `: ${afterKill.stderr}`}`);
+  } finally {
+    if (childPid) { try { process.kill(childPid, "SIGKILL"); } catch {} }
+    clean(f);
+  }
 }
 for (const override of ["flag", "env"]) {
   const f = fixture();
