@@ -68,16 +68,37 @@ git -C "$TARGET_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 # is the lock: the kernel releases it on every exit path, including SIGKILL. The
 # file intentionally remains as a harmless place to flock; its text is diagnostic
 # metadata only and can never make a future run look locked.
-if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" && "${RALPH_BATCH_LOCK_HELD:-}" != "1" ]]; then
+batch_lock_child_token=""
+if [[ "${1:-}" == --ralph-batch-lock-child=* ]]; then
+  batch_lock_child_token="${1#*=}"
+  shift
+fi
+BATCH_LOCK_FILE="$TARGET_REPO/.ralph/batch.lock"
+if [[ -n "$batch_lock_child_token" ]]; then
+  guardian_pid="${batch_lock_child_token%%-*}"
+  guardian_lock="$(readlink "/proc/$PPID/fd/9" 2>/dev/null || true)"
+  kernel_guardian_pid="$(fuser "$BATCH_LOCK_FILE" 2>/dev/null | awk -v self="$$" '{ for (i = 1; i <= NF; i++) if ($i != self) { print $i; exit } }')"
+  if [[ "$guardian_pid" != "$PPID" || "$kernel_guardian_pid" != "$PPID" || "$guardian_lock" != "$BATCH_LOCK_FILE" ]]; then
+    batch_lock_child_token=""
+  fi
+fi
+if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" && -z "$batch_lock_child_token" ]]; then
   command -v flock >/dev/null 2>&1 || die "flock is required to run ralph batch safely."
+  command -v fuser >/dev/null 2>&1 || die "fuser is required to identify an active ralph batch safely."
   mkdir -p "$TARGET_REPO/.ralph"
-  BATCH_LOCK_FILE="$TARGET_REPO/.ralph/batch.lock"
   # Append-open does not erase the holder metadata before a contender learns
   # whether it owns the lock.
   exec 9>>"$BATCH_LOCK_FILE"
   if ! flock -n 9; then
     active_batch="$(sed -n '1p' "$BATCH_LOCK_FILE" 2>/dev/null || true)"
-    [[ -n "$active_batch" ]] || active_batch="active batch metadata unavailable"
+    if [[ ! "$active_batch" =~ ^run=batch-[^[:space:]]+[[:space:]]pid=[0-9]+$ ]]; then
+      # Metadata is published immediately after flock succeeds, but a contender
+      # can arrive in that tiny interval. Ask the kernel-backed lock listing for
+      # the holder so the refusal still always identifies a live batch and PID.
+      active_pid="$(fuser "$BATCH_LOCK_FILE" 2>/dev/null | awk -v self="$$" '{ for (i = 1; i <= NF; i++) if ($i != self) { print $i; exit } }')"
+      [[ "$active_pid" =~ ^[0-9]+$ ]] || active_pid="unknown"
+      active_batch="run=batch-pending pid=$active_pid"
+    fi
     die "Another batch is already active for $TARGET_REPO ($active_batch). Refusing to run concurrently; use --allow-concurrent only with separate worktrees."
   fi
   printf 'run=batch-pending pid=%s\n' "$$" > "$BATCH_LOCK_FILE"
@@ -85,13 +106,15 @@ if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" && "${RALPH_BATCH_LOCK_HELD:-}" != "1
   # 9 is closed before exec. No agent/check descendant can inherit the lock. If
   # the batch child exits or is killed, wait returns and this guardian exits too.
   export BATCH_LOCK_FILE
-  RALPH_BATCH_LOCK_HELD=1 bash "$0" "$@" 9>&- &
+  lock_child_token="$$-$RANDOM-$RANDOM"
+  bash "$0" "--ralph-batch-lock-child=$lock_child_token" "$@" 9>&- &
   batch_pid=$!
   trap 'kill -TERM "$batch_pid" 2>/dev/null || true' TERM INT HUP
   wait "$batch_pid"
   exit $?
-elif [[ "${RALPH_BATCH_LOCK_HELD:-}" == "1" ]]; then
-  # Defensive close if a caller enters the guarded path manually.
+elif [[ -n "$batch_lock_child_token" ]]; then
+  # The marker is an internal argv capability, not a caller-inherited environment
+  # bypass. Close the guardian lock descriptor before any batch descendants start.
   exec 9>&-
 fi
 

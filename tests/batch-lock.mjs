@@ -10,6 +10,12 @@ let failures = 0;
 const check = (ok, message) => ok ? console.log(`  ✔ ${message}`) : (console.error(`  x FAIL: ${message}`), failures++);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const waitChild = (child) => new Promise((resolve) => child.on("exit", (status) => resolve(status)));
+const collectChild = (child) => new Promise((resolve) => {
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  child.on("exit", (status) => resolve({ status, output }));
+});
 
 function fixture() {
   const target = mkdtempSync(path.join(tmpdir(), "ralph-batch-lock-"));
@@ -53,11 +59,25 @@ console.log("batch target lock: overlapping, sequential, and override fixtures")
 {
   const f = fixture();
   try {
+    // Start all contenders together rather than waiting for metadata publication.
+    // Exactly one owns the flock; every loser must still identify its live owner.
+    const contenders = Array.from({ length: 8 }, () => spawn(process.execPath, args(f), { env: env(f, "2"), stdio: ["ignore", "pipe", "pipe"] }));
+    const results = await Promise.all(contenders.map(collectChild));
+    check(results.filter((result) => result.status === 0).length === 1, "simultaneous startup admits exactly one batch");
+    const refusals = results.filter((result) => result.status !== 0);
+    check(refusals.length === 7 && refusals.every((result) => /Another batch is already active.*run=batch-.*pid=\d+/s.test(result.output)), "startup-race refusals always name the active run and pid");
+  } finally { clean(f); }
+}
+{
+  const f = fixture();
+  try {
     const first = spawn(process.execPath, args(f), { env: env(f, "2"), stdio: "ignore" });
     await waitForLock(f);
     const second = spawnSync(process.execPath, args(f), { env: env(f), encoding: "utf8" });
     check(second.status !== 0, "a second overlapping batch is refused");
     check(/Another batch is already active.*run=batch-.*pid=\d+/s.test(`${second.stdout}${second.stderr}`), "refusal names the active run and pid");
+    const forgedSentinel = spawnSync(process.execPath, args(f), { env: env(f, "0", { RALPH_BATCH_LOCK_HELD: "1" }), encoding: "utf8" });
+    check(forgedSentinel.status !== 0, "the removed environment sentinel cannot bypass the lock");
     check(await waitChild(first) === 0, "the lock holder completes normally");
     const sequential = spawnSync(process.execPath, args(f), { env: env(f), encoding: "utf8" });
     check(sequential.status === 0, `a later batch starts after automatic lock release${sequential.status === 0 ? "" : `: ${sequential.stderr}`}`);
