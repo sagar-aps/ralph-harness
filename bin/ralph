@@ -164,6 +164,16 @@ function parseEnvFile(file) {
   return out;
 }
 
+// Last `lines` lines of a log file, for surfacing why a detached child died.
+function readTail(file, lines) {
+  if (!exists(file)) return "";
+  try {
+    const all = fs.readFileSync(file, "utf-8").split("\n");
+    while (all.length && all[all.length - 1] === "") all.pop();
+    return all.slice(-lines).join("\n");
+  } catch { return ""; }
+}
+
 // Ensure each entry exists in <repo>/.gitignore (creating the file if needed).
 // Returns true if the file was changed.
 function ensureGitignore(repo, entries) {
@@ -1164,6 +1174,13 @@ async function main() {
         console.error(`Failed to spawn detached batch: ${err.message}`);
         process.exit(1);
       });
+      // unref() lets us return without waiting, but the exit event still fires while
+      // we are polling — and we MUST observe it: a detached batch that dies before
+      // publishing a run (the #82 lock refusal, exit 121) would otherwise look like a
+      // success, and the caller's follow-up `ralph status` would adopt the OTHER
+      // batch's run as if it were its own.
+      let childExit = null;
+      child.on("exit", (code, signal) => { childExit = { code, signal }; });
       child.unref();
       fs.closeSync(out);
       console.log(`Detached batch (PID ${child.pid}). Log: ${logPath}`);
@@ -1172,10 +1189,44 @@ async function main() {
       // report a batch that just started as already finished.
       const deadline = Date.now() + 30000;
       let runId = "";
-      while (Date.now() < deadline) {
+      // OUR run, not just "a new one": the batch writes `run=… pid=… holder=<guardian>`
+      // into the #82 lock file, and that guardian is the very process we spawned
+      // (batch-loop.sh execs it), so holder === child.pid identifies the run as ours.
+      // A concurrent batch on the same target therefore can't be mistaken for it.
+      const lockPath = path.join(ralphDir, "batch.lock");
+      const attributedRunId = () => {
+        try {
+          const m = fs.readFileSync(lockPath, "utf-8").match(/^run=(\S+) pid=\d+ holder=(\d+)/m);
+          if (m && Number(m[2]) === child.pid) return m[1];
+        } catch {}
+        return "";
+      };
+      // --allow-concurrent runs hold no lock and publish no holder line, so there
+      // they keep the original "any run id newer than the one we saw" handshake.
+      const unlocked = env.RALPH_ALLOW_CONCURRENT === "1";
+      const publishedRunId = () => {
+        // Still gated on last-run.env, so a caller that goes straight to
+        // `ralph status` finds the run recorded — the lock only says whose it is.
         const m = parseEnvFile(lastRunPath);
-        if (m.RUN_ID && m.RUN_ID !== prevRunId) { runId = m.RUN_ID; break; }
+        if (!m.RUN_ID) return "";
+        const mine = attributedRunId();
+        if (mine) return m.RUN_ID === mine ? m.RUN_ID : "";
+        return unlocked && m.RUN_ID !== prevRunId ? m.RUN_ID : "";
+      };
+      while (Date.now() < deadline) {
+        runId = publishedRunId();
+        if (runId) break;
+        // Re-read after the exit: a very short batch can publish and finish between
+        // two polls, and that is a success, not a failure.
+        if (childExit) { runId = publishedRunId(); break; }
         await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!runId && childExit) {
+        const tail = readTail(logPath, 20);
+        if (tail) process.stderr.write(tail.endsWith("\n") ? tail : `${tail}\n`);
+        const how = childExit.signal ? `on ${childExit.signal}` : `with status ${childExit.code}`;
+        console.error(`ralph: the detached batch exited ${how} without starting a run of its own. Log: ${logPath}`);
+        process.exit(childExit.code || 1);
       }
       if (runId) console.log(`Run: ${runId}`);
       else console.log("(run id not published yet — check the log if status looks stale)");

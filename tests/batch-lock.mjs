@@ -50,7 +50,9 @@ const env = (f, seconds = "0", extra = {}) => ({ ...process.env, BRANCH: "", RAL
 async function waitForLock(f) {
   const lock = path.join(f.target, ".ralph", "batch.lock");
   for (let i = 0; i < 100; i++) {
-    if (existsSync(lock) && /run=batch-.*pid=\d+/.test(readFileSync(lock, "utf8"))) return;
+    // The guardian's provisional `run=batch-pending` line appears first; wait for the
+    // batch's own line, so a contender is racing a fully started run.
+    if (existsSync(lock) && /run=batch-\d\S* pid=\d+ holder=\d+/.test(readFileSync(lock, "utf8"))) return;
     await sleep(25);
   }
   throw new Error(`batch lock was not acquired: ${lock}`);
@@ -132,6 +134,57 @@ console.log("batch target lock: overlapping, sequential, and override fixtures")
     check(/Another batch is already active.*run=batch-.*pid=\d+/s.test(nested), `a batch nested inside a running batch's descendant is refused loud: ${nested.trim() || "(no nested run recorded)"}`);
     check(/nested_status=(?!0\b)\d+/.test(nested), "the nested batch exits non-zero instead of corrupting the live run");
   } finally { clean(f); }
+}
+{
+  // --detach is a first-class batch flag, so a refusal has to reach the CALLER:
+  // exiting 0 here would leave `ralph batch --detach && ralph status --watch`
+  // adopting the OTHER batch's run — the very "no result of my own" symptom #82
+  // exists to eliminate.
+  const f = fixture();
+  try {
+    const holder = spawn(process.execPath, args(f), { env: env(f, "6"), stdio: "ignore" });
+    await waitForLock(f);
+    const started = Date.now();
+    const detached = spawnSync(process.execPath, [...args(f), "--detach"], { env: env(f), encoding: "utf8" });
+    const detachedOutput = `${detached.stdout}${detached.stderr}`;
+    check(detached.status === 121, `a refused --detach exits non-zero (got ${detached.status})`);
+    check(/Another batch is already active.*run=batch-.*pid=\d+/s.test(detachedOutput), `the --detach refusal reaches the caller, not only the detach log: ${detachedOutput.trim()}`);
+    check(/without starting a run of its own/.test(detachedOutput), "the caller is told no run of its own was started");
+    check(Date.now() - started < 25000, "the refused --detach fails immediately instead of stalling the handshake");
+    check(await waitChild(holder) === 0, "the holder is unaffected by the refused --detach");
+  } finally { clean(f); }
+}
+{
+  // The flock outlives the guardian being killed on its own (SIGKILL, OOM): the
+  // batch it started is still running, and a second batch then would be exactly the
+  // overlap the lock exists to prevent.
+  const f = fixture();
+  let batchPid;
+  try {
+    const holder = spawn(process.execPath, args(f), { env: env(f, "25"), stdio: "ignore" });
+    await waitForLock(f);
+    const lockText = readFileSync(path.join(f.target, ".ralph", "batch.lock"), "utf8");
+    batchPid = Number((lockText.match(/pid=(\d+)/) || [])[1]);
+    const guardianPid = Number((lockText.match(/holder=(\d+)/) || [])[1]);
+    check(guardianPid > 0 && guardianPid !== batchPid, `the holder metadata names the batch and its lock guardian: ${lockText.trim()}`);
+    process.kill(guardianPid, "SIGKILL");
+    await waitChild(holder);
+    await sleep(500);
+    check(process.kill(batchPid, 0) === true, "killing the guardian alone leaves the batch running");
+    const overlap = spawnSync(process.execPath, args(f), { env: env(f), encoding: "utf8" });
+    check(overlap.status !== 0, "a killed guardian does not free the lock while its batch is still running");
+    process.kill(batchPid, "SIGKILL");
+    for (let i = 0; i < 100; i++) {
+      try { process.kill(batchPid, 0); } catch { break; }
+      await sleep(25);
+    }
+    await sleep(500);
+    const afterBatch = spawnSync(process.execPath, args(f), { env: env(f), encoding: "utf8" });
+    check(afterBatch.status === 0, `the lock releases once the orphaned batch is gone (no stale lock)${afterBatch.status === 0 ? "" : `: ${afterBatch.stderr}`}`);
+  } finally {
+    if (batchPid) { try { process.kill(batchPid, "SIGKILL"); } catch {} }
+    clean(f);
+  }
 }
 for (const override of ["flag", "env"]) {
   const f = fixture();

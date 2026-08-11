@@ -595,7 +595,9 @@ if [[ "$RESUMING" != "true" ]]; then
   mkdir -p "$TASKS_DIR"
 fi
 if [[ -n "${BATCH_LOCK_FILE:-}" ]]; then
-  printf 'run=batch-%s pid=%s\n' "$TS" "$$" > "$BATCH_LOCK_FILE"
+  # pid= is this batch (kill that to stop the run); holder= is the guardian that owns
+  # the flock, so a refusal names both processes involved.
+  printf 'run=batch-%s pid=%s holder=%s\n' "$TS" "$$" "$PPID" > "$BATCH_LOCK_FILE"
 fi
 RALPH_QUOTA_ARTIFACT="$RUN_DIR/provider-quota.env"
 export RALPH_QUOTA_ARTIFACT
