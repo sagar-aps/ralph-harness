@@ -23,7 +23,20 @@ function fixture() {
   for (const command of [["init", "-q"], ["config", "user.email", "t@e.com"], ["config", "user.name", "t"]]) spawnSync("git", command, { cwd: target });
   mkdirSync(path.join(target, "scripts"));
   writeFileSync(path.join(target, "README.md"), "# fixture\n");
-  writeFileSync(path.join(target, "scripts", "check.sh"), "#!/usr/bin/env bash\nif [[ -n \"${LOCK_TEST_CHILD_PID_FILE:-}\" ]]; then echo $$ > \"$LOCK_TEST_CHILD_PID_FILE\"; fi\nsleep \"${LOCK_TEST_SLEEP:-0}\"\n");
+  // The check stands in for every batch descendant (agents, checks, whatever they
+  // spawn): it can report its pid, linger, and start a nested `ralph batch` on the
+  // same target — which must be refused, since a descendant never inherits the lock.
+  writeFileSync(path.join(target, "scripts", "check.sh"), [
+    "#!/usr/bin/env bash",
+    'if [[ -n "${LOCK_TEST_CHILD_PID_FILE:-}" ]]; then echo $$ > "$LOCK_TEST_CHILD_PID_FILE"; fi',
+    'if [[ -n "${LOCK_TEST_NESTED_FILE:-}" ]]; then',
+    '  env -u LOCK_TEST_NESTED_FILE -u RALPH_ALLOW_CONCURRENT "$LOCK_TEST_NODE" "$LOCK_TEST_CLI" \\',
+    '    batch --repo "$LOCK_TEST_TARGET" --plan "$LOCK_TEST_PLAN" --max-tasks 1 > "$LOCK_TEST_NESTED_FILE" 2>&1',
+    '  echo "nested_status=$?" >> "$LOCK_TEST_NESTED_FILE"',
+    "fi",
+    'sleep "${LOCK_TEST_SLEEP:-0}"',
+    "",
+  ].join("\n"));
   chmodSync(path.join(target, "scripts", "check.sh"), 0o755);
   writeFileSync(path.join(target, "ralph.target.json"), JSON.stringify({ check: "./scripts/check.sh", preview: { enabled: false } }));
   writeFileSync(path.join(target, ".gitignore"), ".ralph/\n.agent-run/\n");
@@ -77,7 +90,7 @@ console.log("batch target lock: overlapping, sequential, and override fixtures")
     check(second.status !== 0, "a second overlapping batch is refused");
     check(/Another batch is already active.*run=batch-.*pid=\d+/s.test(`${second.stdout}${second.stderr}`), "refusal names the active run and pid");
     const forgedSentinel = spawnSync(process.execPath, args(f), { env: env(f, "0", { RALPH_BATCH_LOCK_HELD: "1" }), encoding: "utf8" });
-    check(forgedSentinel.status !== 0, "the removed environment sentinel cannot bypass the lock");
+    check(forgedSentinel.status !== 0, "no environment sentinel other than RALPH_ALLOW_CONCURRENT bypasses the lock");
     check(await waitChild(first) === 0, "the lock holder completes normally");
     const sequential = spawnSync(process.execPath, args(f), { env: env(f), encoding: "utf8" });
     check(sequential.status === 0, `a later batch starts after automatic lock release${sequential.status === 0 ? "" : `: ${sequential.stderr}`}`);
@@ -103,6 +116,22 @@ console.log("batch target lock: overlapping, sequential, and override fixtures")
     if (childPid) { try { process.kill(childPid, "SIGKILL"); } catch {} }
     clean(f);
   }
+}
+{
+  // The lock is handed to the batch on argv, not in the environment, so a batch
+  // descendant cannot inherit "the lock is already mine" and quietly run unlocked.
+  const f = fixture();
+  const nestedFile = path.join(f.target, ".ralph", "nested.log");
+  try {
+    const holder = spawn(process.execPath, args(f), {
+      env: env(f, "0", { LOCK_TEST_NESTED_FILE: nestedFile, LOCK_TEST_NODE: process.execPath, LOCK_TEST_CLI: cli, LOCK_TEST_TARGET: f.target, LOCK_TEST_PLAN: f.plan }),
+      stdio: "ignore",
+    });
+    check(await waitChild(holder) === 0, "the batch whose check nests another batch still succeeds");
+    const nested = existsSync(nestedFile) ? readFileSync(nestedFile, "utf8") : "";
+    check(/Another batch is already active.*run=batch-.*pid=\d+/s.test(nested), `a batch nested inside a running batch's descendant is refused loud: ${nested.trim() || "(no nested run recorded)"}`);
+    check(/nested_status=(?!0\b)\d+/.test(nested), "the nested batch exits non-zero instead of corrupting the live run");
+  } finally { clean(f); }
 }
 for (const override of ["flag", "env"]) {
   const f = fixture();

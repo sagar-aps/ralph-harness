@@ -806,7 +806,7 @@ with §1 this is the complete flag surface; `ralph help` is the authoritative li
 | `--branch <name>` | `review`, `batch` | Override the working branch name (default is generated from the run id). |
 | `--plan <dir\|file>` | `batch` | **Required**: a dir of `*.md` (sorted) or one `.md` split by its top heading level. |
 | `--max-tasks <n>` | `batch` | Cap how many tasks run. Default: all. |
-| `--allow-concurrent` | `batch` | Bypass `<target>/.ralph/batch.lock`. Default: off; use only when every concurrent run has a separate worktree. The fd-based `flock` auto-releases when its batch exits. |
+| `--allow-concurrent` | `batch` | Bypass `<target>/.ralph/batch.lock`. Default: off; use only when every concurrent run has a separate worktree. The lock is an fd-based `flock(2)` held by `.agents/ralph/batch-lock.py`, which runs the batch as its child: it auto-releases when that guardian exits (normal exit, crash or `kill -9`), so it can never go stale, and the locked fd is closed before the batch starts, so no agent/check descendant can keep it open. A second batch on the same target is refused loudly, naming the active run and pid (exit 121). |
 | `--run latest\|<run-id>` | `status`, `integrate`, `cleanup` | Which run to act on. Default `latest`. |
 | `--watch` | `status` | Poll to a terminal status (see §13.5 for exit codes). |
 | `--json` | `report`, `explain`, `pick-driver` | Machine-readable output. Default: human text (on `pick-driver`, the bare driver name). |

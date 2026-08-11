@@ -64,58 +64,35 @@ TARGET_REPO="$(cd "$TARGET_REPO" && pwd)"
 git -C "$TARGET_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || die "Not a git repository: $TARGET_REPO"
 
-# Batch owns target-local mutable state, so serialize runs per target. The open fd
-# is the lock: the kernel releases it on every exit path, including SIGKILL. The
-# file intentionally remains as a harmless place to flock; its text is diagnostic
-# metadata only and can never make a future run look locked.
-batch_lock_child_token=""
-if [[ "${1:-}" == --ralph-batch-lock-child=* ]]; then
-  batch_lock_child_token="${1#*=}"
+# ---- Per-target batch lock (#82) --------------------------------------------
+# Batch owns target-local mutable state (.ralph/last-run.env, the worktree
+# registry, .agent-run/), so two batches on ONE target must never overlap: the
+# second silently orphans the first. Serialize them behind an fd-based flock(2)
+# held by batch-lock.py, which re-runs this script as its child. See that file for
+# why the lock can never go stale and why no descendant can hold it open.
+batch_locked=""
+if [[ "${1:-}" == "--ralph-batch-locked" ]]; then
+  # Internal marker from our own guardian, passed on ARGV and never in the
+  # environment: argv is not inherited, so a nested `ralph batch` started by an
+  # agent or a check still gets locked instead of silently skipping the lock.
+  # bin/ralph forwards no argv here, so typing it by hand is only a clumsy synonym
+  # for the documented --allow-concurrent.
+  batch_locked="1"
   shift
 fi
 BATCH_LOCK_FILE="$TARGET_REPO/.ralph/batch.lock"
-if [[ -n "$batch_lock_child_token" ]]; then
-  guardian_pid="${batch_lock_child_token%%-*}"
-  guardian_lock="$(readlink "/proc/$PPID/fd/9" 2>/dev/null || true)"
-  kernel_guardian_pid="$(fuser "$BATCH_LOCK_FILE" 2>/dev/null | awk -v self="$$" '{ for (i = 1; i <= NF; i++) if ($i != self) { print $i; exit } }')"
-  if [[ "$guardian_pid" != "$PPID" || "$kernel_guardian_pid" != "$PPID" || "$guardian_lock" != "$BATCH_LOCK_FILE" ]]; then
-    batch_lock_child_token=""
-  fi
-fi
-if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" && -z "$batch_lock_child_token" ]]; then
-  command -v flock >/dev/null 2>&1 || die "flock is required to run ralph batch safely."
-  command -v fuser >/dev/null 2>&1 || die "fuser is required to identify an active ralph batch safely."
+if [[ "${RALPH_ALLOW_CONCURRENT:-}" == "1" ]]; then
+  # Deliberate parallel runs (separate worktrees each): no lock is held, so this
+  # run must not touch another batch's holder metadata either.
+  BATCH_LOCK_FILE=""
+elif [[ -z "$batch_locked" ]]; then
+  [[ -f "$SCRIPT_DIR/batch-lock.py" ]] \
+    || die "Batch lock helper missing: $SCRIPT_DIR/batch-lock.py (re-run 'ralph install --force' to refresh .agents/ralph)."
   mkdir -p "$TARGET_REPO/.ralph"
-  # Append-open does not erase the holder metadata before a contender learns
-  # whether it owns the lock.
-  exec 9>>"$BATCH_LOCK_FILE"
-  if ! flock -n 9; then
-    active_batch="$(sed -n '1p' "$BATCH_LOCK_FILE" 2>/dev/null || true)"
-    if [[ ! "$active_batch" =~ ^run=batch-[^[:space:]]+[[:space:]]pid=[0-9]+$ ]]; then
-      # Metadata is published immediately after flock succeeds, but a contender
-      # can arrive in that tiny interval. Ask the kernel-backed lock listing for
-      # the holder so the refusal still always identifies a live batch and PID.
-      active_pid="$(fuser "$BATCH_LOCK_FILE" 2>/dev/null | awk -v self="$$" '{ for (i = 1; i <= NF; i++) if ($i != self) { print $i; exit } }')"
-      [[ "$active_pid" =~ ^[0-9]+$ ]] || active_pid="unknown"
-      active_batch="run=batch-pending pid=$active_pid"
-    fi
-    die "Another batch is already active for $TARGET_REPO ($active_batch). Refusing to run concurrently; use --allow-concurrent only with separate worktrees."
-  fi
-  printf 'run=batch-pending pid=%s\n' "$$" > "$BATCH_LOCK_FILE"
-  # Keep this process as the lock guardian and run the batch in a child whose fd
-  # 9 is closed before exec. No agent/check descendant can inherit the lock. If
-  # the batch child exits or is killed, wait returns and this guardian exits too.
-  export BATCH_LOCK_FILE
-  lock_child_token="$$-$RANDOM-$RANDOM"
-  bash "$0" "--ralph-batch-lock-child=$lock_child_token" "$@" 9>&- &
-  batch_pid=$!
-  trap 'kill -TERM "$batch_pid" 2>/dev/null || true' TERM INT HUP
-  wait "$batch_pid"
-  exit $?
-elif [[ -n "$batch_lock_child_token" ]]; then
-  # The marker is an internal argv capability, not a caller-inherited environment
-  # bypass. Close the guardian lock descriptor before any batch descendants start.
-  exec 9>&-
+  # exec: the guardian becomes this process, so it is the one the caller waits on
+  # and signals, and its exit status is ours.
+  exec python3 "$SCRIPT_DIR/batch-lock.py" "$BATCH_LOCK_FILE" "$TARGET_REPO" \
+    -- bash "$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")" --ralph-batch-locked "$@"
 fi
 
 PLAN="${PLAN:-}"

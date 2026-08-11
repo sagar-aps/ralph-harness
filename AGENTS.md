@@ -39,6 +39,10 @@ change a flag.
   (`RALPH_AGENT_RETRIES`) then halts the batch with `REVIEWER_UNAVAILABLE` /
   `BUILDER_UNAVAILABLE` (exit 4) — unless efficiency mode has a rung ladder to promote
   the task onto first (#75, below); `--resume` continues, skipping already-PASSed tasks.
+  One live batch per target: `.agents/ralph/batch-lock.py` holds an fd-based `flock(2)`
+  on `<target>/.ralph/batch.lock` and runs the batch as its child, so a second
+  overlapping batch is refused loudly (exit 121) instead of corrupting the first, the
+  lock cannot go stale, and no descendant can hold it — `--allow-concurrent` opts out.
 - Backends/roles: `.agents/ralph/agents.sh` (`resolve_backend_cmd`); prompts
   `PROMPT_builder.md` / `PROMPT_reviewer.md`; config `review-config.sh`. The
   cron/orchestrator loop DRIVER is a third, independent role:
