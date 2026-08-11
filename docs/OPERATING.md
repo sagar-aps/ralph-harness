@@ -39,6 +39,7 @@ contract: an unset flag means the code path does not run.
 | Stop at first failure | `--stop-on-fail` | `false` | `batch` |
 | Resume a halted run | `--resume` | `false` | `batch` |
 | Detached run | `--detach` | `false` | `batch` |
+| Concurrent batch override | `--allow-concurrent` / `RALPH_ALLOW_CONCURRENT=1` | **OFF**; one live batch per target | `batch` |
 | Dirty target allowed | `--allow-dirty` / `ALLOW_DIRTY=true` | `false` | `review`, `batch` |
 | Branch in place (no worktree) | `--no-worktree` / `USE_WORKTREE=false` | worktree **on** | `review` |
 | Skip preflight | `--no-preflight` / `--skip-preflight` / `PREFLIGHT_SKIP=true` | preflight runs | `build`, `review`, `batch` |
@@ -805,6 +806,7 @@ with §1 this is the complete flag surface; `ralph help` is the authoritative li
 | `--branch <name>` | `review`, `batch` | Override the working branch name (default is generated from the run id). |
 | `--plan <dir\|file>` | `batch` | **Required**: a dir of `*.md` (sorted) or one `.md` split by its top heading level. |
 | `--max-tasks <n>` | `batch` | Cap how many tasks run. Default: all. |
+| `--allow-concurrent` | `batch` | Bypass `<target>/.ralph/batch.lock`. Default: off; use only when every concurrent run has a separate worktree. The fd-based `flock` auto-releases when its batch exits. |
 | `--run latest\|<run-id>` | `status`, `integrate`, `cleanup` | Which run to act on. Default `latest`. |
 | `--watch` | `status` | Poll to a terminal status (see §13.5 for exit codes). |
 | `--json` | `report`, `explain`, `pick-driver` | Machine-readable output. Default: human text (on `pick-driver`, the bare driver name). |

@@ -21,6 +21,8 @@
 #   BRANCH               Override branch name (default ralph/batch-<timestamp>).
 #   RALPH_WORKTREE_DIR   Base dir for the worktree.
 #   RALPH_DRY_RUN=1      Skip ONLY the agent backends; check still runs.
+#   RALPH_ALLOW_CONCURRENT=1  Bypass the per-target batch lock. The caller must
+#                        give concurrent runs separate worktrees.
 #   RALPH_SNAPSHOT_INTERVAL  Seconds between WIP snapshots while the builder runs
 #                        (default 60; <=0 disables). Snapshots are commits under
 #                        refs/ralph/wip/<run-ts>/task-N/iter-M, taken WITHOUT
@@ -61,6 +63,25 @@ TARGET_REPO="${TARGET_REPO:-}"
 TARGET_REPO="$(cd "$TARGET_REPO" && pwd)"
 git -C "$TARGET_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || die "Not a git repository: $TARGET_REPO"
+
+# Batch owns target-local mutable state, so serialize runs per target. The open fd
+# is the lock: the kernel releases it on every exit path, including SIGKILL. The
+# file intentionally remains as a harmless place to flock; its text is diagnostic
+# metadata only and can never make a future run look locked.
+if [[ "${RALPH_ALLOW_CONCURRENT:-}" != "1" ]]; then
+  command -v flock >/dev/null 2>&1 || die "flock is required to run ralph batch safely."
+  mkdir -p "$TARGET_REPO/.ralph"
+  BATCH_LOCK_FILE="$TARGET_REPO/.ralph/batch.lock"
+  # Append-open does not erase the holder metadata before a contender learns
+  # whether it owns the lock.
+  exec 9>>"$BATCH_LOCK_FILE"
+  if ! flock -n 9; then
+    active_batch="$(sed -n '1p' "$BATCH_LOCK_FILE" 2>/dev/null || true)"
+    [[ -n "$active_batch" ]] || active_batch="active batch metadata unavailable"
+    die "Another batch is already active for $TARGET_REPO ($active_batch). Refusing to run concurrently; use --allow-concurrent only with separate worktrees."
+  fi
+  printf 'run=batch-pending pid=%s\n' "$$" > "$BATCH_LOCK_FILE"
+fi
 
 PLAN="${PLAN:-}"
 [[ -n "$PLAN" ]] || die "PLAN is required (use --plan <dir-or-file>)."
@@ -560,6 +581,9 @@ if [[ "$RESUMING" != "true" ]]; then
   RUN_DIR="$TARGET_REPO/.agent-run/batch-$TS"
   TASKS_DIR="$RUN_DIR/tasks"
   mkdir -p "$TASKS_DIR"
+fi
+if [[ -n "${BATCH_LOCK_FILE:-}" ]]; then
+  printf 'run=batch-%s pid=%s\n' "$TS" "$$" > "$BATCH_LOCK_FILE"
 fi
 RALPH_QUOTA_ARTIFACT="$RUN_DIR/provider-quota.env"
 export RALPH_QUOTA_ARTIFACT
