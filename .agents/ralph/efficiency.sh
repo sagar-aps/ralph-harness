@@ -232,11 +232,11 @@ EOF
     # shellcheck disable=SC2086
     assignments="$(python3 "$script" select --complexity "$complexity" --repo "$repo" \
       --profile "$profile" --shell --after-rung "$after" $pool_args \
-      "${unresolved_args[@]}")" || rc=$?
+      ${unresolved_args[@]+"${unresolved_args[@]}"})" || rc=$?
   else
     # shellcheck disable=SC2086
     assignments="$(python3 "$script" select --complexity "$complexity" --repo "$repo" \
-      --profile "$profile" --shell $pool_args "${unresolved_args[@]}")" || rc=$?
+      --profile "$profile" --shell $pool_args ${unresolved_args[@]+"${unresolved_args[@]}"})" || rc=$?
   fi
   if [[ -z "$assignments" ]]; then
     RALPH_EFFICIENCY_SELECT_REASON="could not run $script (exit $rc)"
