@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -107,6 +107,39 @@ try {
     }
   } finally {
     rmSync(fakeHome, { recursive: true, force: true });
+  }
+}
+
+// `status/integrate --run <id>` for a NON-latest batch run: batch artifacts live in
+// .agent-run/<id>/ (not .ralph/runs/), and STATUS/BRANCH must come from the run's
+// own final-report.md since last-run.env describes a different (latest) run.
+{
+  const repo = mkdtempSync(path.join(tmpdir(), "ralph-runid-"));
+  try {
+    spawnSync("git", ["init", "-q", repo]);
+    const runDir = path.join(repo, ".agent-run", "batch-20260101-000000-1");
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(
+      path.join(runDir, "final-report.md"),
+      "# Ralph batch final report — READY_FOR_HUMAN_REVIEW\n\n" +
+        "- Branch (NOT merged): ralph/batch-20260101-000000-1\n",
+    );
+    mkdirSync(path.join(repo, ".ralph"), { recursive: true });
+    writeFileSync(path.join(repo, ".ralph", "last-run.env"), "RUN_ID=batch-other\nSTATUS=FAILED\n");
+    const r = spawnSync(
+      process.execPath,
+      [cliPath, "status", "--repo", repo, "--run", "batch-20260101-000000-1"],
+      { encoding: "utf-8" },
+    );
+    if (
+      !/Status:\s+READY_FOR_HUMAN_REVIEW/.test(r.stdout) ||
+      !/Branch:\s+ralph\/batch-20260101-000000-1/.test(r.stdout)
+    ) {
+      console.error(`status --run <batch-id> did not resolve the batch run:\n${r.stdout}${r.stderr}`);
+      process.exit(1);
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
   }
 }
 

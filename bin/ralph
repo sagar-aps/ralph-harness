@@ -233,7 +233,31 @@ function resolveRun(repo, runArg) {
     const rd = dirForLastRun();
     return { runId: runArg, runDir: exists(rd) ? rd : null, lastRun };
   }
-  return { runId: runArg, runDir: path.join(runsDir, runArg), lastRun: {} };
+  // A non-latest run: review runs live in .ralph/runs/<id>, batch runs in
+  // .agent-run/<id> (batch-<ts>). Look in both rather than assuming .ralph/runs.
+  const candidates = [path.join(runsDir, runArg), path.join(repo, ".agent-run", runArg)];
+  const found = candidates.find((d) => exists(d));
+  return { runId: runArg, runDir: found || candidates[0], lastRun: {} };
+}
+
+// Recover a non-latest run's fields from its own artifacts (last-run.env only
+// describes the latest run): the outcome heading of final_status.md (review) or
+// final-report.md (batch), plus the branch/worktree lines both write.
+function metaFromRunReport(runDir) {
+  const out = {};
+  for (const name of ["final_status.md", "final-report.md"]) {
+    const f = path.join(runDir, name);
+    if (!exists(f)) continue;
+    const text = fs.readFileSync(f, "utf-8");
+    const status = text.match(/^# (?:Final Status:|Ralph batch final report —)\s*(\S+)/m);
+    if (status) out.STATUS = status[1];
+    const branch = text.match(/^- Branch(?: \(NOT merged\))?: (\S+)/m);
+    if (branch) out.BRANCH = branch[1];
+    const wt = text.match(/^- Worktree: (\S+)/m);
+    if (wt) out.WORKTREE = wt[1];
+    break;
+  }
+  return out;
 }
 
 // Merge last-run.env with the chosen run's final_status.md / config.resolved.env.
@@ -244,6 +268,10 @@ function loadRunMeta(repo, runArg) {
     const cfg = parseEnvFile(path.join(runDir, "config.resolved.env"));
     // last-run.env wins for STATUS/PREVIEW_URL; config fills the rest.
     meta = { ...cfg, ...meta };
+  }
+  if (runDir && exists(runDir)) {
+    // Fills only what last-run.env/config didn't (i.e. a non-latest run).
+    meta = { ...metaFromRunReport(runDir), ...meta };
   }
   if (runId && !meta.RUN_ID) meta.RUN_ID = runId;
   if (runDir && !meta.ARTIFACTS_DIR) meta.ARTIFACTS_DIR = runDir;
