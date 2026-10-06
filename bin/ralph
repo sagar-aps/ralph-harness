@@ -928,9 +928,21 @@ for (let i = 0; i < rawArgs.length; i += 1) {
 }
 
 const cmd = args[0];
-if (cmd === "help" || cmd === "-h" || cmd === "--help") {
+// --help / -h anywhere wins: `ralph integrate --repo X --help` must print usage,
+// never fall through and execute the (state-changing) command.
+if (cmd === "help" || args.includes("-h") || args.includes("--help")) {
   usage();
   process.exit(0);
+}
+// State-changing operator commands take no positionals/free text, so any leftover
+// `-`-prefixed token is an unrecognized flag (a typo, or a flag from another
+// command). Refuse it rather than silently running the command without it.
+if (["integrate", "cleanup", "batch", "review"].includes(cmd)) {
+  const unknown = args.slice(1).filter((a) => a.startsWith("-"));
+  if (unknown.length) {
+    console.error(`ralph ${cmd}: unrecognized option(s): ${unknown.join(" ")} (see: ralph help)`);
+    process.exit(2);
+  }
 }
 
 async function runInstallSkills() {

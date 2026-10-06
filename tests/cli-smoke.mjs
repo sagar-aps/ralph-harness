@@ -17,6 +17,54 @@ const cliPath = path.join(repoRoot, "bin", "ralph");
 
 run(process.execPath, [cliPath, "--help"]);
 
+// --help anywhere must print usage and exit 0 without running the command:
+// `integrate --repo X --help` used to fall through and EXECUTE the merge.
+{
+  const missing = path.join(tmpdir(), "ralph-no-such-repo-for-help");
+  for (const argv of [
+    ["integrate", "--repo", missing, "--help"],
+    ["cleanup", "--repo", missing, "-h"],
+  ]) {
+    const r = spawnSync(process.execPath, [cliPath, ...argv], { encoding: "utf-8" });
+    if (r.status !== 0 || !/Usage|ralph/i.test(r.stdout)) {
+      console.error(`help-anywhere failed for: ${argv.join(" ")} (exit ${r.status})\n${r.stderr}`);
+      process.exit(1);
+    }
+  }
+  // An unrecognized flag on a state-changing command is refused, not ignored.
+  const bad = spawnSync(process.execPath, [cliPath, "integrate", "--repo", missing, "--prr"], {
+    encoding: "utf-8",
+  });
+  if (bad.status !== 2 || !/unrecognized option\(s\): --prr/.test(bad.stderr)) {
+    console.error(`unknown-flag refusal failed (exit ${bad.status}): ${bad.stderr}`);
+    process.exit(1);
+  }
+}
+
+// --help anywhere must print usage and exit 0 without running the command:
+// `integrate --repo X --help` used to fall through and EXECUTE the merge.
+{
+  const missing = path.join(tmpdir(), "ralph-no-such-repo-for-help");
+  for (const argv of [
+    ["integrate", "--repo", missing, "--help"],
+    ["cleanup", "--repo", missing, "-h"],
+  ]) {
+    const r = spawnSync(process.execPath, [cliPath, ...argv], { encoding: "utf-8" });
+    if (r.status !== 0 || !/Usage|ralph/i.test(r.stdout)) {
+      console.error(`help-anywhere failed for: ${argv.join(" ")} (exit ${r.status})\n${r.stderr}`);
+      process.exit(1);
+    }
+  }
+  // An unrecognized flag on a state-changing command is refused, not ignored.
+  const bad = spawnSync(process.execPath, [cliPath, "integrate", "--repo", missing, "--prr"], {
+    encoding: "utf-8",
+  });
+  if (bad.status !== 2 || !/unrecognized option\(s\): --prr/.test(bad.stderr)) {
+    console.error(`unknown-flag refusal failed (exit ${bad.status}): ${bad.stderr}`);
+    process.exit(1);
+  }
+}
+
 const projectRoot = mkdtempSync(path.join(tmpdir(), "ralph-cli-"));
 try {
   const outPath = path.join(projectRoot, "prd.json");
