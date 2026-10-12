@@ -1050,6 +1050,42 @@ console.log("20) WIP snapshots capture mid-builder work and survive a kill");
   }
 }
 
+console.log("N) --base <ref> branches the worktree from that ref, never touching the target checkout");
+{
+  const { target, mainHead } = makeTarget();
+  const plan = makePlanDir();
+  try {
+    // A "PR head" one commit ahead of main, on its own branch; the target stays on main.
+    git(target, ["checkout", "-q", "-b", "pr-head"]);
+    writeFileSync(path.join(target, "PR.md"), "pr\n");
+    git(target, ["add", "-A"]);
+    git(target, ["commit", "-q", "-m", "pr commit"]);
+    const prHead = git(target, ["rev-parse", "HEAD"]);
+    git(target, ["checkout", "-q", "-"]);
+    const branchBefore = git(target, ["symbolic-ref", "--short", "HEAD"]);
+    const r = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--max-tasks", "1", "--base", "pr-head",
+       "--builder", "claude", "--reviewer", "codex", "--auto-approve-builder"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target) },
+    );
+    check(r.status === 0, `batch --base exits 0 (got ${r.status}: ${r.stderr.slice(-300)})`);
+    const wt = path.join(wtBase(target), readdirSync(wtBase(target))[0]);
+    check(git(wt, ["merge-base", "--is-ancestor", prHead, "HEAD"]) === "", "worktree branch contains the --base commit");
+    check(git(target, ["symbolic-ref", "--short", "HEAD"]) === branchBefore, "target checkout stays on its branch");
+    check(git(target, ["rev-parse", "HEAD"]) === mainHead, "target checkout HEAD is unchanged");
+    const lre = readFileSync(path.join(target, ".ralph", "last-run.env"), "utf-8");
+    check(lre.includes(`BASE_COMMIT=${prHead}`), "last-run.env records the --base commit as BASE_COMMIT");
+
+    const bad = ralph(
+      ["batch", "--repo", target, "--plan", plan, "--base", "no-such-ref", "--builder", "claude", "--reviewer", "codex"],
+      { RALPH_DRY_RUN: "1", RALPH_WORKTREE_DIR: wtBase(target) },
+    );
+    check(bad.status !== 0 && /does not resolve/.test(`${bad.stdout}${bad.stderr}`), "an unresolvable --base fails loudly");
+  } finally {
+    cleanup(target);
+  }
+}
+
 for (const d of [...planDirs, ...stateDirs]) {
   try {
     rmSync(d, { recursive: true, force: true });

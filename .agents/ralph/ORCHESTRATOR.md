@@ -167,6 +167,11 @@ boot). Each pass:
    was never received and the round it spent deciding is lost; leaving the label on an item you
    have already handled tells the Manager you are still stalled, and it will re-answer instead
    of reviewing.
+   **Never check out, switch or detach the shared target checkout** (the Manager deploys from
+   it). To fix a PR in place, dispatch `ralph batch --base origin/<pr-branch> …` after
+   `git fetch origin`, so the fix branch stacks on the PR head inside its own worktree. Rebase
+   and push from that worktree (`git push --force-with-lease origin <fix>:<pr-branch>`). Clear
+   `blocked:orchestrator` only after the fix is on the PR head.
 2. **Select treatable tickets — label-mechanical, not judgment.** Eligible = `now` AND
    `spec:ready` AND has a `## Acceptance` section. Never touch `spec:draft`, `blocked:owner`,
    `blocked:manager`, `blocked:orchestrator`, or `decision-needed`. `blocked:orchestrator` is
