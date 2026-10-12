@@ -20,6 +20,9 @@
 #   ALLOW_DIRTY          "true" => allow a dirty target working tree.
 #   BRANCH               Override branch name (default ralph/batch-<timestamp>).
 #   RALPH_WORKTREE_DIR   Base dir for the worktree.
+#   RALPH_BASE_REF       Ref the fresh worktree branches from (default: the target
+#                        checkout's HEAD). Lets a caller stack work on a PR head
+#                        without checking it out in the shared target checkout.
 #   RALPH_DRY_RUN=1      Skip ONLY the agent backends; check still runs.
 #   RALPH_ALLOW_CONCURRENT=1  Bypass the per-target batch lock. The caller must
 #                        give concurrent runs separate worktrees.
@@ -705,11 +708,21 @@ if [[ "$RESUMING" == "true" ]]; then
   done
   echo "Resume: already-complete tasks =${COMPLETED_SET}"
 else
-  BASE_REF="$(git -C "$TARGET_REPO" rev-parse HEAD)"
+  if [[ -n "${RALPH_BASE_REF:-}" ]]; then
+    BASE_REF="$(git -C "$TARGET_REPO" rev-parse --verify --quiet "${RALPH_BASE_REF}^{commit}")" \
+      || die "--base ${RALPH_BASE_REF} does not resolve to a commit in $TARGET_REPO (fetch it first?)."
+    echo "Base: ${RALPH_BASE_REF} (${BASE_REF:0:12})"
+  else
+    BASE_REF="$(git -C "$TARGET_REPO" rev-parse HEAD)"
+    if ! git -C "$TARGET_REPO" symbolic-ref -q HEAD >/dev/null; then
+      echo "WARNING: target checkout HEAD is detached at ${BASE_REF:0:12}; the batch branches from it." >&2
+      echo "         Pass --base <ref> to choose the base explicitly." >&2
+    fi
+  fi
   WT_BASE="${RALPH_WORKTREE_DIR:-$(dirname "$TARGET_REPO")/.ralph-worktrees}"
   mkdir -p "$WT_BASE"
   WORKDIR="$WT_BASE/$(basename "$TARGET_REPO")-batch-$TS"
-  git -C "$TARGET_REPO" worktree add -b "$BRANCH" "$WORKDIR" >/dev/null \
+  git -C "$TARGET_REPO" worktree add -b "$BRANCH" "$WORKDIR" "$BASE_REF" >/dev/null \
     || die "Failed to create worktree."
 fi
 
