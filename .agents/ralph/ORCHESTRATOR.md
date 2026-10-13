@@ -217,6 +217,14 @@ boot). Each pass:
    the PR number in the pass log so the round's decision is reconstructable. If the open PR
    turns out to be one of yours carrying `blocked:orchestrator`, step 1 already owns it — you
    push a fix onto that PR's branch, you never open a second PR for the same ticket.
+
+   **`ralph batch` enforces this as a backstop.** A fresh batch whose tasks name `#N` in a
+   title (or whose `RALPH_FIXES` lists it) lists the target's open PRs and refuses to start if
+   any one closes, mentions, or branches on `#N`. It exits non-zero before any worktree exists
+   and names the covering PR. Treat that refusal as "skip this ticket", never as a reason to
+   retry. Still run the checks above: the backstop fires only after you've written a plan and
+   spent a dispatch slot. A deliberate fix-up of an existing PR (step 1 reviewfix) is the one
+   legitimate exception. Pass `--allow-duplicate` for it, and only for it.
 3. **Assign to a builder.** Dispatch the ticket through the harness (`ralph review <task>` /
    `ralph batch`). The builder implements; the in-loop **reviewer** returns PASS/FAIL; iterate
    under the harness until the check and reviewer pass.

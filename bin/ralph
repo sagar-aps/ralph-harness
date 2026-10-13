@@ -31,6 +31,7 @@ const review = {
   branch: null,
   verdictRegex: null,
   allowDirty: false,
+  allowDuplicate: false,
   detach: false,
   watch: false,
   noWorktree: false,
@@ -561,6 +562,8 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
   --task <id> | review <index>        Select a PRD story by id or 1-based index
   --branch <name>                     Override the working branch name
   --allow-dirty                       Allow a dirty target working tree
+  --allow-duplicate                   (batch) Dispatch even if an open PR already
+                                      references a task's #N (duplicate guard)
   --no-worktree                       Branch in place instead of a git worktree
   --verdict-regex <re>                Reviewer verdict regex (default: '^VERDICT: (PASS|FAIL)')
   --preview | --no-preview            Force website preview+e2e on/off (else target config)
@@ -842,6 +845,10 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   if (matchedReviewFlag) continue;
   if (arg === "--allow-dirty") {
     review.allowDirty = true;
+    continue;
+  }
+  if (arg === "--allow-duplicate") {
+    review.allowDuplicate = true;
     continue;
   }
   if (arg === "--detach") {
@@ -1146,6 +1153,7 @@ async function main() {
     if (review.branch) env.BRANCH = review.branch;
     if (review.verdictRegex) env.VERDICT_REGEX = review.verdictRegex;
     if (review.allowDirty) env.ALLOW_DIRTY = "true";
+    if (review.allowDuplicate) env.RALPH_ALLOW_DUPLICATE = "true";
     if (review.skipPreflight) env.PREFLIGHT_SKIP = "true";
     if (review.autoApproveBuilder) env.AUTO_APPROVE_BUILDER = "true";
     if (review.stopOnFail) env.STOP_ON_FAIL = "true";

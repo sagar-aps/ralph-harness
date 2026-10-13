@@ -18,6 +18,8 @@
 #   AUTO_APPROVE_BUILDER "true" => builder uses permission-skipping flags (unattended).
 #   STOP_ON_FAIL         "true" => stop at the first failing task.
 #   ALLOW_DIRTY          "true" => allow a dirty target working tree.
+#   RALPH_ALLOW_DUPLICATE "true" => skip the duplicate-dispatch guard (open PR already
+#                        references a task's issue #N). RALPH_GH overrides the gh binary.
 #   BRANCH               Override branch name (default ralph/batch-<timestamp>).
 #   RALPH_WORKTREE_DIR   Base dir for the worktree.
 #   RALPH_DRY_RUN=1      Skip ONLY the agent backends; check still runs.
@@ -687,6 +689,49 @@ if [[ "$MAX_TASKS" -gt 0 && "$TASK_TOTAL" -gt "$MAX_TASKS" ]]; then
   TASK_RUN_COUNT="$MAX_TASKS"
 else
   TASK_RUN_COUNT="$TASK_TOTAL"
+fi
+
+# ---- Duplicate-dispatch guard (fresh runs only) ------------------------------
+# Refuse to start work an open PR already carries: two unattended rounds each picking
+# the same still-open ticket is the #74 duplicate-PR failure, and a prose rule in the
+# round prompt did not stop it. Issue refs come from the tasks this run will execute
+# ("#N" in a task title) plus RALPH_FIXES. Runs only for a GitHub-hosted target (or
+# when RALPH_GH is set); if the PR listing fails, warn and continue rather than block.
+if [[ "$RESUMING" != "true" && "${RALPH_ALLOW_DUPLICATE:-false}" != "true" ]]; then
+  DUP_REFS="$( { head -n "$TASK_RUN_COUNT" "$MANIFEST" | cut -f2 | grep -oE '#[0-9]+' | tr -d '#'
+                 printf '%s\n' "${RALPH_FIXES:-}" | tr -cs '0-9' '\n'; } | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
+  DUP_ORIGIN="$(git -C "$TARGET_REPO" remote get-url origin 2>/dev/null || true)"
+  if [[ -n "${DUP_REFS// /}" && ( -n "${RALPH_GH:-}" || "$DUP_ORIGIN" == *github.com* ) ]]; then
+    if DUP_JSON="$(cd "$TARGET_REPO" && "${RALPH_GH:-gh}" pr list --state open --limit 200 \
+                     --json number,title,body,headRefName,commits 2>/dev/null)"; then
+      DUP_HITS="$(DUP_REFS="$DUP_REFS" python3 -c '
+import json, os, re, sys
+refs = os.environ["DUP_REFS"].split()
+prs = json.loads(sys.stdin.read() or "[]")
+for n in refs:
+    closes = re.compile(r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s*:?\s*#%s\b" % n, re.I)
+    mention = re.compile(r"#%s\b" % n)
+    branch = re.compile(r"(?:^|/)(?:issue[-_]?)?%s(?:[-_]|$)" % n, re.I)
+    for pr in prs:
+        heads = [c.get("messageHeadline", "") for c in pr.get("commits") or []]
+        why = ("body closes it" if closes.search(pr.get("body") or "") else
+               "title mentions it" if mention.search(pr.get("title") or "") else
+               "commit subject mentions it" if any(mention.search(h) for h in heads) else
+               "branch name carries it" if branch.search(pr.get("headRefName") or "") else "")
+        if why:
+            print("#%s -> open PR #%s (%s: %s)" % (n, pr["number"], why, pr.get("headRefName", "")))
+' <<<"$DUP_JSON")" || DUP_HITS=""
+      if [[ -n "$DUP_HITS" ]]; then
+        rmdir "$TASKS_DIR" "$RUN_DIR" 2>/dev/null || true
+        die "Duplicate dispatch refused: an open PR already covers this work.
+$DUP_HITS
+Pick another ticket. A deliberate fix-up of that PR (reviewfix) passes --allow-duplicate."
+      fi
+      echo "Duplicate guard: no open PR references #${DUP_REFS% } — ok."
+    else
+      echo "WARNING: duplicate guard could not list open PRs (gh failed); continuing unguarded." >&2
+    fi
+  fi
 fi
 
 # ---- Shared worktree (created ONCE; reused on resume) ----------------------
