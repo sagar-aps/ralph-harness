@@ -738,6 +738,46 @@ export RALPH_RUN_ID="batch-$TS" RALPH_TARGET_REPO="$TARGET_REPO" RALPH_WORKTREE=
        RALPH_BRANCH="$BRANCH" RALPH_BASE_COMMIT="$BASE_REF" \
        RALPH_APP_PORT RALPH_DB_PORT RALPH_PREVIEW_URL RALPH_COMPOSE_PROJECT
 
+# ---- Gate commands: catch a broken check/verify BEFORE any builder attempt (#98) ----
+# CHECK_CMD/VERIFY_CMD are eval'd inside the worktree, so a gate that cannot run fails
+# every attempt no matter what the builder does. Reject a syntax error outright; repair
+# the two common launch faults (a script written without +x, a relative path into a
+# gitignored dir that only exists in the target checkout) with a loud notice.
+normalize_gate_cmd() {  # <var-name> <label>
+  local var="$1" label="$2" cmd first rest path interp
+  cmd="${!var}"
+  [[ -n "$cmd" ]] || return 0
+  bash -n -c "$cmd" 2>/dev/null \
+    || die "$label is not valid shell (bash -n failed): $cmd
+Put multi-step gates in a script and pass its path."
+  read -r first rest <<<"$cmd"
+  [[ "$first" == */* ]] || return 0
+  if [[ "$first" == /* ]]; then path="$first"; else path="$WORKDIR/$first"; fi
+  if [[ ! -e "$path" && "$first" != /* && -e "$TARGET_REPO/$first" ]]; then
+    path="$TARGET_REPO/$first"
+    echo "NOTICE: $label path '$first' is missing in the worktree (gitignored?); using $path" >&2
+    printf -v cmd '%q%s' "$path" "${rest:+ $rest}"
+  fi
+  if [[ -f "$path" && ! -x "$path" ]]; then
+    interp="$(head -n1 "$path" 2>/dev/null | sed -n 's/^#![[:space:]]*//p')"
+    [[ -n "$interp" ]] || interp="bash"
+    echo "NOTICE: $label script $path is not executable; running it as: $interp $path" >&2
+    printf -v cmd '%s %q%s' "$interp" "$path" "${rest:+ $rest}"
+  fi
+  printf -v "$var" '%s' "$cmd"
+}
+normalize_gate_cmd CHECK_CMD "CHECK_CMD (--check)"
+normalize_gate_cmd VERIFY_CMD "VERIFY_CMD (--verify)"
+
+# A gate exit that means "the command could not run", not "the code is wrong":
+# 126 not executable, 127 not found, 2 + a shell syntax error in its log.
+gate_broken() {  # <exit> <log>
+  [[ "$1" -eq 126 || "$1" -eq 127 ]] && return 0
+  # Only bash's own parse errors — not a test suite that mentions "syntax error".
+  [[ "$1" -eq 2 ]] && grep -qE 'line [0-9]+: syntax error|syntax error near unexpected token|syntax error: unexpected end of file' "$2" 2>/dev/null && return 0
+  return 1
+}
+
 export WORKDIR BRANCH CHECK_CMD RUN_DIR AGENTS_PATH VERDICT_REGEX \
        TARGET_REPO TASK_TOTAL AUTO_APPROVE_BUILDER MAX_ITERATIONS
 
@@ -1322,6 +1362,7 @@ CONTEXT_FILE="$RUN_DIR/batch-context.md"
 
 ATTEMPTED=0; COMPLETED=0; FAILED=0; SKIPPED=0; BLOCKED_COUNT=0
 STOPPED_EARLY="false"
+GATE_ERROR=""                # #98: "check exit 126 …" when a gate command cannot run
 AGENT_ERROR_ROLE=""        # "builder" | "reviewer" when an unrecoverable ERROR halts the batch
 QUOTA_ROLE=""
 AGENT_ERROR_EXIT=""
@@ -1523,6 +1564,12 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     # own preflight — prevents the self-host check -> npm test -> ralph recursion (#35).
     set +e; ( cd "$WORKDIR" && RALPH_IN_PREFLIGHT=1 eval "$CHECK_CMD" ) > "$ITER_CHECK_LOG" 2>&1; CHECK_STATUS=$?; set -e
     echo "    check exit: $CHECK_STATUS"
+    if gate_broken "$CHECK_STATUS" "$ITER_CHECK_LOG"; then
+      # Not the builder's fault and no retry can fix it: halt before the reviewer runs.
+      cp "$ITER_CHECK_LOG" "$CHECK_LOG" 2>/dev/null || true
+      GATE_ERROR="check exit $CHECK_STATUS"; HALTED_TASK="$IDX"
+      break
+    fi
 
     # 3. Diff for this task so far (vs the task's starting commit)
     git -C "$WORKDIR" add -A >/dev/null 2>&1 || true
@@ -1582,6 +1629,10 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
         set +e; ( cd "$WORKDIR" && eval "$VERIFY_CMD" ) > "$ITER_VERIFY_LOG" 2>&1; VERIFY_STATUS=$?; set -e
         echo "    verify exit: $VERIFY_STATUS"
         cp "$ITER_VERIFY_LOG" "$VERIFY_LOG" 2>/dev/null || true
+        if gate_broken "$VERIFY_STATUS" "$ITER_VERIFY_LOG"; then
+          GATE_ERROR="verify exit $VERIFY_STATUS"; HALTED_TASK="$IDX"
+          break
+        fi
       fi
       if [[ "$VERIFY_STATUS" -eq 0 ]]; then
         TASK_STATUS="PASS"
@@ -1610,6 +1661,11 @@ while IFS=$'\t' read -r IDX TITLE FN <&3; do
     set +e; ralph_orchestrator_budget_refresh "$RUN_DIR"; BUDGET_RC=$?; set -e
     if [[ "$BUDGET_RC" -eq 2 ]]; then die "Invalid orchestrator budget configuration."; fi
     [[ "$BUDGET_RC" -eq 0 ]] && BUDGET_REACHED="true"
+  fi
+
+  if [[ -n "$GATE_ERROR" ]]; then
+    echo "Task $IDX HALTED — gate command could not run ($GATE_ERROR); no further attempts spent."
+    break
   fi
 
   # Unrecoverable agent (builder/reviewer) ERROR → halt: do not commit, do not
@@ -1717,7 +1773,9 @@ fi
 # ---- Outcome ----------------------------------------------------------------
 # An unrecoverable agent ERROR is its OWN terminal state, distinct from
 # COMPLETED_WITH_FAILURES (which means tasks ran and some failed review).
-if [[ -n "$AGENT_ERROR_ROLE" ]]; then
+if [[ -n "$GATE_ERROR" ]]; then
+  OUTCOME="CHECK_BROKEN"
+elif [[ -n "$AGENT_ERROR_ROLE" ]]; then
   if [[ -n "$QUOTA_ROLE" ]]; then OUTCOME="PROVIDER_QUOTA_EXHAUSTED"
   elif [[ "$LAUNCH_ESCALATION_EXHAUSTED" == "true" ]]; then
     # #75: efficiency mode climbed the whole ladder and every rung failed to LAUNCH.
@@ -1809,7 +1867,17 @@ REPORT="$RUN_DIR/final-report.md"
     echo "  reviewer failed a task). Last trail: ${LAUNCH_ESCALATION_RUNGS:-(none)}"
     echo "- Per-escalation records: $RUN_DIR/escalations.jsonl (and the ledger, as \`event\` lines)"
   fi
-  if [[ -n "$AGENT_ERROR_ROLE" && "$LAUNCH_ESCALATION_EXHAUSTED" == "true" ]]; then
+  if [[ -n "$GATE_ERROR" ]]; then
+    echo ""
+    echo "## ⚠ Halted: gate command could not run ($GATE_ERROR)"
+    echo ""
+    echo "Task $HALTED_TASK's gate exited with a code that means the COMMAND failed to run"
+    echo "(126 not executable, 127 not found, or a shell syntax error), not that the code is"
+    echo "wrong. The batch stopped instead of spending builder attempts on it. See"
+    echo "\`$RUN_DIR/task-$HALTED_TASK-check.log\`. Fix the command (absolute path, chmod +x,"
+    echo "or a script instead of an inline brace group), then RESUME:"
+    echo "  ralph batch --repo \"$TARGET_REPO\" --plan \"$PLAN\" --resume"
+  elif [[ -n "$AGENT_ERROR_ROLE" && "$LAUNCH_ESCALATION_EXHAUSTED" == "true" ]]; then
     echo ""
     echo "## ⚠ Halted: no launchable rung left ($AGENT_ERROR_ROLE)"
     echo ""
