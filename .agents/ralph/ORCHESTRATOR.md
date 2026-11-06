@@ -167,6 +167,17 @@ boot). Each pass:
    was never received and the round it spent deciding is lost; leaving the label on an item you
    have already handled tells the Manager you are still stalled, and it will re-answer instead
    of reviewing.
+
+   **A PR can merge under you, so check its state before each step.** Run
+   `gh pr view <N> --json state` before dispatching a fix for an existing PR (a handback, or
+   your own follow-up after CI turns red) and again right before pushing it.
+   - If the PR is `MERGED` or `CLOSED`, its branch is dead. Do not push to it. Cut a fresh
+     branch off `origin/<default-branch>`, rebuild or cherry-pick the fix onto it, and file it
+     as a **new** PR that references the merged one.
+   - `ralph integrate --pr` refuses (exit 3) when the run's branch has a merged/closed PR. It
+     pushes to an OPEN one, fast-forward only.
+   - A PASS result is never left unpushed: every PASS ends with a pushed branch and an open
+     PR, or an explicit escalation explaining why not.
 2. **Select treatable tickets — label-mechanical, not judgment.** Eligible = `now` AND
    `spec:ready` AND has a `## Acceptance` section. Never touch `spec:draft`, `blocked:owner`,
    `blocked:manager`, `blocked:orchestrator`, or `decision-needed`. `blocked:orchestrator` is
