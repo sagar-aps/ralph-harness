@@ -1645,8 +1645,34 @@ async function main() {
       if (notice) console.error(`\n${notice}\n`);
 
       const existing = prForBranch(repo, branch, identity);
+      const existingState = String((existing && existing.state) || "").toUpperCase();
+      if (existing && existing.url && existingState !== "OPEN") {
+        // A MERGED/CLOSED PR can never receive these commits: pushing would strand them
+        // on a dead branch, and skipping silently (the old behaviour) dropped a PASSing
+        // result. Refuse loudly and keep the worktree so the work can be re-filed.
+        console.error(`\nThe PR for ${branch} is already ${existingState || "not open"}: ${existing.url}`);
+        console.error("This run's commits cannot reach it. Nothing was pushed; the worktree is kept.");
+        console.error(
+          `File the work as a NEW PR from a fresh branch off origin/${base}: cherry-pick this run's\n` +
+            `commits onto it (or re-run the plan on a fresh batch), then \`ralph integrate --pr\` that run.`,
+        );
+        process.exit(3);
+      }
       if (existing && existing.url) {
-        console.log(`\nA PR already exists for ${branch}: ${existing.url} (${existing.state}). Skipping create.`);
+        // OPEN: this run continues that PR's branch (e.g. a reviewfix) — push so the PR
+        // actually gets the commits. Plain push: a non-fast-forward is refused, never forced.
+        const push = runAsIdentity(identity, repo, "git", ["-C", repo, "push", "origin", branch], {
+          stdio: "inherit",
+          encoding: undefined,
+        });
+        if (push.status !== 0) {
+          console.error(
+            `git push of ${branch} was rejected; the open PR ${existing.url} was NOT updated. ` +
+              "Rebase onto the PR head (or --force-with-lease deliberately), then push. Worktree kept.",
+          );
+          process.exit(push.status ?? 1);
+        }
+        console.log(`\nUpdated the open PR for ${branch}: ${existing.url}`);
       } else {
         const push = runAsIdentity(identity, repo, "git", ["-C", repo, "push", "-u", "origin", branch], {
           stdio: "inherit",
