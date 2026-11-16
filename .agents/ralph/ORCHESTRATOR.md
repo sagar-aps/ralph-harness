@@ -178,6 +178,10 @@ boot). Each pass:
      pushes to an OPEN one, fast-forward only.
    - A PASS result is never left unpushed: every PASS ends with a pushed branch and an open
      PR, or an explicit escalation explaining why not.
+   - **Push once per ticket per round** (every push re-runs the target's PR CI). Squash a
+     round's fix commits locally before pushing; don't push a rebase that leaves the tree
+     unchanged (`ralph integrate --pr` skips it for you); don't push empty commits just to
+     retrigger CI — rerun the check instead when the identity can.
 2. **Select treatable tickets — label-mechanical, not judgment.** Eligible = `now` AND
    `spec:ready` AND has a `## Acceptance` section. Never touch `spec:draft`, `blocked:owner`,
    `blocked:manager`, `blocked:orchestrator`, or `decision-needed`. `blocked:orchestrator` is
@@ -237,7 +241,12 @@ boot). Each pass:
    immediately before `ralph integrate --pr` — the default branch moves fast, and a stale
    branch buys you a rebase request from the Manager instead of a review, costing a whole
    round. File the PR with `Fixes #<N>` in the body — `ralph integrate --pr` derives that from
-   the branch name for a single ticket; for a **bundled batch** run that closes several tickets
+   the branch name for a single ticket. **Draft-first** when the target sets
+   `"pr": {"draft": true}` in `ralph.target.json` (or pass `--draft`): the PR opens as a draft
+   so intermediate pushes run only the light CI. Pass `--ready` once the run's local gate
+   (CHECK_CMD/preflight) passed for the final state — a new PR then opens ready directly, an
+   existing draft is pushed and marked ready (`gh pr ready`). A reviewfix push without
+   `--ready` turns a ready PR back into a draft first. For a **bundled batch** run that closes several tickets
    on one branch, set `RALPH_FIXES="1 3 4"` so every issue is closed on merge. As a standing
    behavior, every PR body must state the builder and reviewer backend/agent that produced the
    work, including the resolved

@@ -20,6 +20,8 @@ let prdOutPath = null;
 // Review-loop (builder/reviewer) + operator options.
 const review = {
   repo: null,
+  draft: null,
+  ready: false,
   builder: null,
   reviewer: null,
   maxIterations: null,
@@ -460,7 +462,7 @@ function prForBranch(repo, branch, identity = null) {
     identity,
     repo,
     "gh",
-    ["pr", "list", "--head", branch, "--state", "all", "--json", "url,state", "-q", ".[0]"],
+    ["pr", "list", "--head", branch, "--state", "all", "--json", "url,state,isDraft", "-q", ".[0]"],
     { encoding: "utf-8" },
   );
   if (r.status !== 0 || !r.stdout.trim()) return null;
@@ -575,6 +577,10 @@ Review-loop options (also enabled by passing --repo/--reviewer to build):
                                       (Fixes #N from branch name; set RALPH_FIXES="1 3 4"
                                        to close multiple issues, e.g. a bundled batch run)
                                       (keeps the branch, removes the worktree; needs gh)
+  --draft | --no-draft                integrate --pr: open the PR as a draft (default: "pr": {"draft": true}
+                                      in ralph.target.json, else not a draft)
+  --ready                             integrate --pr: the local gate passed — open it ready for review, or
+                                      mark the existing draft PR ready after the push (gh pr ready)
   --merged                            cleanup: remove every worktree whose PR is already merged (needs gh)
   --type generic|nextjs-postgres      init-target scaffold type
 
@@ -882,6 +888,14 @@ for (let i = 0; i < rawArgs.length; i += 1) {
   }
   if (arg === "--pr") {
     review.pr = true;
+    continue;
+  }
+  if (arg === "--draft" || arg === "--no-draft") {
+    review.draft = arg === "--draft";
+    continue;
+  }
+  if (arg === "--ready") {
+    review.ready = true;
     continue;
   }
   if (arg === "--merged") {
@@ -1644,6 +1658,13 @@ async function main() {
       // shows who filed the PR even if nobody reads the body.
       if (notice) console.error(`\n${notice}\n`);
 
+      // Draft-first (CI cost): a draft PR runs only the light CI jobs; the full suite runs
+      // once it is marked ready. --ready means the local gate passed, so open it ready.
+      const prCfg = readTargetConfig(repo).pr || {};
+      const draftMode = review.draft !== null ? review.draft : prCfg.draft === true;
+      const ghAs = (args) => runAsIdentity(identity, repo, "gh", args, { stdio: "inherit", encoding: undefined });
+      console.log(`- Draft:       ${review.ready ? "no (--ready)" : draftMode ? "yes" : "no"}`);
+
       const existing = prForBranch(repo, branch, identity);
       const existingState = String((existing && existing.state) || "").toUpperCase();
       if (existing && existing.url && existingState !== "OPEN") {
@@ -1661,6 +1682,27 @@ async function main() {
       if (existing && existing.url) {
         // OPEN: this run continues that PR's branch (e.g. a reviewfix) — push so the PR
         // actually gets the commits. Plain push: a non-fast-forward is refused, never forced.
+        // Every push re-runs CI, so skip one that changes nothing (same tree as the PR head,
+        // e.g. a no-op rebase).
+        const remote = runAsIdentity(identity, repo, "git", ["-C", repo, "ls-remote", "origin", `refs/heads/${branch}`], {
+          encoding: "utf-8",
+        });
+        const remoteSha = remote.status === 0 ? String(remote.stdout || "").split(/\s/)[0] : "";
+        const treeOf = (ref) => git(repo, ["rev-parse", "--verify", "-q", `${ref}^{tree}`]).stdout.trim();
+        const remoteTree = remoteSha ? treeOf(remoteSha) : "";
+        if (remoteTree && remoteTree === treeOf(branch)) {
+          console.log(`\nNo change: ${branch} has the same tree as the PR head (${remoteSha.slice(0, 7)}); nothing pushed.`);
+          if (review.ready && existing.isDraft && ghAs(["pr", "ready", existing.url]).status !== 0) {
+            console.error(`\`gh pr ready\` failed; mark ${existing.url} ready by hand.`);
+            process.exit(1);
+          }
+          process.exit(0);
+        }
+        // Draft mode: a reviewfix push to a ready PR goes back to draft first, so the
+        // intermediate push runs only the light CI; --ready (or a human) readies it again.
+        if (draftMode && !review.ready && !existing.isDraft && ghAs(["pr", "ready", "--undo", existing.url]).status !== 0) {
+          console.error(`warning: could not convert ${existing.url} back to a draft; the push runs the full CI.`);
+        }
         const push = runAsIdentity(identity, repo, "git", ["-C", repo, "push", "origin", branch], {
           stdio: "inherit",
           encoding: undefined,
@@ -1673,6 +1715,10 @@ async function main() {
           process.exit(push.status ?? 1);
         }
         console.log(`\nUpdated the open PR for ${branch}: ${existing.url}`);
+        if (review.ready && (existing.isDraft || draftMode) && ghAs(["pr", "ready", existing.url]).status !== 0) {
+          console.error(`\`gh pr ready\` failed; the push landed — mark ${existing.url} ready by hand.`);
+          process.exit(1);
+        }
       } else {
         const push = runAsIdentity(identity, repo, "git", ["-C", repo, "push", "-u", "origin", branch], {
           stdio: "inherit",
@@ -1695,7 +1741,10 @@ async function main() {
           identity,
           repo,
           "gh",
-          ["pr", "create", "--base", base, "--head", branch, "--title", prTitle(meta, branch), "--body", bodyLines.join("\n")],
+          [
+            "pr", "create", "--base", base, "--head", branch, "--title", prTitle(meta, branch), "--body", bodyLines.join("\n"),
+            ...(draftMode && !review.ready ? ["--draft"] : []),
+          ],
           { stdio: "inherit", encoding: undefined },
         );
         if (create.status !== 0) {
